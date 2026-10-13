@@ -23,10 +23,10 @@ The game is played with the controller as a Wii Remote with Nunchuk. The left st
 | Left stick | Nunchuk stick | Move the player |
 | Right stick | Pointer | Aim and point in menus |
 | D-pad | D-pad | Menu navigation |
-| A (bottom) | A | Confirm in menus, pass |
-| B (right) | B | Back in menus, shoot |
-| X (left) | 1 | Pause and resume in a match |
-| Y (top) | 2 | Second action button |
+| Bottom face button | A | Confirm in menus, pass |
+| Right face button | B | Back in menus, shoot |
+| Left face button | 1 | Pause and resume in a match |
+| Top face button | 2 | Second action button |
 | Start | Plus and 1 | Pause and resume in a match, Press Plus on the title screen |
 | Select | Minus | Title screen and the page tabs of the Controls page (unused in a match, as on the Wii) |
 | Menu or Guide | Home | Skips fades and movies |
@@ -36,7 +36,7 @@ The game is played with the controller as a Wii Remote with Nunchuk. The left st
 | R2 | Shake Remote | Hit an opponent |
 | Select and Start together | none | Quit the port |
 
-On a pad whose face buttons are labelled the Nintendo way, A and B and X and Y swap places so that the Wii labels match. Players who prefer other buttons can make a profile in `mscharged.ini`.
+Buttons are named by position. On the RG35XX H the printed labels follow the Nintendo layout, so its B button (bottom) passes and its A button (right) shoots; its Y (left) is the Wii 1 and its X (top) is the Wii 2. Players who prefer other buttons can make a profile in `mscharged.ini`.
 
 Hold Select and press Start to quit.
 
