@@ -44,4 +44,6 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-clang \
 ARG CMAKE_VERSION=3.31.6
 RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
     | tar xz -C /opt && ln -sf /opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/* /usr/local/bin/
+# User mode emulation, only to smoke test the aarch64 binary (build/40_verify.sh): no binfmt registration needed.
+RUN apt-get update && apt-get install -y --no-install-recommends qemu-user-static && rm -rf /var/lib/apt/lists/*
 WORKDIR /src

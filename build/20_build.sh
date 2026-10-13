@@ -25,6 +25,6 @@ set -euo pipefail
 cd $SRC
 cmake -S . -B $B -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=$W/docker/toolchain-aarch64.cmake \
   $(echo $PRESET_ARGS) -DMSCHARGED_AURORA_EXTRA_PATCH_DIR=$SERIES -DPython3_EXECUTABLE=/usr/bin/python3 -DBUILD_TESTING=OFF -DMSCHARGED_FORMAT_PREPARED_SOURCES=OFF \
-  -DMSCHARGED_SDL3_LIBRARY=$OUT/sdl-shim/libSDL3.so.0.5.0 -DRust_CARGO_TARGET=aarch64-unknown-linux-gnu
+  -DCMAKE_SKIP_RPATH=ON -DMSCHARGED_SDL3_LIBRARY=$OUT/sdl-shim/libSDL3.so.0.5.0 -DRust_CARGO_TARGET=aarch64-unknown-linux-gnu
 cmake --build $B --target ${1:-mscharged} -j${JOBS:-6} -- -k ${KEEP:-1}
 "

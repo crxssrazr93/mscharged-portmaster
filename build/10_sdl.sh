@@ -9,7 +9,7 @@ source "$(dirname "$0")/common.sh"
 in_container "
 set -euo pipefail
 TC=$W/docker/toolchain-aarch64.cmake
-rm -rf $OUT/sdl-shim $OUT/sdl-native-build; mkdir -p $OUT/sdl-shim $OUT/sdl-native
+rm -rf $OUT/sdl-shim $OUT/sdl-shim-build $OUT/sdl-native $OUT/sdl-native-build; mkdir -p $OUT/sdl-shim $OUT/sdl-native
 cmake -S $SHIM_SRC -B $OUT/sdl-shim-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=\$TC \
   -DSDL_SDL2_BACKEND=ON -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_TEST_LIBRARY=OFF \
   -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_KMSDRM=OFF -DSDL_PIPEWIRE=OFF -DSDL_PULSEAUDIO=OFF -DSDL_ALSA=OFF \
