@@ -1,7 +1,7 @@
 From: mscharged-portmaster
 Subject: Parse wide printf arguments from the AAPCS64 va_list
 Upstream-base: 7a6bf165d9f1c5914181c079c7d4bfa7204f3509
-Classification: aarch64 Linux host adaptation; apply after 0689.
+Classification: aarch64 Linux host adaptation; apply after 0690.
 
 On aarch64 Linux va_list is a struct, so the function parameter is the cursor itself
 (like the pointer-shaped case). The generic branch is not a template, so clang compiles

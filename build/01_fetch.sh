@@ -10,7 +10,8 @@ if [ ! -d "$SRC/.git" ]; then
   else git clone -q --branch main --no-recurse-submodules "$PORT_REPO" "$SRC"; fi
 fi
 cd "$SRC"
-git checkout -q "$PORT_COMMIT"
+git cat-file -e "$PORT_COMMIT^{commit}" 2>/dev/null || git fetch -q "$PORT_REPO" main
+git checkout -q $([ "${RESET:-0}" = 1 ] && echo -f) "$PORT_COMMIT"
 if [ "${MIRROR:-0}" = 1 ]; then
   for m in "$W"/upstream/.git/modules/extern/*; do
     git config "submodule.extern/$(basename "$m").url" "file://$m"

@@ -4,7 +4,7 @@
 # Usage: tests/pc/gles_boot.sh <out dir> [seconds, default 60]
 # Host screenshots (key "p" in KEYS) are collected into <out dir>/host.
 # Environment: BUILD (build dir, default upstream/build/gles-release), BIN (executable name in it, default mscharged), INI (config file, default tests/pc/gles_mscharged.ini), EVERY (screenshot period, default 10),
-#   ACTIONS (file with "<second> <xdotool args>" lines), KEYS ("<second>:<xdotool key> ...", e.g. "40:Return 50:x"), ARGS (extra mscharged arguments).
+#   RSS_AT (second at which VmRSS/VmHWM of the game is written to <out dir>/rss.txt), ACTIONS (file with "<second> <xdotool args>" lines), KEYS ("<second>:<xdotool key> ...", e.g. "40:Return 50:x"), ARGS (extra mscharged arguments).
 O=$(realpath -m "$1"); T=${2:-60}
 W="$(cd "$(dirname "$0")/../.." && pwd)"
 INI=${INI-$W/tests/pc/gles_mscharged.ini}; EVERY=${EVERY:-10}
@@ -26,6 +26,7 @@ if [ -n "$ACTIONS" ]; then   # file of "<second> <xdotool arguments>" lines
     [ -n "$at" ] && ( sleep "$at"; env -u WAYLAND_DISPLAY DISPLAY=:$N xdotool $rest ) &
   done < "$ACTIONS"
 fi
+[ -n "$RSS_AT" ] && ( sleep "$RSS_AT"; grep -E "VmRSS|VmHWM" /proc/$G/status > "$O/rss.txt" ) &
 for t in $(seq $EVERY $EVERY $T); do
   sleep $EVERY
   env -u WAYLAND_DISPLAY DISPLAY=:$N import -window root "$O/shot_$(printf %04d $t).png" 2>/dev/null

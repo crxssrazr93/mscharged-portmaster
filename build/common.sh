@@ -5,7 +5,7 @@ SRC="${XSRC:-$W/work/xbuild-src}"          # (override: XSRC) the port at the pi
 OUT="${XOUT:-$W/work/xbuild-out}"          # (override: XOUT) build products
 SHIM_SRC="$W/work/sdl-shim"       # bmdhacks/SDL branch sdl2-backend at the pinned commit
 PORT_REPO=https://github.com/yannicksuter/mscharged-port.git
-PORT_COMMIT=d7cdfc47              # commit the GLES patches were made against
+PORT_COMMIT=64dcb73b              # mscharged-port 1.0.8 (origin/main); the previous base is the git tag base-d7cdfc47
 SHIM_REPO=https://github.com/bmdhacks/SDL.git
 SHIM_COMMIT=6057d79ba             # SDL 3.5.0-dev with the SDL2-delegating video/audio/joystick backends
 

@@ -1,7 +1,7 @@
 From: mscharged-portmaster
 Subject: Opt-in movie zoom for 4:3 layouts (MSCHARGED_MOVIE_ZOOM=1)
 Upstream-base: 7a6bf165d9f1c5914181c079c7d4bfa7204f3509
-Classification: host option; apply after 0690. Default off, the original presentation is unchanged.
+Classification: host option; apply after 0691. Default off, the original presentation is unchanged.
 
 The 4:3 slides place the movie in a 16:9 box (the video frames themselves are full frame, not letterboxed).
 With the option set, the box is scaled about its centre to the full screen height; the sides are cropped.

@@ -4,19 +4,9 @@
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 B="$SRC/build/pm-aarch64"   # the preparer requires an ignored build directory inside the checkout
-# Aurora patch series: our GLES series, the PortMaster compatibility patches (patches/aurora-pm) and the GPU memory and
-# shader patches (patches/aurora-gpu, skipped with AURORA_GPU=0).
-SERIES="$OUT/aurora-series"; rm -rf "$SERIES"; mkdir -p "$SERIES"
-GLES_DIR="${AURORA_GLES_DIR:-$W/patches/aurora-gles}"   # override to build from another copy of the GLES series
-cp "$GLES_DIR"/*.patch "$SERIES/"; cp "$GLES_DIR/series" "$SERIES/series"
-# Verified GLES render fixes (patches/aurora-glesfix), applied right after the GLES series; GLESFIX=0 skips them.
-if [ "${GLESFIX:-1}" = 1 ]; then
-  for p in "$W"/patches/aurora-glesfix/*.patch; do [ -e "$p" ] || continue; cp "$p" "$SERIES/"; basename "$p" >> "$SERIES/series"; done
-fi
-for p in "$W"/patches/aurora-pm/*.patch; do [ -e "$p" ] || continue; cp "$p" "$SERIES/"; basename "$p" >> "$SERIES/series"; done
-if [ "${AURORA_GPU:-1}" = 1 ]; then
-  for p in "$W"/patches/aurora-gpu/*.patch; do [ -e "$p" ] || continue; cp "$p" "$SERIES/"; basename "$p" >> "$SERIES/series"; done
-fi
+# Aurora patch series (GLES, glesfix, pm, gpu; see tools/aurora_series.sh for the skip switches).
+SERIES="$OUT/aurora-series"
+"$W/tools/aurora_series.sh" "$SERIES"
 # Cache variables of the gles-release preset (resolved through its inheritance), so the build matches the PC one.
 PRESET_ARGS=$(python3 - "$SRC/CMakePresets.json" <<'PY'
 import json, sys

@@ -1,14 +1,16 @@
 #!/bin/bash
-# Re-export the Aurora GLES patches from the worktree, re-prepare sources and build the GLES port.
+# PC build of the GLES port from the prepared tree (build/01_fetch.sh creates work/xbuild-src: the port at the pinned
+# commit with patches/port-gles, port-pm, port-perf and the decomp patches). The Aurora series is assembled by
+# tools/aurora_series.sh (gles, glesfix, pm, gpu). The build directory is work/xbuild-src/build/pc-gles.
 # Usage: tools/gles_build.sh [target, default mscharged]
+# Environment: XSRC (other prepared tree), BDIR (build dir name, default pc-gles), CMAKE_ARGS (extra cmake arguments,
+#   e.g. -DMSCHARGED_HANDHELD=OFF), GLESFIX/AURORA_PM/AURORA_GPU=0 (skip a series), N (error lines to print).
 set -e
 W="$(cd "$(dirname "$0")/.." && pwd)"
-# The committed patches/aurora-gles is authoritative (the dev worktree also holds unmerged wip commits that would
-# conflict with patches/aurora-glesfix); re-export it explicitly with GLES_EXPORT=1.
-[ "${GLES_EXPORT:-0}" = 1 ] && "$W/tools/export_aurora_gles.sh" > /dev/null
-cd "$W/upstream"
-"$W/tools/aurora_series.sh" "$W/work/aurora-series-gles"   # patches/aurora-gles + patches/aurora-glesfix
-cmake --preset gles-release -DMSCHARGED_AURORA_EXTRA_PATCH_DIR="$W/work/aurora-series-gles" > "$W/work/gles-configure.log" 2>&1 || { tail -30 "$W/work/gles-configure.log"; exit 1; }
-cmake --build build/gles-release --target "${1:-mscharged}" -j8 -- -k 0 > "$W/work/gles-build.log" 2>&1 || true
+SRC="${XSRC:-$W/work/xbuild-src}"; B=build/${BDIR:-pc-gles}
+S=$W/work/aurora-series-pc; "$W/tools/aurora_series.sh" "$S"
+cd "$SRC"
+cmake --preset gles-release -B "$B" -DMSCHARGED_AURORA_EXTRA_PATCH_DIR="$S" -DBUILD_TESTING=OFF $CMAKE_ARGS > "$W/work/gles-configure.log" 2>&1 || { tail -30 "$W/work/gles-configure.log"; exit 1; }
+cmake --build "$B" --target "${1:-mscharged}" -j8 -- -k 0 > "$W/work/gles-build.log" 2>&1 || true
 grep -E 'error:|FAILED|undefined reference' "$W/work/gles-build.log" | cut -c1-250 | sort | uniq | head -${N:-40}
 tail -1 "$W/work/gles-build.log"
