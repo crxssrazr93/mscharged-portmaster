@@ -1,5 +1,7 @@
 # Mario Strikers Charged for PortMaster
 
+**Work in progress. Not playable yet on handhelds** (see Status below).
+
 Work in progress. This repository turns [yannicksuter/mscharged-port](https://github.com/yannicksuter/mscharged-port), the native PC port of Mario Strikers Charged (Wii) built from its decompilation, into a PortMaster port for Linux handhelds (aarch64, Mali and similar GPUs). It holds only patches, build scripts, tests and the PortMaster launcher. No game data is included: players supply their own USA disc (R4QE01, revision 1) as `.rvz` or `.iso`.
 
 Test device: Anbernic RG35XX H (Allwinner H700, Mali-G31, about 1 GB RAM, Knulli).
