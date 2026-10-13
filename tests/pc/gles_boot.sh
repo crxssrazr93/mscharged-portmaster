@@ -33,7 +33,9 @@ for t in $(seq $EVERY $EVERY $T); do
   env -u WAYLAND_DISPLAY DISPLAY=:$N import -window root "$O/shot_$(printf %04d $t).png" 2>/dev/null
 done
 kill -TERM $G 2>/dev/null; sleep 3   # let the game flush its log, then make sure it is gone
-kill -9 $G 2>/dev/null; kill -9 $X 2>/dev/null; wait 2>/dev/null
+kill -9 $G 2>/dev/null; kill -9 $X 2>/dev/null
+for j in $(jobs -p); do pkill -P $j 2>/dev/null; kill $j 2>/dev/null; done   # pending scripted input and samplers
+wait 2>/dev/null
 cp logs/mscharged.log "$O/mscharged.log" 2>/dev/null
 mkdir -p "$O/host"; mv screenshots/*.png "$O/host/" 2>/dev/null
 ls "$O"/shot_*.png | wc -l

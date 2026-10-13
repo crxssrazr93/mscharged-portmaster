@@ -15,3 +15,7 @@ in_container() {
   docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/cache/cargo \
     -v "$W:$W" -v mscharged-pm-cache:/cache -w "$W" "$IMAGE" bash -c "$*"
 }
+
+# Build directory name inside the prepared tree: HANDHELD=1 (default) the lean handheld game, HANDHELD=0 the full port,
+# LTO=1 a separate directory for the link time optimized handheld build.
+build_name() { echo "pm-aarch64$([ "${HANDHELD:-1}" = 1 ] && echo -handheld)${LTO:+-lto}"; }

@@ -7,7 +7,8 @@
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 HANDHELD="${HANDHELD:-1}"
-if [ "$HANDHELD" = 1 ]; then PRESET=gles-handheld; B="$SRC/build/pm-aarch64-handheld"; else PRESET=gles-release; B="$SRC/build/pm-aarch64"; fi
+if [ "$HANDHELD" = 1 ]; then PRESET=gles-handheld; else PRESET=gles-release; fi
+B="$SRC/build/$(build_name)"
 export HANDHELD   # the preparer requires an ignored build directory inside the checkout
 # Aurora patch series (GLES, glesfix, pm, gpu; see tools/aurora_series.sh for the skip switches).
 SERIES="$OUT/aurora-series"

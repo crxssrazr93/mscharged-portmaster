@@ -39,27 +39,19 @@ effects_volume = 100
 mute = false
 
 [controls]
-# Who plays: keyboard (keyboard & mouse), remote1-remote4 (the Wii Remote in
-# that DolphinBar slot), gamepad1-gamepad4 (the n-th connected Xbox,
-# PlayStation or other standard gamepad, played as Wii Remote + Nunchuk) or
-# off. Players fill in order and each device plays once. Without a DolphinBar
-# the Wii Remote players are left out and the others close up in order.
+# Who plays: keyboard (keyboard & mouse), gamepad1-gamepad4 (the n-th connected
+# Xbox, PlayStation or other standard gamepad, played as Wii Remote + Nunchuk)
+# or off. Players fill in order and each device plays once.
 player1 = gamepad1
 player2 = off
 player3 = off
 player4 = off
-# When player 1 is a Wii Remote or gamepad and plays alone, the mouse also
+# When player 1 is a gamepad and plays alone, the mouse also
 # points for it (left click A, right click B); the controller keeps working.
 mouse_pointer = false
-# Pointer calibration of the Wii Remote in each DolphinBar slot, made on the
-# launcher's Controls page (none = uncalibrated).
-remote1_calibration = none
-remote2_calibration = none
-remote3_calibration = none
-remote4_calibration = none
 deadzone = 15
 rumble = true
-# Where the sensor bar or DolphinBar sits: bottom or top of the screen.
+# Where the sensor bar sits: bottom or top of the screen.
 sensor_bar = bottom
 # Button profile of each gamepad: Default (built in; each controller family
 # gets its own layout) or the name of a [gamepad_profileN] below. A missing
@@ -145,7 +137,3 @@ unlock_all = false
 graphics_validation = false
 log_level = info
 verbose_console = false
-
-[launcher]
-# Launcher interface size: auto, or a percentage from 75 to 200.
-ui_scale = auto

@@ -5,6 +5,11 @@ set(CMAKE_C_COMPILER aarch64-clang)
 set(CMAKE_CXX_COMPILER aarch64-clang++)
 set(CMAKE_AR llvm-ar-19)
 set(CMAKE_RANLIB llvm-ranlib-19)
+# The LTO archive tools (MSCHARGED_HANDHELD_LTO).
+set(CMAKE_C_COMPILER_AR llvm-ar-19)
+set(CMAKE_CXX_COMPILER_AR llvm-ar-19)
+set(CMAKE_C_COMPILER_RANLIB llvm-ranlib-19)
+set(CMAKE_CXX_COMPILER_RANLIB llvm-ranlib-19)
 set(CMAKE_STRIP llvm-strip-19)
 set(CMAKE_SYSROOT /sysroot)
 # Plain ARMv8-A so the binary runs on every PortMaster SoC (Cortex-A35 to A55), tuned for the

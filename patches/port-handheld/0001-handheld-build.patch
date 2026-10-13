@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 6919a91a..b2ccf736 100644
+index 6919a91a..e5bec8ee 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -56,6 +56,22 @@ if(MSCHARGED_GRAPHICS_BACKEND STREQUAL "gles")
@@ -16,7 +16,7 @@ index 6919a91a..b2ccf736 100644
 +    # the unreferenced parts of the static libraries.
 +    add_compile_options(-ffunction-sections -fdata-sections)
 +    add_link_options(-Wl,--gc-sections)
-+    option(MSCHARGED_HANDHELD_LTO "Link time optimization of the handheld build" OFF)
++    option(MSCHARGED_HANDHELD_LTO "Link time optimization of the handheld build (the host executable; not the game modules)" OFF)
 +    if(MSCHARGED_HANDHELD_LTO)
 +        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 +    endif()
@@ -57,6 +57,27 @@ index 6919a91a..b2ccf736 100644
  
  if(MSCHARGED_BUILD_LAUNCHER OR MSCHARGED_BUILD_AURORA_HOST)
      include(cmake/SDL.cmake)
+@@ -374,6 +396,20 @@ endif()
+ 
+ message(STATUS "Configured development tools (launcher: ${MSCHARGED_BUILD_LAUNCHER}, experimental startup: ${MSCHARGED_BUILD_GAME_STARTUP}, independent GX check: ${MSCHARGED_BUILD_GX_CHECK}, static asset preview: ${MSCHARGED_BUILD_SCENE_PREVIEW}); playable game remains pending")
+ 
++if(MSCHARGED_HANDHELD AND MSCHARGED_HANDHELD_LTO)
++    # The decomp mixes 16 bit wchar_t (Wii) and 32 bit wchar_t sources, which LTO cannot merge into one module, and
++    # the game modules link bitcode free objects. Everything built from the decomp (targets named
++    # (m)charged_original_*, including the two game modules) stays an ordinary build; the host executable and the
++    # native libraries are optimized across files.
++    get_property(mscharged_all_targets DIRECTORY "${CMAKE_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
++    foreach(target IN LISTS mscharged_all_targets)
++        get_target_property(target_type ${target} TYPE)
++        if(target MATCHES "^m?charged_original_" AND target_type MATCHES "LIBRARY|EXECUTABLE")
++            set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
++        endif()
++    endforeach()
++endif()
++
+ # Last: platform-specific diagnostics for console idioms, after every original
+ # source consumer is defined (third-party subdirectories untouched).
+ include(cmake/OriginalSourceWarnings.cmake)
 diff --git a/CMakePresets.json b/CMakePresets.json
 index 96cd8e16..41b1845c 100644
 --- a/CMakePresets.json
@@ -151,7 +172,7 @@ index 3bfe1af1..2687b477 100644
  # Real GPU tests require a desktop and driver. Keep the portable tests runnable
  # without a GPU; register this explicit gate only when requested.
 diff --git a/cmake/GraphicsProviders.cmake b/cmake/GraphicsProviders.cmake
-index 31201ff7..647bfa02 100644
+index 31201ff7..0833bc7b 100644
 --- a/cmake/GraphicsProviders.cmake
 +++ b/cmake/GraphicsProviders.cmake
 @@ -1,8 +1,17 @@
@@ -225,7 +246,19 @@ index 31201ff7..647bfa02 100644
      set(ZSTD_BUILD_PROGRAMS OFF)
      set(ZSTD_BUILD_TESTS OFF)
      set(ZSTD_BUILD_SHARED OFF)
-@@ -59,42 +70,44 @@ function(mscharged_add_graphics_providers)
+@@ -54,47 +65,56 @@ function(mscharged_add_graphics_providers)
+     add_library(sqlite3 STATIC "${MSCHARGED_SQLITE_GENERATED}/sqlite3.c")
+     target_include_directories(sqlite3 PUBLIC "${MSCHARGED_SQLITE_GENERATED}")
+     target_link_libraries(sqlite3 PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
++    if(MSCHARGED_HANDHELD)
++        # Aurora only prepares and steps plain statements (shader and pipeline cache); leave out what it never calls.
++        target_compile_definitions(sqlite3 PRIVATE SQLITE_OMIT_LOAD_EXTENSION SQLITE_OMIT_DEPRECATED
++            SQLITE_OMIT_PROGRESS_CALLBACK SQLITE_OMIT_SHARED_CACHE SQLITE_OMIT_TRACE SQLITE_OMIT_AUTHORIZATION
++            SQLITE_OMIT_DECLTYPE SQLITE_OMIT_COMPLETE SQLITE_OMIT_GET_TABLE SQLITE_OMIT_TCL_VARIABLE
++            SQLITE_DEFAULT_MEMSTATUS=0)
++    endif()
+     if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+         # Upstream amalgamation code that newer GCC reports (const-returning C23
          # string functions, a guarded strlen); SQLite itself is unchanged.
          target_compile_options(sqlite3 PRIVATE -Wno-discarded-qualifiers -Wno-stringop-overread)
      endif()
