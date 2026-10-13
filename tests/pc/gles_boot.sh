@@ -3,11 +3,11 @@
 # Nothing is shown on the desktop: Wayland is unset and the game uses a private X display.
 # Usage: tests/pc/gles_boot.sh <out dir> [seconds, default 60]
 # Host screenshots (key "p" in KEYS) are collected into <out dir>/host.
-# Environment: INI (config file, default work/run-gles/mscharged.ini), EVERY (screenshot period, default 10),
-#   KEYS ("<second>:<xdotool key> ...", e.g. "40:Return 50:x"), ARGS (extra mscharged arguments).
+# Environment: INI (config file, default tests/pc/gles_mscharged.ini), EVERY (screenshot period, default 10),
+#   ACTIONS (file with "<second> <xdotool args>" lines), KEYS ("<second>:<xdotool key> ...", e.g. "40:Return 50:x"), ARGS (extra mscharged arguments).
 O=$(realpath -m "$1"); T=${2:-60}
 W="$(cd "$(dirname "$0")/../.." && pwd)"
-INI=${INI-$W/work/run-gles/mscharged.ini}; EVERY=${EVERY:-10}
+INI=${INI-$W/tests/pc/gles_mscharged.ini}; EVERY=${EVERY:-10}
 rm -rf "$O"; mkdir -p "$O/home"
 N=$((300 + RANDOM % 600))
 Xvfb :$N -screen 0 640x480x24 > "$O/xvfb.log" 2>&1 & X=$!
@@ -21,6 +21,11 @@ start=$SECONDS
 for k in $KEYS; do
   ( sleep "${k%%:*}"; env -u WAYLAND_DISPLAY DISPLAY=:$N xdotool key "${k#*:}" ) &
 done
+if [ -n "$ACTIONS" ]; then   # file of "<second> <xdotool arguments>" lines
+  while read -r at rest; do
+    [ -n "$at" ] && ( sleep "$at"; env -u WAYLAND_DISPLAY DISPLAY=:$N xdotool $rest ) &
+  done < "$ACTIONS"
+fi
 for t in $(seq $EVERY $EVERY $T); do
   sleep $EVERY
   env -u WAYLAND_DISPLAY DISPLAY=:$N import -window root "$O/shot_$(printf %04d $t).png" 2>/dev/null

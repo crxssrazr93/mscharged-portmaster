@@ -1,0 +1,38 @@
+20 mousemove 290 274
+22 keydown Return
+22.4 keyup Return
+38 mousemove 295 70
+40 keydown Return
+40.4 keyup Return
+52 mousemove 288 400
+54 keydown Return
+54.4 keyup Return
+72 mousemove 148 124
+74 keydown Return
+74.4 keyup Return
+84 mousemove 78 296
+86 keydown Return
+86.4 keyup Return
+92 mousemove 438 124
+94 keydown Return
+94.4 keyup Return
+104 mousemove 88 364
+106 keydown Return
+106.4 keyup Return
+120 mousemove 295 400
+122 keydown Return
+122.4 keyup Return
+142 keydown Return
+142.4 keyup Return
+158 keydown Return
+158.4 keyup Return
+174 keydown Return
+174.4 keyup Return
+184 mousemove 125 100
+186 keydown Return
+186.4 keyup Return
+196 mousemove 295 400
+198 keydown Return
+198.4 keyup Return
+214 keydown Return
+214.4 keyup Return
