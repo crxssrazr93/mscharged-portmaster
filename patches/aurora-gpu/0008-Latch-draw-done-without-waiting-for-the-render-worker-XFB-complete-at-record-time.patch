@@ -1,0 +1,56 @@
+diff --color -ruN gpu2-b7/lib/gfx/frame.cpp gpu2-edit/lib/gfx/frame.cpp
+--- a/lib/gfx/frame.cpp	2026-10-13 20:23:44.306254737 +0530
++++ b/lib/gfx/frame.cpp	2026-10-13 20:15:45.993490055 +0530
+@@ -313,6 +313,14 @@
+   return always;
+ }
+ 
++bool submit_sync_always() {
++  static const bool always = [] {
++    const char* env = std::getenv("AURORA_SUBMIT_SYNC");
++    return env != nullptr && env[0] == '1';
++  }();
++  return always;
++}
++
+ // Block the calling (worker) thread until every GL command issued so far has completed on the GPU.
+ void wait_gpu_complete() {
+   ZoneScopedN("GPU complete");
+@@ -779,7 +787,11 @@
+   // executed every recorded op and glFinish has confirmed the GPU is done with them.
+   finish();
+   end_frame_impl({}, /*presenting=*/false, /*hardware=*/true);
+-  render_worker::synchronize();
++  // The draw done is latched once the frame is queued: the game's data was copied while recording and every consumer
++  // of the result (VI scanout) is ordered behind it on the render worker. AURORA_SUBMIT_SYNC=1 waits for the worker.
++  if (submit_sync_always()) {
++    render_worker::synchronize();
++  }
+ }
+ 
+ void submit_draw_done_and_wait() {
+@@ -811,7 +823,9 @@
+     depth_peek::after_submit();
+     process_events();
+   });
+-  render_worker::synchronize();
++  if (submit_sync_always()) {
++    render_worker::synchronize();
++  }
+ }
+ 
+ void synchronize() { render_worker::synchronize(); }
+diff --color -ruN gpu2-b7/lib/gfx/xfb.cpp gpu2-edit/lib/gfx/xfb.cpp
+--- a/lib/gfx/xfb.cpp	2026-10-13 20:23:44.294254831 +0530
++++ b/lib/gfx/xfb.cpp	2026-10-13 20:15:45.994898958 +0530
+@@ -256,7 +256,9 @@
+   resolve_pass_into_with_uniforms(snapshot->packedYuyv, rect,
+       clear && state.colorUpdate, clear && state.alphaUpdate && gx::efb_has_alpha(state.pixelFmt),
+       clear && state.depthUpdate, state.clearColor, gx::clear_depth_value(), ResolveFormat,
+-      state.pixelFmt, &uniforms, sizeof(uniforms), [snapshot] { complete(snapshot); });
++      state.pixelFmt, &uniforms, sizeof(uniforms), {});
++  // Complete as soon as the copy is recorded: the VI scanout work that reads it is queued later on the render worker.
++  complete(snapshot);
+ }
+ 
+ void set_flicker_filter(bool enabled) { g_flickerFilter.store(enabled, std::memory_order_relaxed); }
