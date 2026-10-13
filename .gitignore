@@ -10,3 +10,4 @@ port/mscharged/licenses/
 port/mscharged/cover.png
 port/mscharged/mscharged.ini
 port/mscharged/log.txt
+__pycache__/
