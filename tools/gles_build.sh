@@ -10,9 +10,9 @@ set -e
 W="$(cd "$(dirname "$0")/.." && pwd)"
 PRESET=${PRESET:-gles-release}; [ "$PRESET" = gles-handheld ] && { export HANDHELD=1; BDIR=${BDIR:-pc-handheld}; }
 SRC="${XSRC:-$W/work/xbuild-src}"; B=build/${BDIR:-pc-gles}
-S=$W/work/aurora-series-pc; "$W/tools/aurora_series.sh" "$S"
+S=${SERIES_DIR:-$W/work/aurora-series-pc}; "$W/tools/aurora_series.sh" "$S"
 cd "$SRC"
-cmake --preset "$PRESET" -B "$B" -DMSCHARGED_AURORA_EXTRA_PATCH_DIR="$S" -DBUILD_TESTING=OFF $CMAKE_ARGS > "$W/work/gles-configure.log" 2>&1 || { tail -30 "$W/work/gles-configure.log"; exit 1; }
-cmake --build "$B" --target "${1:-mscharged}" -j8 -- -k 0 > "$W/work/gles-build.log" 2>&1 || true
-grep -E 'error:|FAILED|undefined reference' "$W/work/gles-build.log" | cut -c1-250 | sort | uniq | head -${N:-40}
-tail -1 "$W/work/gles-build.log"
+cmake --preset "$PRESET" -B "$B" -DMSCHARGED_AURORA_EXTRA_PATCH_DIR="$S" -DBUILD_TESTING=OFF $CMAKE_ARGS > "${LOGP:-$W/work/gles}-configure.log" 2>&1 || { tail -30 "${LOGP:-$W/work/gles}-configure.log"; exit 1; }
+cmake --build "$B" --target "${1:-mscharged}" -j8 -- -k 0 > "${LOGP:-$W/work/gles}-build.log" 2>&1 || true
+grep -E 'error:|FAILED|undefined reference' "${LOGP:-$W/work/gles}-build.log" | cut -c1-250 | sort | uniq | head -${N:-40}
+tail -1 "${LOGP:-$W/work/gles}-build.log"

@@ -1,34 +1,12 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Sajid Ahamed <crxssrazr93@gmail.com>
-Date: Tue, 13 Oct 2026 17:32:14 +0530
-Subject: [PATCH] Render timings in the census, no spin in wait_draw_done,
- glFinish only when needed, configurable and growing rings, streaming gap in
- wall time
-
----
- lib/gfx/encoding.cpp       |   3 ++
- lib/gfx/frame.cpp          | 103 ++++++++++++++++++++++++++++++++++---
- lib/gfx/frame_packet.hpp   |   6 +--
- lib/gfx/pipeline_cache.cpp |   2 +
- lib/gfx/recording.cpp      |  10 ++--
- lib/gfx/render_worker.cpp  |   2 +
- lib/gfx/resources.hpp      |  21 ++++++--
- lib/gl/census.cpp          |  27 ++++++++++
- lib/gl/census.hpp          |  18 +++++++
- lib/gx/fifo.cpp            |  16 +++++-
- lib/gx/texture.cpp         |  13 ++++-
- 11 files changed, 198 insertions(+), 23 deletions(-)
-
-diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
-index fe584ed..5f7d483 100644
---- a/lib/gfx/encoding.cpp
-+++ b/lib/gfx/encoding.cpp
+diff --color -ruN gpu2-base/lib/gfx/encoding.cpp gpu2-edit/lib/gfx/encoding.cpp
+--- a/lib/gfx/encoding.cpp	2026-10-13 19:04:06.042025280 +0530
++++ b/lib/gfx/encoding.cpp	2026-10-13 19:09:53.363070222 +0530
 @@ -1,3 +1,4 @@
 +#include "../gl/census.hpp"
  #include "encoding.hpp"
  #include "xfb.hpp"
  
-@@ -368,6 +369,7 @@ void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
+@@ -368,6 +369,7 @@
  // WebGPU staging-buffer + CopyBuffer path is gone). Incremental: only the bytes/uploads added since
  // the previous op's high-water are pushed, tracked in frame.copied.
  void upload_op_data(FramePacket& frame, const FrameOp& op) {
@@ -36,7 +14,7 @@ index fe584ed..5f7d483 100644
    const auto& hw = op.highWater;
    auto& done = frame.copied;
    const auto upload_range = [](const gl::Buffer& buffer, const ByteBuffer& src, uint32_t from, uint32_t to) {
-@@ -424,6 +426,7 @@ void apply_scissor(gl::PassEncoder& pass, const ClipRect& sc, const gl::Extent3D
+@@ -424,6 +426,7 @@
  }
  
  void encode_op(FramePacket& frame, const FrameOp& op) {
@@ -44,11 +22,18 @@ index fe584ed..5f7d483 100644
    upload_op_data(frame, op);
    switch (op.type) {
    case FrameOpType::RenderPass:
-diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
-index e873986..04ffcb8 100644
---- a/lib/gfx/frame.cpp
-+++ b/lib/gfx/frame.cpp
-@@ -30,6 +30,8 @@
+diff --color -ruN gpu2-base/lib/gfx/frame.cpp gpu2-edit/lib/gfx/frame.cpp
+--- a/lib/gfx/frame.cpp	2026-10-13 19:04:06.086100845 +0530
++++ b/lib/gfx/frame.cpp	2026-10-13 19:12:05.331272593 +0530
+@@ -17,6 +17,7 @@
+ #include "../gl/census.hpp"
+ #include "../gl/context.hpp"
+ #include "../gl/gl_core.hpp"
++#include "../gl/state.hpp"
+ #include "../gx/gx.hpp"
+ #include "../gx/texture.hpp"
+ #ifdef AURORA_ENABLE_RMLUI
+@@ -30,6 +31,8 @@
  #include <atomic>
  #include <chrono>
  #include <cstdint>
@@ -57,7 +42,15 @@ index e873986..04ffcb8 100644
  #include <cstring>
  #include <deque>
  #include <memory>
-@@ -114,8 +116,60 @@ void wait_frame_buffer_fence(size_t slot) {
+@@ -93,6 +96,7 @@
+   if (set.fence == nullptr || gl::gl.ClientWaitSync == nullptr) {
+     return;
+   }
++  gl::census::ScopedTimer fenceTimer{gl::census::TmFenceWait};
+   // Flush on the first wait so the fence is guaranteed to be in the GPU pipe (cannot self-deadlock on
+   // unsubmitted commands). Bounded chunks with a diagnostic rather than an unbounded block.
+   constexpr uint64_t kChunkNs = 1'000'000'000ull; // 1 s
+@@ -114,8 +118,60 @@
  // Persistent caches for CPU-expanded native-fetch geometry. Separate from the per-frame staging rings
  // so cached ranges can never be clobbered by ring uploads. Filled once per unique mesh (by content
  // hash) and referenced every subsequent frame.
@@ -120,7 +113,15 @@ index e873986..04ffcb8 100644
  // Bump-allocator cursors; on exhaustion the whole cache is reset (deferred to a frame boundary). The
  // generation counter bumps on each reset so CPU-side content maps can drop entries that point at
  // now-recycled ranges. Recording thread only.
-@@ -245,9 +299,21 @@ size_t acquire_frame_slot() {
+@@ -233,6 +289,7 @@
+ 
+ size_t acquire_frame_slot() {
+   ZoneScopedN("Acquire frame slot");
++  gl::census::ScopedTimer slotTimer{gl::census::TmSlotWait};
+   const auto waitStart = PresentClock::now();
+   while (true) {
+     if (const auto slot = g_frameSlots.try_acquire()) {
+@@ -245,9 +302,21 @@
    }
  }
  
@@ -142,7 +143,7 @@ index e873986..04ffcb8 100644
    if (gl::gl.Finish != nullptr) {
      gl::gl.Finish();
    }
-@@ -419,9 +485,9 @@ void initialize() {
+@@ -419,9 +488,9 @@
      // Per-frame ring: one persistent-mapped set per frame slot (double-buffered, fenced on reuse; see
      // FrameBufferSet). The active aliases are pointed at a slot by the begin-frame work item.
      for (auto& set : g_frameBufferSets) {
@@ -155,7 +156,7 @@ index e873986..04ffcb8 100644
      }
      select_frame_buffers(0);
      // The storage-fetch path is dead (native vertex fetch only); no g_storageBuffer. The native geom
-@@ -527,11 +593,13 @@ static bool begin_frame_impl(bool preserveEfb) {
+@@ -527,11 +596,13 @@
      begin_recording(frame, frameSlot);
    }
    begin_pipeline_frame();
@@ -169,7 +170,7 @@ index e873986..04ffcb8 100644
      select_frame_buffers(frameSlot);
      webgpu::gpu_prof::frame_begin();
    });
-@@ -582,6 +650,10 @@ static void end_frame_impl(EndFrameCallback callback, bool presenting, bool hard
+@@ -582,6 +653,10 @@
    }
    const auto recorded = end_recording();
    auto& frame = *recorded.packet;
@@ -180,16 +181,50 @@ index e873986..04ffcb8 100644
    gl::census::ring_sample(gl::census::RingVerts, static_cast<int64_t>(frame.verts.size()));
    gl::census::ring_sample(gl::census::RingUniforms, static_cast<int64_t>(frame.uniforms.size()));
    gl::census::ring_sample(gl::census::RingIndices, static_cast<int64_t>(frame.indices.size()));
-@@ -628,7 +700,7 @@ static void end_frame_impl(EndFrameCallback callback, bool presenting, bool hard
-     // After-submit callbacks promise the GPU work recorded before them has completed (XFB snapshots
-     // become scanout-visible, completion latches fire). glFinish is the portable GL equivalent of
-     // Queue::OnSubmittedWorkDone; it is only paid for frames that need it.
+@@ -625,21 +700,21 @@
+     if (hardware) {
+       webgpu::gpu_prof::frame_end();
+     }
+-    // After-submit callbacks promise the GPU work recorded before them has completed (XFB snapshots
+-    // become scanout-visible, completion latches fire). glFinish is the portable GL equivalent of
+-    // Queue::OnSubmittedWorkDone; it is only paid for frames that need it.
 -    const bool needFinish = hardware || !afterSubmitCallbacks.empty();
-+    const bool needFinish = (hardware && gl_finish_always()) || !afterSubmitCallbacks.empty();
++    // The after-submit callbacks (XFB snapshot completion) only publish state that is consumed on this same render
++    // worker through GL commands queued after this point, so command order is enough and nothing waits for the GPU.
++    // AURORA_GL_FINISH=1 restores the glFinish.
++    const bool needFinish = gl_finish_always();
      if (needFinish) {
        wait_gpu_complete();
-       for (auto& afterSubmit : afterSubmitCallbacks) {
-@@ -666,6 +738,21 @@ void end_frame(EndFrameCallback callback) {
+-      for (auto& afterSubmit : afterSubmitCallbacks) {
+-        if (afterSubmit) {
+-          afterSubmit();
+-        }
+-      }
+-      if (hardware) {
+-        depth_peek::after_submit();
++    }
++    for (auto& afterSubmit : afterSubmitCallbacks) {
++      if (afterSubmit) {
++        afterSubmit();
+       }
+     }
++    if (hardware) {
++      depth_peek::after_submit();
++    }
+     // Fence this slot's persistent buffer set: it stays "busy" until the GPU finishes everything
+     // issued this frame (its GX draws read the vertex/uniform/index mappings). The next frame that
+     // reuses this slot waits this fence before overwriting the mappings (see wait_frame_buffer_fence).
+@@ -653,6 +728,9 @@
+     if (!needFinish && gl::gl.FenceSync != nullptr) {
+       set.fence = gl::gl.FenceSync(gl::GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+     }
++    if (!needFinish && gl::gl.Flush != nullptr) {
++      gl::gl.Flush(); // start the GPU on this frame now; nothing waits for it
++    }
+     g_frameSlots.release(frameSlot);
+     expire_cached_bind_groups();
+     process_events();
+@@ -666,6 +744,21 @@
  
  uint32_t current_frame() noexcept { return g_frameIndex; }
  
@@ -211,22 +246,23 @@ index e873986..04ffcb8 100644
  void after_submit() noexcept { depth_peek::after_submit(); }
  
  void gpu_synchronize() {
-@@ -705,7 +792,9 @@ void submit_draw_done_and_wait() {
+@@ -705,7 +798,11 @@
    render_worker::enqueue_work([callbacks = std::move(callbacks)]() mutable {
      // A parser acknowledgement or render-worker drain is never this fence: glFinish runs strictly
      // after every GL command of the sealed prefix.
 -    wait_gpu_complete();
-+    if (gl_finish_always() || !callbacks.empty()) {
++    if (gl_finish_always()) {
 +      wait_gpu_complete();
++    } else if (gl::gl.Flush != nullptr) {
++      gl::gl.Flush();
 +    }
      for (auto& callback : callbacks) {
        if (callback) {
          callback();
-diff --git a/lib/gfx/frame_packet.hpp b/lib/gfx/frame_packet.hpp
-index 872c845..a66566b 100644
---- a/lib/gfx/frame_packet.hpp
-+++ b/lib/gfx/frame_packet.hpp
-@@ -197,9 +197,9 @@ struct FramePacket {
+diff --color -ruN gpu2-base/lib/gfx/frame_packet.hpp gpu2-edit/lib/gfx/frame_packet.hpp
+--- a/lib/gfx/frame_packet.hpp	2026-10-13 19:04:06.042086736 +0530
++++ b/lib/gfx/frame_packet.hpp	2026-10-13 19:09:53.363510325 +0530
+@@ -197,9 +197,9 @@
      indices.clear();
      storage.clear();
      textureUpload.clear();
@@ -239,16 +275,15 @@ index 872c845..a66566b 100644
      textureUpload.reserve_extra(TextureUploadSize);
      afterSubmitCallbacks.clear();
      copied = {};
-diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
-index 5e08faf..a5740d9 100644
---- a/lib/gfx/pipeline_cache.cpp
-+++ b/lib/gfx/pipeline_cache.cpp
+diff --color -ruN gpu2-base/lib/gfx/pipeline_cache.cpp gpu2-edit/lib/gfx/pipeline_cache.cpp
+--- a/lib/gfx/pipeline_cache.cpp	2026-10-13 19:04:06.083640459 +0530
++++ b/lib/gfx/pipeline_cache.cpp	2026-10-13 19:09:53.363661330 +0530
 @@ -1,3 +1,4 @@
 +#include "../gl/census.hpp"
  #include "pipeline_cache.hpp"
  
  #include "clear.hpp"
-@@ -572,6 +573,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
+@@ -572,6 +573,7 @@
      // screen (game loop parked before its first [clock] line). If the build doesn't land in
      // time, name the culprit and return; bind_pipeline() skips draws whose pipeline isn't
      // ready, so the cost of bailing is a missing UI element for a few frames, not a hang.
@@ -256,11 +291,10 @@ index 5e08faf..a5740d9 100644
      std::unique_lock lock{g_pipelineMutex};
      if (g_gaveUpPipelines.contains(runtimeKey)) {
        return runtimeKey; // already gave up on this one: it builds in the background, its draws are skipped meanwhile
-diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
-index b41c6a7..3f33995 100644
---- a/lib/gfx/recording.cpp
-+++ b/lib/gfx/recording.cpp
-@@ -223,7 +223,8 @@ void seal_pass(FramePacket& frame, uint32_t passIndex) {
+diff --color -ruN gpu2-base/lib/gfx/recording.cpp gpu2-edit/lib/gfx/recording.cpp
+--- a/lib/gfx/recording.cpp	2026-10-13 19:04:06.081222882 +0530
++++ b/lib/gfx/recording.cpp	2026-10-13 19:09:53.363984862 +0530
+@@ -223,7 +223,8 @@
    pass.sealed = true;
  }
  
@@ -270,7 +304,7 @@ index b41c6a7..3f33995 100644
    if (alignment != 0) {
      const size_t begin = target.size();
      const size_t alignedBegin = AURORA_ALIGN(begin, alignment);
-@@ -236,6 +237,7 @@ Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignm
+@@ -236,6 +237,7 @@
      // The per-frame ring ceilings are reserved up front so recording never reallocs under the render
      // worker's concurrent reads; growing past one reallocs and also overruns the GL ring buffer.
      gl::census::ring_overflow();
@@ -278,7 +312,7 @@ index b41c6a7..3f33995 100644
      Log.warn("Per-frame buffer overflow: {} + {} bytes exceeds the {} byte ring", begin, length, ceiling);
    }
    if (length > 0) {
-@@ -1213,7 +1215,7 @@ Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+@@ -1213,7 +1215,7 @@
    if (!check_recording("push_verts")) {
      return {};
    }
@@ -287,7 +321,7 @@ index b41c6a7..3f33995 100644
  }
  
  Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
-@@ -1221,7 +1223,7 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+@@ -1221,7 +1223,7 @@
    if (!check_recording("push_indices")) {
      return {};
    }
@@ -296,7 +330,7 @@ index b41c6a7..3f33995 100644
  }
  
  Range push_uniform(const uint8_t* data, size_t length) {
-@@ -1229,7 +1231,7 @@ Range push_uniform(const uint8_t* data, size_t length) {
+@@ -1229,7 +1231,7 @@
    if (!check_recording("push_uniform")) {
      return {};
    }
@@ -305,16 +339,15 @@ index b41c6a7..3f33995 100644
  }
  
  Range push_storage(const uint8_t* data, size_t length) {
-diff --git a/lib/gfx/render_worker.cpp b/lib/gfx/render_worker.cpp
-index 5b53f47..7cbfac4 100644
---- a/lib/gfx/render_worker.cpp
-+++ b/lib/gfx/render_worker.cpp
+diff --color -ruN gpu2-base/lib/gfx/render_worker.cpp gpu2-edit/lib/gfx/render_worker.cpp
+--- a/lib/gfx/render_worker.cpp	2026-10-13 19:04:06.042189542 +0530
++++ b/lib/gfx/render_worker.cpp	2026-10-13 19:09:53.364259570 +0530
 @@ -1,3 +1,4 @@
 +#include "../gl/census.hpp"
  #include "render_worker.hpp"
  #include <aurora/hardware.h>
  
-@@ -258,6 +259,7 @@ void synchronize() {
+@@ -258,6 +259,7 @@
    }
  
    ZoneScoped;
@@ -322,10 +355,95 @@ index 5b53f47..7cbfac4 100644
    auto sync = std::make_shared<SyncState>();
    enqueue({
        .type = ItemType::Sync,
-diff --git a/lib/gfx/resources.hpp b/lib/gfx/resources.hpp
-index 4cd5f2a..ee10e87 100644
---- a/lib/gfx/resources.hpp
-+++ b/lib/gfx/resources.hpp
+diff --color -ruN gpu2-base/lib/gfx/resource_cache.cpp gpu2-edit/lib/gfx/resource_cache.cpp
+--- a/lib/gfx/resource_cache.cpp	2026-10-13 19:04:06.073235430 +0530
++++ b/lib/gfx/resource_cache.cpp	2026-10-13 19:11:42.460413145 +0530
+@@ -11,7 +11,9 @@
+ #include <bit>
+ #include <cstddef>
+ #include <cstdint>
++#include <atomic>
+ #include <mutex>
++#include <vector>
+ 
+ #include <absl/container/flat_hash_map.h>
+ #include <tracy/Tracy.hpp>
+@@ -108,13 +110,70 @@
+   return it->second.bindGroup;
+ }
+ 
++namespace {
++// GL texture names generated ahead of time on the render worker. Creating a texture used to block the recording thread
++// until the worker had drained its whole queue (every new texture, every video plane, every display copy). With a
++// name in hand the handle is complete, and the worker makes the storage in order before any upload or draw that
++// uses it.
++std::mutex g_textureNameMutex;
++std::vector<gl::GLuint> g_textureNames;
++std::atomic_bool g_textureNameRefillQueued{false};
++constexpr size_t TextureNameLowWater = 24;
++constexpr int TextureNameBatch = 64;
++
++gl::GLuint take_texture_name() {
++  std::lock_guard lock{g_textureNameMutex};
++  if (g_textureNames.empty()) {
++    return 0;
++  }
++  const gl::GLuint id = g_textureNames.back();
++  g_textureNames.pop_back();
++  return id;
++}
++
++void queue_texture_name_refill() {
++  if (g_textureNameRefillQueued.exchange(true)) {
++    return;
++  }
++  render_worker::enqueue_work([] {
++    gl::GLuint names[TextureNameBatch];
++    gl::generate_texture_names(names, TextureNameBatch);
++    {
++      std::lock_guard lock{g_textureNameMutex};
++      g_textureNames.insert(g_textureNames.end(), names, names + TextureNameBatch);
++    }
++    g_textureNameRefillQueued.store(false);
++  });
++}
++} // namespace
++
+ gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable,
+                               uint8_t censusTag, gl::TexSwizzle swizzle) {
+   gl::Texture result;
++  if (render_worker::is_running() && !render_worker::is_worker_thread()) {
++    size_t pooled;
++    {
++      std::lock_guard lock{g_textureNameMutex};
++      pooled = g_textureNames.size();
++    }
++    if (pooled < TextureNameLowWater) {
++      queue_texture_name_refill();
++    }
++    if (const gl::GLuint id = take_texture_name(); id != 0) {
++      result = gl::describe_texture(id, format, size, mips, renderable, censusTag);
++      if (result.id != 0) {
++        render_worker::enqueue_work([=] {
++          gl::create_texture_named(id, format, size, mips, renderable, censusTag, swizzle);
++          // create_texture binds GL_TEXTURE_2D directly; drop the state cache's texture-unit shadow so
++          // the next draw re-binds.
++          gl::invalidate_texture_bindings();
++        });
++      }
++      return result;
++    }
++  }
+   render_worker::enqueue_work([&] {
+     result = gl::create_texture(format, size, mips, renderable, censusTag, swizzle);
+-    // create_texture binds GL_TEXTURE_2D directly; drop the state cache's texture-unit shadow so
+-    // the next draw re-binds.
+     gl::invalidate_texture_bindings();
+   });
+   render_worker::synchronize();
+diff --color -ruN gpu2-base/lib/gfx/resources.hpp gpu2-edit/lib/gfx/resources.hpp
+--- a/lib/gfx/resources.hpp	2026-10-13 19:04:06.042255656 +0530
++++ b/lib/gfx/resources.hpp	2026-10-13 19:09:53.364395236 +0530
 @@ -4,11 +4,22 @@
  
  namespace aurora::gfx {
@@ -354,11 +472,21 @@ index 4cd5f2a..ee10e87 100644
  
  // g_stats, the g_*Buffer ring aliases and detail::resources() are declared in types.hpp so that every
  // file that includes the gfx types sees them (the Dawn-era common.hpp provided them to everyone).
-diff --git a/lib/gl/census.cpp b/lib/gl/census.cpp
-index 3d69bbb..3b6b6ae 100644
---- a/lib/gl/census.cpp
-+++ b/lib/gl/census.cpp
-@@ -31,6 +31,12 @@ std::atomic<int64_t> s_progSourceUs{0};
+diff --color -ruN gpu2-base/lib/gfx/scanout.cpp gpu2-edit/lib/gfx/scanout.cpp
+--- a/lib/gfx/scanout.cpp	2026-10-13 19:04:06.073260474 +0530
++++ b/lib/gfx/scanout.cpp	2026-10-13 19:11:59.500126319 +0530
+@@ -548,6 +548,7 @@
+       bool published = false;
+       ~DeviceFrame() { if (!published) webgpu::sdl2shim_present::publish_empty(); }
+     } deviceFrame;
++    gl::census::ScopedTimer presentTimer{gl::census::TmPresent};
+     auto effective = scanout;
+     {
+       std::lock_guard lock(state.mutex);
+diff --color -ruN gpu2-base/lib/gl/census.cpp gpu2-edit/lib/gl/census.cpp
+--- a/lib/gl/census.cpp	2026-10-13 19:04:06.081222882 +0530
++++ b/lib/gl/census.cpp	2026-10-13 19:11:59.485262901 +0530
+@@ -31,6 +31,12 @@
  std::atomic<int64_t> s_progBinaryUs{0};
  std::atomic<int64_t> s_progMaxUs{0};
  
@@ -371,7 +499,7 @@ index 3d69bbb..3b6b6ae 100644
  std::atomic<int64_t> s_ringPeak[RingCount];
  std::atomic<int64_t> s_ringOverflows{0};
  std::atomic<int64_t> s_nativeResets{0};
-@@ -146,6 +152,12 @@ void texture_removed(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept {
+@@ -146,6 +152,12 @@
    s_tags[tag].equiv.fetch_sub(equivBytes, std::memory_order_relaxed);
  }
  
@@ -384,7 +512,7 @@ index 3d69bbb..3b6b6ae 100644
  void ring_sample(Ring ring, int64_t bytesUsed) noexcept {
    int64_t prev = s_ringPeak[ring].load(std::memory_order_relaxed);
    while (bytesUsed > prev && !s_ringPeak[ring].compare_exchange_weak(prev, bytesUsed, std::memory_order_relaxed)) {
-@@ -209,6 +221,21 @@ void log_tick() noexcept {
+@@ -209,6 +221,21 @@
                        mb(s_ringPeak[RingVerts]), mb(s_ringPeak[RingUniforms]), mb(s_ringPeak[RingIndices]),
                        mb(s_ringPeak[RingTexUpload]), mb(s_ringPeak[RingNativeVerts]), mb(s_ringPeak[RingNativeIndices]),
                        s_ringOverflows.load(), s_nativeResets.load());
@@ -398,19 +526,18 @@ index 3d69bbb..3b6b6ae 100644
 +      s_timersPrev[i] = cur;
 +    }
 +    head += fmt::format("\n[gl-time] ms per second: ops {:.0f} (upload {:.0f}) finish {:.0f} sync-wait {:.0f} "
-+                        "drawdone-wait {:.0f} parse {:.0f} pipeline-wait {:.0f}",
++                        "drawdone-wait {:.0f} parse {:.0f} pipeline-wait {:.0f} slot-wait {:.0f} fence-wait {:.0f} present {:.0f}",
 +                        ms[TmOps], ms[TmUpload], ms[TmFinish], ms[TmSyncWait], ms[TmDrawDone], ms[TmParse],
-+                        ms[TmPipeline]);
++                        ms[TmPipeline], ms[TmSlotWait], ms[TmFenceWait], ms[TmPresent]);
 +  }
 +  s_timeMark = now;
    const auto emit = [&](const std::string& m) { detailed > 0 ? Log.warn("{}", m) : Log.info("{}", m); };
    emit(head);
    if (detailed > 0) {
-diff --git a/lib/gl/census.hpp b/lib/gl/census.hpp
-index 00ee43b..94bc489 100644
---- a/lib/gl/census.hpp
-+++ b/lib/gl/census.hpp
-@@ -72,6 +72,24 @@ void ring_sample(Ring ring, int64_t bytesUsed) noexcept;
+diff --color -ruN gpu2-base/lib/gl/census.hpp gpu2-edit/lib/gl/census.hpp
+--- a/lib/gl/census.hpp	2026-10-13 19:04:06.081261756 +0530
++++ b/lib/gl/census.hpp	2026-10-13 19:11:59.482407098 +0530
+@@ -72,6 +72,29 @@
  void ring_overflow() noexcept;      // a per frame ring ran past its ceiling
  void native_cache_reset() noexcept; // a native geometry cache ran full and was recycled
  
@@ -423,7 +550,12 @@ index 00ee43b..94bc489 100644
 +//   drawdone   GX owner thread blocked in GXWaitDrawDone
 +//   parse      GX FIFO worker processing commands (includes the sync wait of a draw-done)
 +//   pipeline   recording thread blocked on a shader compile
-+enum Timer : uint8_t { TmOps, TmUpload, TmFinish, TmSyncWait, TmDrawDone, TmParse, TmPipeline, TmCount };
++//   slot-wait  recording thread waiting for a free frame slot (the render worker is two frames behind)
++//   fence-wait render worker waiting for the GPU to release a slot's ring buffers
++//   present    render worker drawing and presenting the VI picture
++enum Timer : uint8_t {
++  TmOps, TmUpload, TmFinish, TmSyncWait, TmDrawDone, TmParse, TmPipeline, TmSlotWait, TmFenceWait, TmPresent, TmCount
++};
 +void time_add(Timer timer, int64_t nanoseconds) noexcept;
 +struct ScopedTimer {
 +  Timer timer;
@@ -435,16 +567,83 @@ index 00ee43b..94bc489 100644
  // Rate-limited summary line (one [gl-census] INFO log every ~10 s, every AURORA_CENSUS seconds when
  // set). Called once per frame from the end-of-frame path on the render worker; cheap when not due.
  void log_tick() noexcept;
-diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
-index c6dc4ea..564e992 100644
---- a/lib/gx/fifo.cpp
-+++ b/lib/gx/fifo.cpp
+diff --color -ruN gpu2-base/lib/gl/textures.cpp gpu2-edit/lib/gl/textures.cpp
+--- a/lib/gl/textures.cpp	2026-10-13 19:04:06.073418993 +0530
++++ b/lib/gl/textures.cpp	2026-10-13 19:11:30.204261600 +0530
+@@ -202,8 +202,7 @@
+   return i;
+ }
+ 
+-Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool renderable, uint8_t tag,
+-                       TexSwizzle swizzle) {
++Texture describe_texture(GLuint id, TextureFormat format, Extent3D size, uint32_t mips, bool renderable, uint8_t tag) {
+   const auto info = gl_format(format);
+   if (!info.valid) {
+     Log.fatal("create_texture: unsupported format {}", static_cast<int>(format));
+@@ -212,9 +211,34 @@
+   if (tag == census::TagOther && renderable) {
+     tag = info.depth ? census::TagDepth : census::TagRenderColor;
+   }
+-  const uint32_t levels = mips < 1 ? 1 : mips;
++  return Texture{
++      .id = id,
++      .format = format,
++      .size = size,
++      .mips = mips < 1 ? 1 : mips,
++      .renderable = renderable,
++      .tag = tag,
++  };
++}
++
++void generate_texture_names(GLuint* names, int count) { gl.GenTextures(count, names); }
++
++Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool renderable, uint8_t tag,
++                       TexSwizzle swizzle) {
+   GLuint id = 0;
+   gl.GenTextures(1, &id);
++  return create_texture_named(id, format, size, mips, renderable, tag, swizzle);
++}
++
++Texture create_texture_named(GLuint id, TextureFormat format, Extent3D size, uint32_t mips, bool renderable,
++                             uint8_t tag, TexSwizzle swizzle) {
++  const auto described = describe_texture(id, format, size, mips, renderable, tag);
++  if (described.id == 0) {
++    return {};
++  }
++  const auto info = gl_format(format);
++  tag = described.tag;
++  const uint32_t levels = described.mips;
+   gl.BindTexture(GL_TEXTURE_2D, id);
+   gl.TexStorage2D(GL_TEXTURE_2D, static_cast<GLsizei>(levels), info.internalFormat, static_cast<GLsizei>(size.width),
+                   static_cast<GLsizei>(size.height));
+diff --color -ruN gpu2-base/lib/gl/textures.hpp gpu2-edit/lib/gl/textures.hpp
+--- a/lib/gl/textures.hpp	2026-10-13 19:04:06.073434518 +0530
++++ b/lib/gl/textures.hpp	2026-10-13 19:11:42.459354566 +0530
+@@ -69,6 +69,15 @@
+ Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool renderable, uint8_t tag = 0,
+                        TexSwizzle swizzle = TexSwizzle::None);
+ 
++// Asynchronous creation: the handle is known without GL (describe_texture), the storage is made later on the render
++// worker with a texture name generated beforehand (generate_texture_names), so the recording thread need not wait
++// for the worker.
++Texture describe_texture(GLuint id, TextureFormat format, Extent3D size, uint32_t mips, bool renderable,
++                         uint8_t tag = 0);
++Texture create_texture_named(GLuint id, TextureFormat format, Extent3D size, uint32_t mips, bool renderable,
++                             uint8_t tag = 0, TexSwizzle swizzle = TexSwizzle::None);
++void generate_texture_names(GLuint* names, int count);
++
+ // GPU bytes the full mip chain of a texture occupies (what glTexStorage2D allocates).
+ int64_t texture_storage_bytes(TextureFormat format, Extent3D size, uint32_t levels);
+ 
+diff --color -ruN gpu2-base/lib/gx/fifo.cpp gpu2-edit/lib/gx/fifo.cpp
+--- a/lib/gx/fifo.cpp	2026-10-13 19:04:06.063879870 +0530
++++ b/lib/gx/fifo.cpp	2026-10-13 19:09:53.364897249 +0530
 @@ -1,3 +1,4 @@
 +#include "../gl/census.hpp"
  #include "fifo.hpp"
  #include <aurora/hardware.h>
  
-@@ -103,6 +104,8 @@ void latch_gpu_draw_done() {
+@@ -103,6 +104,8 @@
    }
    sGpuFinishPending.store(true, std::memory_order_release);
    sDrawDoneLatches.fetch_add(1, std::memory_order_release);
@@ -453,7 +652,7 @@ index c6dc4ea..564e992 100644
  }
  
  void wake_worker() noexcept {
-@@ -125,7 +128,10 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
+@@ -125,7 +128,10 @@
          AURORA_ASSERT(gfx::begin_hardware_frame(), "Original GX hardware staging/recorder failed to begin");
          sHardwareFrameActive = true;
        }
@@ -465,7 +664,7 @@ index c6dc4ea..564e992 100644
      }
      AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
                    "FIFO processor made invalid progress: processed {} of {} remaining bytes", result.bytesProcessed,
-@@ -422,6 +428,7 @@ void wait_draw_done() {
+@@ -422,6 +428,7 @@
    const BOOL enabled = OSDisableInterrupts();
    struct Mask { BOOL enabled; ~Mask() { OSRestoreInterrupts(enabled); } } mask{enabled};
    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
@@ -473,7 +672,7 @@ index c6dc4ea..564e992 100644
    while (!sDrawDone) {
      // Native equivalent of source OSSleepThread: allow the genuine latched
      // interrupt while the source owner sleeps, then reenter its critical section.
-@@ -429,7 +436,12 @@ void wait_draw_done() {
+@@ -429,7 +436,12 @@
      // Sleep on the genuine finish IRQ; native desktop presentation is separate.
      aurora_service_hardware_interrupts();
      service_draw_done();
@@ -487,10 +686,9 @@ index c6dc4ea..564e992 100644
      OSDisableInterrupts();
      AURORA_ASSERT(sDrawDone || std::chrono::steady_clock::now() < deadline,
                    "GXWaitDrawDone timed out without a genuine GPU finish interrupt");
-diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
-index 9ef12a1..47e84dd 100644
---- a/lib/gx/texture.cpp
-+++ b/lib/gx/texture.cpp
+diff --color -ruN gpu2-base/lib/gx/texture.cpp gpu2-edit/lib/gx/texture.cpp
+--- a/lib/gx/texture.cpp	2026-10-13 19:04:06.086142292 +0530
++++ b/lib/gx/texture.cpp	2026-10-13 19:09:53.365147749 +0530
 @@ -14,6 +14,7 @@
  
  #include <algorithm>
@@ -499,7 +697,7 @@ index 9ef12a1..47e84dd 100644
  #include <cstddef>
  #include <cstdint>
  #include <cstdlib>
-@@ -623,14 +624,20 @@ struct StreamKey {
+@@ -623,14 +624,20 @@
  struct StreamSlot {
    gfx::TextureHandle handle; // set once streaming
    uint64_t lastChangeFrame = 0;
@@ -521,7 +719,7 @@ index 9ef12a1..47e84dd 100644
        s_streamSlots.erase(it++);
      } else {
        ++it;
-@@ -651,7 +658,9 @@ gfx::TextureHandle try_streaming_update(const GXTexObj_& obj) {
+@@ -651,7 +658,9 @@
        slot.streak = 0; // the same buffer holding several textures within one frame: not video
        return {};
      }
