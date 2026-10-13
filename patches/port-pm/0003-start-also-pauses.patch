@@ -1,0 +1,33 @@
+diff --git a/src/bootstrap/gamepad_actions.h b/src/bootstrap/gamepad_actions.h
+--- a/src/bootstrap/gamepad_actions.h
++++ b/src/bootstrap/gamepad_actions.h
+@@ -31,7 +31,7 @@
+ inline constexpr std::array<GamepadAction, GamepadActionCount> kGamepadActions{{
+     {"a", "A", "Confirm, select", "a"},
+     {"b", "B", "Back", "b"},
+-    {"one", "1", nullptr, "x"},
++    {"one", "1", "Pause in a match (Start also presses it)", "x | start"},
+     {"two", "2", nullptr, "y"},
+     {"plus", "+ (Plus)", nullptr, "start"},
+     {"minus", "\xE2\x88\x92 (Minus)", nullptr, "back"},
+diff --git a/src/platform/gamepad_bindings.cpp b/src/platform/gamepad_bindings.cpp
+--- a/src/platform/gamepad_bindings.cpp
++++ b/src/platform/gamepad_bindings.cpp
+@@ -132,7 +132,7 @@
+         // Nintendo prints A on the right and B at the bottom, X on top and Y on the left.
+         inputs[GamepadActionA] = "b";
+         inputs[GamepadActionB] = "a";
+-        inputs[GamepadActionOne] = "x";
++        inputs[GamepadActionOne] = "x | start";
+         inputs[GamepadActionTwo] = "y";
+     } else if (family == GamepadFamily::GameCube) {
+         // GameCube (USB adapter): A bottom, B left, X right, Y top; L/R are
+@@ -140,7 +140,7 @@
+         // buttons left for 1, - and HOME.
+         inputs[GamepadActionA] = "a";
+         inputs[GamepadActionB] = "x";
+-        inputs[GamepadActionOne] = "none";
++        inputs[GamepadActionOne] = "start";
+         inputs[GamepadActionTwo] = "y";
+         inputs[GamepadActionMinus] = "none";
+         inputs[GamepadActionHome] = "none";

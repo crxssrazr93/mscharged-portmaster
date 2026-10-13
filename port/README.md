@@ -18,16 +18,25 @@ The launcher looks for a file named R4QE01 first, then for any .rvz or .iso file
 
 The game is played with the controller as a Wii Remote with Nunchuk. The left stick is the Nunchuk stick, the right stick moves the pointer in menus.
 
-| Wii | Controller |
-| --- | --- |
-| A, B | A, B |
-| 1, 2 | X, Y |
-| Plus and minus | Start and Select |
-| D-pad | D-pad |
-| C | L1 |
-| Z | L2 |
-| Shake Remote (hit an opponent) | R2 |
-| Shake Nunchuk (switch items) | R1 |
+| Controller button | Wii input | What it does in the game |
+| --- | --- | --- |
+| Left stick | Nunchuk stick | Move the player |
+| Right stick | Pointer | Aim and point in menus |
+| D-pad | D-pad | Menu navigation |
+| A (bottom) | A | Confirm in menus, pass |
+| B (right) | B | Back in menus, shoot |
+| X (left) | 1 | Pause and resume in a match |
+| Y (top) | 2 | Second action button |
+| Start | Plus and 1 | Pause and resume in a match, Press Plus on the title screen |
+| Select | Minus | Title screen and the page tabs of the Controls page (unused in a match, as on the Wii) |
+| Menu or Guide | Home | Skips fades and movies |
+| L1 | C | Nunchuk C (chip shot) |
+| L2 | Z | Nunchuk Z (aim) |
+| R1 | Shake Nunchuk | Switch items |
+| R2 | Shake Remote | Hit an opponent |
+| Select and Start together | none | Quit the port |
+
+On a pad whose face buttons are labelled the Nintendo way, A and B and X and Y swap places so that the Wii labels match. Players who prefer other buttons can make a profile in `mscharged.ini`.
 
 Hold Select and press Start to quit.
 
