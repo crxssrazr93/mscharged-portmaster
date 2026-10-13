@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 15:05:51 +0530
+Subject: [PATCH] AURORA_GL_LODADD test aid
+
+---
+ lib/gx/shader_info.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/lib/gx/shader_info.cpp b/lib/gx/shader_info.cpp
+index 5271470..1607014 100644
+--- a/lib/gx/shader_info.cpp
++++ b/lib/gx/shader_info.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "shader_info.hpp"
+ 
+ #include "../gfx/recording.hpp"
+@@ -23,7 +24,9 @@ Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
+     const float replacementScale = static_cast<float>(tex.ref->size.width) / std::max(width, 1.f);
+     vpBias = std::log2(viewportScale / std::max(replacementScale, 0.001f));
+   }
+-  return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
++  // Test aid: AURORA_GL_LODADD=<x> adds x to every texture LOD bias (image comparison experiments).
++  static const float lodAdd = std::getenv("AURORA_GL_LODADD") != nullptr ? std::strtof(std::getenv("AURORA_GL_LODADD"), nullptr) : 0.f;
++  return {width, height, tex.texObj.lod_bias() + vpBias + lodAdd, 0.0f};
+ }
+ 
+ void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {

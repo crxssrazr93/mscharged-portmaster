@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 15:57:35 +0530
+Subject: [PATCH] census: ring peaks
+
+---
+ lib/gfx/frame.cpp     |  7 +++++++
+ lib/gfx/recording.cpp |  2 ++
+ lib/gl/census.cpp     | 17 +++++++++++++++++
+ lib/gl/census.hpp     |  7 +++++++
+ 4 files changed, 33 insertions(+)
+
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index c7631c6..c7fca88 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -514,6 +514,7 @@ static bool begin_frame_impl(bool preserveEfb) {
+     g_nativeVertexCacheOffset = 0;
+     g_nativeIndexCacheOffset = 0;
+     ++g_nativeGeomCacheGeneration;
++    gl::census::native_cache_reset();
+   }
+ 
+   // Per-frame data goes into the packet's ByteBuffers, uploaded to the GL ring buffers with
+@@ -580,6 +581,12 @@ static void end_frame_impl(EndFrameCallback callback, bool presenting, bool hard
+   }
+   const auto recorded = end_recording();
+   auto& frame = *recorded.packet;
++  gl::census::ring_sample(gl::census::RingVerts, static_cast<int64_t>(frame.verts.size()));
++  gl::census::ring_sample(gl::census::RingUniforms, static_cast<int64_t>(frame.uniforms.size()));
++  gl::census::ring_sample(gl::census::RingIndices, static_cast<int64_t>(frame.indices.size()));
++  gl::census::ring_sample(gl::census::RingTexUpload, static_cast<int64_t>(frame.textureUpload.size()));
++  gl::census::ring_sample(gl::census::RingNativeVerts, g_nativeVertexCacheOffset);
++  gl::census::ring_sample(gl::census::RingNativeIndices, g_nativeIndexCacheOffset);
+   const size_t frameSlot = recorded.frameSlot;
+   const uint64_t frameId = frame.frameId;
+   end_pipeline_frame();
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index c2e2af6..0984ccb 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -11,6 +11,7 @@
+ #include "tex_copy_conv.hpp"
+ #include "tex_palette_conv.hpp"
+ #include "texture.hpp"
++#include "../gl/census.hpp"
+ #include "../gl/fbo_cache.hpp"
+ #include "../gl/state.hpp"
+ #include "../gl/textures.hpp"
+@@ -234,6 +235,7 @@ Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignm
+   if (ceiling != 0 && begin + length > ceiling && begin <= ceiling) {
+     // The per-frame ring ceilings are reserved up front so recording never reallocs under the render
+     // worker's concurrent reads; growing past one reallocs and also overruns the GL ring buffer.
++    gl::census::ring_overflow();
+     Log.warn("Per-frame buffer overflow: {} + {} bytes exceeds the {} byte ring", begin, length, ceiling);
+   }
+   if (length > 0) {
+diff --git a/lib/gl/census.cpp b/lib/gl/census.cpp
+index 6694a7b..3d69bbb 100644
+--- a/lib/gl/census.cpp
++++ b/lib/gl/census.cpp
+@@ -31,6 +31,10 @@ std::atomic<int64_t> s_progSourceUs{0};
+ std::atomic<int64_t> s_progBinaryUs{0};
+ std::atomic<int64_t> s_progMaxUs{0};
+ 
++std::atomic<int64_t> s_ringPeak[RingCount];
++std::atomic<int64_t> s_ringOverflows{0};
++std::atomic<int64_t> s_nativeResets{0};
++
+ double mb(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
+ double mb(const Counter& c) { return mb(c.bytes.load(std::memory_order_relaxed)); }
+ 
+@@ -142,6 +146,14 @@ void texture_removed(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept {
+   s_tags[tag].equiv.fetch_sub(equivBytes, std::memory_order_relaxed);
+ }
+ 
++void ring_sample(Ring ring, int64_t bytesUsed) noexcept {
++  int64_t prev = s_ringPeak[ring].load(std::memory_order_relaxed);
++  while (bytesUsed > prev && !s_ringPeak[ring].compare_exchange_weak(prev, bytesUsed, std::memory_order_relaxed)) {
++  }
++}
++void ring_overflow() noexcept { s_ringOverflows.fetch_add(1, std::memory_order_relaxed); }
++void native_cache_reset() noexcept { s_nativeResets.fetch_add(1, std::memory_order_relaxed); }
++
+ void program_built(bool fromBinary, int64_t microseconds) noexcept {
+   if (fromBinary) {
+     s_progBinary.fetch_add(1, std::memory_order_relaxed);
+@@ -192,6 +204,11 @@ void log_tick() noexcept {
+            static_cast<double>(s_progMaxUs.load(std::memory_order_relaxed)) / 1000.0,
+            fbos.count.load(std::memory_order_relaxed), samplers.count.load(std::memory_order_relaxed), mem.rss, mem.swap,
+            mem.hwm);
++  head += fmt::format(" | ring peak MB: vtx {:.2f} uni {:.2f} idx {:.2f} texupload {:.2f} nativeVtx {:.2f} nativeIdx {:.2f}, "
++                      "overflows {} nativeResets {}",
++                      mb(s_ringPeak[RingVerts]), mb(s_ringPeak[RingUniforms]), mb(s_ringPeak[RingIndices]),
++                      mb(s_ringPeak[RingTexUpload]), mb(s_ringPeak[RingNativeVerts]), mb(s_ringPeak[RingNativeIndices]),
++                      s_ringOverflows.load(), s_nativeResets.load());
+   const auto emit = [&](const std::string& m) { detailed > 0 ? Log.warn("{}", m) : Log.info("{}", m); };
+   emit(head);
+   if (detailed > 0) {
+diff --git a/lib/gl/census.hpp b/lib/gl/census.hpp
+index 87025b3..00ee43b 100644
+--- a/lib/gl/census.hpp
++++ b/lib/gl/census.hpp
+@@ -65,6 +65,13 @@ void texture_removed(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept;
+ // A program came from a link of GLSL source (`fromBinary` false) or from the program binary cache.
+ void program_built(bool fromBinary, int64_t microseconds) noexcept;
+ 
++// Peak usage of the per frame rings and the native geometry caches (bytes in use at the end of a frame), to
++// size them. Safe from any thread.
++enum Ring : uint8_t { RingVerts, RingUniforms, RingIndices, RingTexUpload, RingNativeVerts, RingNativeIndices, RingCount };
++void ring_sample(Ring ring, int64_t bytesUsed) noexcept;
++void ring_overflow() noexcept;      // a per frame ring ran past its ceiling
++void native_cache_reset() noexcept; // a native geometry cache ran full and was recycled
++
+ // Rate-limited summary line (one [gl-census] INFO log every ~10 s, every AURORA_CENSUS seconds when
+ // set). Called once per frame from the end-of-frame path on the render worker; cheap when not due.
+ void log_tick() noexcept;

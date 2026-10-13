@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t <t@t>
+Date: Tue, 13 Oct 2026 14:06:46 +0530
+Subject: [PATCH] Fix partial EFB copy crop offset (measure from the bottom
+ edge of the bottom-up GL target)
+
+---
+ lib/gfx/recording.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index ef185c2..b48cdee 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -898,7 +898,11 @@ void resolve_pass_into_with_uniforms(TextureHandle texture, ClipRect rect, bool
+   const auto srcH = static_cast<float>(prevPass.targetSize.height);
+   // Push the UV transform uniform for tex_copy_conv (crop region in UV space).
+   const tex_copy_conv::Uniforms uniforms{
+-      .offset = {static_cast<float>(rect.x) / srcW, static_cast<float>(rect.y) / srcH},
++      // The GL colour target is stored bottom-up while the conversion draw samples it as if its first row
++      // were the image top (the copy flips the image into top-down texture order), so a crop that does not
++      // start at the bottom must be measured from the bottom edge: an offset of rect.y would copy the
++      // wrong rows (the 256x256 corner copies of the captain select holograms came out empty).
++      .offset = {static_cast<float>(rect.x) / srcW, (srcH - static_cast<float>(rect.y + rect.height)) / srcH},
+       .scale = {static_cast<float>(rect.width) / srcW, static_cast<float>(rect.height) / srcH},
+       .opaqueAlpha = !gx::efb_has_alpha(sourceFormat),
+   };

@@ -1,0 +1,1158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 15:30:47 +0530
+Subject: [PATCH] WIP census, texture tags, compaction (exact/near), format
+ additions
+
+---
+ cmake/aurora_gx.cmake       |   1 +
+ lib/gfx/gfx_types.hpp       |   5 +
+ lib/gfx/resource_cache.cpp  |   5 +-
+ lib/gfx/resource_cache.hpp  |   4 +-
+ lib/gfx/scanout.cpp         |   3 +-
+ lib/gfx/texture.cpp         | 105 ++++++++++-------
+ lib/gfx/texture_compact.cpp | 221 ++++++++++++++++++++++++++++++++++++
+ lib/gfx/texture_compact.hpp |  36 ++++++
+ lib/gfx/texture_format.cpp  |   6 +
+ lib/gfx/xfb.cpp             |   3 +-
+ lib/gl/census.cpp           | 186 +++++++++++++++++++++++++++++-
+ lib/gl/census.hpp           |  41 ++++++-
+ lib/gl/gl_core.hpp          |   8 ++
+ lib/gl/handles.hpp          |   1 +
+ lib/gl/program.cpp          |  10 ++
+ lib/gl/textures.cpp         |  81 +++++++++++--
+ lib/gl/textures.hpp         |  16 ++-
+ lib/imgui.cpp               |   3 +-
+ 18 files changed, 673 insertions(+), 62 deletions(-)
+ create mode 100644 lib/gfx/texture_compact.cpp
+ create mode 100644 lib/gfx/texture_compact.hpp
+
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index 5434d38..c09a560 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -13,6 +13,7 @@ add_library(aurora_gx STATIC
+         lib/gfx/tex_palette_conv.cpp
+         lib/gfx/texture.cpp
+         lib/gfx/texture_format.cpp
++        lib/gfx/texture_compact.cpp
+         lib/gfx/texture_convert.cpp
+         lib/gfx/texture_replacement.cpp
+         lib/gx/attr_fmt.cpp
+diff --git a/lib/gfx/gfx_types.hpp b/lib/gfx/gfx_types.hpp
+index ca2c1a0..bf84a57 100644
+--- a/lib/gfx/gfx_types.hpp
++++ b/lib/gfx/gfx_types.hpp
+@@ -44,6 +44,11 @@ enum class TextureFormat : uint8_t {
+   ETC2RGBA8Unorm,
+   ASTC4x4Unorm,
+   ASTC8x8Unorm,
++  // 16 bit and punch-through formats for compacted GX textures (lib/gfx/texture_compact.cpp)
++  RGB565Unorm,
++  RGB5A1Unorm,
++  RGBA4Unorm,
++  ETC2RGB8A1Unorm,
+ };
+ 
+ enum class LoadOp : uint8_t {
+diff --git a/lib/gfx/resource_cache.cpp b/lib/gfx/resource_cache.cpp
+index 4c543ad..cbf3d99 100644
+--- a/lib/gfx/resource_cache.cpp
++++ b/lib/gfx/resource_cache.cpp
+@@ -108,10 +108,11 @@ gl::BindingSet find_bind_group(BindGroupRef id) {
+   return it->second.bindGroup;
+ }
+ 
+-gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable) {
++gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable,
++                              uint8_t censusTag, gl::TexSwizzle swizzle) {
+   gl::Texture result;
+   render_worker::enqueue_work([&] {
+-    result = gl::create_texture(format, size, mips, renderable);
++    result = gl::create_texture(format, size, mips, renderable, censusTag, swizzle);
+     // create_texture binds GL_TEXTURE_2D directly; drop the state cache's texture-unit shadow so
+     // the next draw re-binds.
+     gl::invalidate_texture_bindings();
+diff --git a/lib/gfx/resource_cache.hpp b/lib/gfx/resource_cache.hpp
+index dcda3e7..e07ad35 100644
+--- a/lib/gfx/resource_cache.hpp
++++ b/lib/gfx/resource_cache.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "types.hpp"
++#include "../gl/textures.hpp"
+ 
+ namespace aurora::gfx {
+ 
+@@ -18,7 +19,8 @@ gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor);
+ // callers (texture resolve, bind-group build) run on the recording thread. These marshal
+ // gl::create_texture/create_sampler to the worker and block for the result, so the returned
+ // handle's GL name is valid immediately. Cheap in steady state (creation happens on cache miss).
+-gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable);
++gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable,
++                              uint8_t censusTag = 0, gl::TexSwizzle swizzle = gl::TexSwizzle::None);
+ gl::Sampler create_gl_sampler(const gl::SamplerDescriptor& descriptor);
+ 
+ namespace detail {
+diff --git a/lib/gfx/scanout.cpp b/lib/gfx/scanout.cpp
+index c2a7b81..bc73995 100644
+--- a/lib/gfx/scanout.cpp
++++ b/lib/gfx/scanout.cpp
+@@ -2,6 +2,7 @@
+ #include "scanout_geometry.hpp"
+ #include <SDL3/SDL_video.h>
+ #include "xfb.hpp"
++#include "../gl/census.hpp"
+ #include "render_worker.hpp"
+ #include "recording.hpp"
+ #include "resources.hpp"
+@@ -401,7 +402,7 @@ TextureHandle new_signal(uint32_t width, uint32_t height) {
+   const gl::Extent3D size{width, height, 1};
+   // Rendered by the signal passes and sampled by the next stage; create_gl_texture
+   // marshals the creation to the render worker.
+-  const gl::Texture texture = create_gl_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/true);
++  const gl::Texture texture = create_gl_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/true, gl::census::TagScanout);
+   return std::make_shared<TextureRef>(texture, texture, texture, size, gl::TextureFormat::RGBA8Unorm, 1, GX_TF_RGBA8);
+ }
+ // Render worker only. `uniformSlot` selects the uniform buffer range.
+diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
+index e0b7a69..cb8f1df 100644
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -7,6 +7,7 @@
+ #include "aurora/aurora.h"
+ #include "render_worker.hpp"
+ #include "texture.hpp"
++#include "texture_compact.hpp"
+ #include "texture_convert.hpp"
+ #include "../gx/gx_fmt.hpp"
+ 
+@@ -46,31 +47,82 @@ TextureRef::~TextureRef() {
+   }
+ }
+ 
+-TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
++namespace {
++// Shared by the static and dynamic creators: Mali's glTexStorage2D rejects zero sized textures and mip counts above
++// floor(log2(max(w,h)))+1, so clamp both (desktop Mesa tolerates either).
++void clamp_texture_dims(uint32_t& width, uint32_t& height, uint32_t& mips, const char* label) {
++  // A zero-sized texture makes Mali's glTexStorage2D fail with GL_INVALID_VALUE and lose
++  // the device (desktop Mesa tolerates it). GX can request 0-dim copies/targets when a
++  // subsystem is scaled to nothing (e.g. shadows under shadowResolutionMultiplier=0), so
++  // clamp to at least 1x1 — the texture is valid and the draw becomes an effective no-op.
++  width = width < 1u ? 1u : width;
++  height = height < 1u ? 1u : height;
++  // Some GX textures over-specify their mip chain (harmless on desktop Mesa, fatal on Mali), so clamp to the
++  // legal maximum.
++  uint32_t maxMips = 1;
++  for (uint32_t d = (width > height ? width : height); d > 1u; d >>= 1) {
++    ++maxMips;
++  }
++  if (mips > maxMips) {
++    Log.warn("Clamping texture '{}' mip levels {} -> {} for {}x{} (Mali glTexStorage2D limit)", label, mips, maxMips,
++             width, height);
++    mips = maxMips;
++  }
++  if (mips == 0) {
++    mips = 1;
++  }
++}
++} // namespace
++
++TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat, ArrayRef<uint8_t> data,
+                                     bool tlut, const char* label) noexcept {
+   ZoneScoped;
+ 
+-  auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
+-  auto& ref = *handle;
++  clamp_texture_dims(width, height, mips, label);
++  const gl::Extent3D size{
++      .width = width,
++      .height = height,
++      .depthOrArrayLayers = 1,
++  };
+ 
+   ConvertedTexture converted;
+-  if (ref.gxFormat != InvalidTextureFormat) {
++  if (gxFormat != InvalidTextureFormat) {
+     if (tlut) {
+-      CHECK(ref.size.height == 1, "new_static_texture_2d[{}]: expected tlut height 1, got {}", label, ref.size.height);
+-      CHECK(ref.mipCount == 1, "new_static_texture_2d[{}]: expected tlut mipCount 1, got {}", label, ref.mipCount);
+-      converted = convert_tlut(ref.gxFormat, ref.size.width, data);
++      CHECK(height == 1, "new_static_texture_2d[{}]: expected tlut height 1, got {}", label, height);
++      CHECK(mips == 1, "new_static_texture_2d[{}]: expected tlut mipCount 1, got {}", label, mips);
++      converted = convert_tlut(gxFormat, width, data);
+     } else {
+-      converted = convert_texture(ref.gxFormat, ref.size.width, ref.size.height, ref.mipCount, data);
++      converted = convert_texture(gxFormat, width, height, mips, data);
+     }
+     if (!converted.data.empty()) {
+       data = converted.data;
+-      ref.hasArbitraryMips = converted.hasArbitraryMips;
+     }
+   }
+ 
++  // Store what was decoded to RGBA8 in the smallest GPU format that keeps it (grey as R8/RG8 with a swizzle, 4 and
++  // 5/6 bit images as 16 bit formats, see texture_compact.cpp). GX formats the decoder passes through (palette
++  // indices, replacement pack formats) and TLUTs keep their format.
++  gl::TextureFormat glFormat = to_gl(gxFormat);
++  gl::TexSwizzle swizzle = gl::TexSwizzle::None;
++  CompactedTexture compacted;
++  if (!tlut && gxFormat != InvalidTextureFormat && glFormat == gl::TextureFormat::RGBA8Unorm) {
++    compacted = compact_rgba8(width, height, mips, data);
++    if (!compacted.data.empty()) {
++      data = compacted.data;
++      glFormat = compacted.format;
++      swizzle = compacted.swizzle;
++    }
++  }
++
++  gl::Texture texture =
++      create_gl_texture(glFormat, size, mips, /*renderable=*/false, census_tag_for(gxFormat, tlut), swizzle);
++  auto handle = std::make_shared<TextureRef>(texture, texture, gl::Texture{}, size, glFormat, mips, gxFormat);
++  auto& ref = *handle;
++  ref.hasArbitraryMips = converted.hasArbitraryMips;
++
+   uint32_t offset = 0;
+-  // Use ref.mipCount (already clamped in new_dynamic_texture_2d), not the raw mips
+-  // argument — otherwise we'd write past the texture's actual mip levels.
++  // Use ref.mipCount (already clamped), not the raw mips argument — otherwise we'd write past the texture's actual
++  // mip levels.
+   for (uint32_t mip = 0; mip < ref.mipCount; ++mip) {
+     const gl::Extent3D mipSize{
+         .width = std::max(ref.size.width >> mip, 1u),
+@@ -101,39 +153,16 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
+ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                      const char* label) noexcept {
+   ZoneScopedS(3);
+-  // A zero-sized texture makes Mali's glTexStorage2D fail with GL_INVALID_VALUE and lose
+-  // the device (desktop Mesa tolerates it). GX can request 0-dim copies/targets when a
+-  // subsystem is scaled to nothing (e.g. shadows under shadowResolutionMultiplier=0), so
+-  // clamp to at least 1x1 — the texture is valid and the draw becomes an effective no-op.
+-  width = width < 1u ? 1u : width;
+-  height = height < 1u ? 1u : height;
+-  // Mali's GLES rejects glTexStorage2D with GL_INVALID_VALUE when the requested mip
+-  // count exceeds floor(log2(max(w,h)))+1. Some GX textures over-specify their mip
+-  // chain (harmless on desktop Mesa, fatal on Mali), so clamp to the legal maximum.
+-  {
+-    uint32_t maxMips = 1;
+-    for (uint32_t d = (width > height ? width : height); d > 1u; d >>= 1) {
+-      ++maxMips;
+-    }
+-    if (mips > maxMips) {
+-      Log.warn("Clamping texture '{}' mip levels {} -> {} for {}x{} (Mali glTexStorage2D limit)", label, mips, maxMips,
+-               width, height);
+-      mips = maxMips;
+-    }
+-    if (mips == 0) {
+-      mips = 1;
+-    }
+-  }
++  clamp_texture_dims(width, height, mips, label);
+   const auto glFormat = to_gl(gxFormat);
+   const gl::Extent3D size{
+       .width = width,
+       .height = height,
+       .depthOrArrayLayers = 1,
+   };
+-  // Sampleable texture: created on the render worker (marshaled). Base-game GX formats
+-  // all decode to RGBA8 on the CPU; the R8/RG8 replacement-pack swizzle is a later
+-  // concern (texture-replacement re-verify), not the Ordon path.
+-  gl::Texture texture = create_gl_texture(glFormat, size, mips, /*renderable=*/false);
++  // Sampleable texture: created on the render worker (marshaled). Dynamic textures keep the plain decode format
++  // (write_texture can replace their contents with anything).
++  gl::Texture texture = create_gl_texture(glFormat, size, mips, /*renderable=*/false, census_tag_for(gxFormat, false));
+   return std::make_shared<TextureRef>(texture, texture, gl::Texture{}, size, glFormat, mips, gxFormat);
+ }
+ 
+diff --git a/lib/gfx/texture_compact.cpp b/lib/gfx/texture_compact.cpp
+new file mode 100644
+index 0000000..e120650
+--- /dev/null
++++ b/lib/gfx/texture_compact.cpp
+@@ -0,0 +1,221 @@
++#include "texture_compact.hpp"
++
++#include "../gl/census.hpp"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#include <dolphin/gx.h>
++#include <tracy/Tracy.hpp>
++
++namespace aurora::gfx {
++namespace {
++Module Log("aurora::gfx::texture_compact");
++
++std::atomic<int> g_mode{static_cast<int>(CompactMode::Near)};
++
++bool parse_env(CompactMode& out) {
++  const char* env = std::getenv("AURORA_TEXTURE_COMPACT");
++  if (env == nullptr || env[0] == '\0') {
++    return false;
++  }
++  if (!std::strcmp(env, "off") || !std::strcmp(env, "0")) {
++    out = CompactMode::Off;
++  } else if (!std::strcmp(env, "exact")) {
++    out = CompactMode::Exact;
++  } else if (!std::strcmp(env, "near") || !std::strcmp(env, "1")) {
++    out = CompactMode::Near;
++  } else if (!std::strcmp(env, "lossy") || !std::strcmp(env, "2")) {
++    out = CompactMode::Lossy;
++  } else {
++    Log.warn("AURORA_TEXTURE_COMPACT={} not understood (off|exact|near|lossy)", env);
++    return false;
++  }
++  return true;
++}
++
++// Values an n bit channel expands to when widened to 8 bits the way GX does ((c << (8-n)) | (c >> (2n-8))).
++struct Grids {
++  std::array<bool, 256> is4{}, is5{}, is6{};
++  Grids() {
++    for (int v = 0; v < 256; ++v) {
++      is4[v] = (v % 17) == 0;
++      const int c5 = v >> 3;
++      is5[v] = ((c5 << 3) | (c5 >> 2)) == v;
++      const int c6 = v >> 2;
++      is6[v] = ((c6 << 2) | (c6 >> 4)) == v;
++    }
++  }
++};
++const Grids g_grids;
++
++struct Stats {
++  bool gray = true;     // r == g == b
++  bool intensity = true; // gray and a == r
++  bool opaque = true;   // a == 255
++  bool q4 = true;       // every channel (alpha too) is a 4 bit expansion
++  bool q555 = true;     // opaque, every color channel a 5 bit expansion
++  bool q565 = true;     // opaque, r and b 5 bit, g 6 bit expansions
++  [[nodiscard]] bool any() const { return gray || q4 || q555 || q565; }
++};
++
++Stats analyze(const uint8_t* px, size_t count) {
++  Stats s;
++  for (size_t i = 0; i < count; ++i, px += 4) {
++    const uint8_t r = px[0], g = px[1], b = px[2], a = px[3];
++    if (s.gray && (r != g || g != b)) {
++      s.gray = s.intensity = false;
++    }
++    if (s.intensity && a != r) {
++      s.intensity = false;
++    }
++    if (a != 255) {
++      s.opaque = s.q555 = s.q565 = false;
++    }
++    if (s.q4 && !(g_grids.is4[r] && g_grids.is4[g] && g_grids.is4[b] && g_grids.is4[a])) {
++      s.q4 = false;
++    }
++    if (s.q555 && !(g_grids.is5[r] && g_grids.is5[g] && g_grids.is5[b])) {
++      s.q555 = false;
++    }
++    if (s.q565 && !(g_grids.is5[r] && g_grids.is6[g] && g_grids.is5[b])) {
++      s.q565 = false;
++    }
++    // Grey images stay in the running even when they fail the others, so only quit when nothing is left.
++    if (!s.any()) {
++      break;
++    }
++  }
++  return s;
++}
++
++size_t texel_count(uint32_t width, uint32_t height, uint32_t mips) {
++  size_t total = 0;
++  for (uint32_t m = 0; m < mips; ++m) {
++    total += static_cast<size_t>(std::max(width >> m, 1u)) * std::max(height >> m, 1u);
++  }
++  return total;
++}
++} // namespace
++
++CompactMode compact_mode() noexcept {
++  static const bool envChecked = [] {
++    CompactMode m;
++    if (parse_env(m)) {
++      g_mode.store(static_cast<int>(m));
++      Log.info("[texture-compact] AURORA_TEXTURE_COMPACT sets mode {}", static_cast<int>(m));
++    }
++    return true;
++  }();
++  (void)envChecked;
++  return static_cast<CompactMode>(g_mode.load(std::memory_order_relaxed));
++}
++
++void set_compact_mode(CompactMode mode) noexcept {
++  CompactMode env;
++  if (parse_env(env)) {
++    return; // the environment wins
++  }
++  g_mode.store(static_cast<int>(mode));
++}
++
++uint8_t census_tag_for(u32 gxFormat, bool tlut) noexcept {
++  using namespace gl::census;
++  if (tlut) {
++    return TagTlut;
++  }
++  switch (gxFormat) {
++  case GX_TF_I4:
++    return TagI4;
++  case GX_TF_I8:
++    return TagI8;
++  case GX_TF_IA4:
++    return TagIA4;
++  case GX_TF_IA8:
++    return TagIA8;
++  case GX_TF_RGB565:
++    return TagRGB565;
++  case GX_TF_RGB5A3:
++    return TagRGB5A3;
++  case GX_TF_RGBA8:
++    return TagRGBA8;
++  case GX_TF_CMPR:
++    return TagCMPR;
++  case GX_TF_C4:
++    return TagC4;
++  case GX_TF_C8:
++    return TagC8;
++  case GX_TF_C14X2:
++    return TagC14X2;
++  default:
++    return (gxFormat & _GX_TF_PC) != 0 ? TagPC : TagOther;
++  }
++}
++
++CompactedTexture compact_rgba8(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> rgba) {
++  ZoneScoped;
++  CompactedTexture out;
++  const CompactMode mode = compact_mode();
++  const size_t count = texel_count(width, height, mips);
++  if (mode == CompactMode::Off || rgba.size() < count * 4) {
++    return out;
++  }
++  const uint8_t* src = rgba.data();
++  const Stats st = analyze(src, count);
++
++  // Smallest first. 1 byte per texel: grey images; 2 bytes: 4 bit images, grey with alpha, 5/6 bit opaque images.
++  if (st.intensity) {
++    out.format = gl::TextureFormat::R8Unorm;
++    out.swizzle = gl::TexSwizzle::RRRR;
++    out.data = ByteBuffer(count);
++    for (size_t i = 0; i < count; ++i) {
++      out.data.data()[i] = src[i * 4];
++    }
++  } else if (st.gray && st.opaque) {
++    out.format = gl::TextureFormat::R8Unorm;
++    out.swizzle = gl::TexSwizzle::RRR1;
++    out.data = ByteBuffer(count);
++    for (size_t i = 0; i < count; ++i) {
++      out.data.data()[i] = src[i * 4];
++    }
++  } else if (st.gray) {
++    out.format = gl::TextureFormat::RG8Unorm;
++    out.swizzle = gl::TexSwizzle::RRRG;
++    out.data = ByteBuffer(count * 2);
++    for (size_t i = 0; i < count; ++i) {
++      out.data.data()[i * 2] = src[i * 4];
++      out.data.data()[i * 2 + 1] = src[i * 4 + 3];
++    }
++  } else if (st.q4) {
++    out.format = gl::TextureFormat::RGBA4Unorm;
++    out.data = ByteBuffer(count * 2);
++    auto* dst = reinterpret_cast<uint16_t*>(out.data.data());
++    for (size_t i = 0; i < count; ++i) {
++      const uint8_t* p = src + i * 4;
++      dst[i] = static_cast<uint16_t>((p[0] >> 4) << 12 | (p[1] >> 4) << 8 | (p[2] >> 4) << 4 | (p[3] >> 4));
++    }
++  } else if (mode >= CompactMode::Near && st.q555) {
++    out.format = gl::TextureFormat::RGB5A1Unorm;
++    out.data = ByteBuffer(count * 2);
++    auto* dst = reinterpret_cast<uint16_t*>(out.data.data());
++    for (size_t i = 0; i < count; ++i) {
++      const uint8_t* p = src + i * 4;
++      dst[i] = static_cast<uint16_t>((p[0] >> 3) << 11 | (p[1] >> 3) << 6 | (p[2] >> 3) << 1 | 1);
++    }
++  } else if (mode >= CompactMode::Near && st.q565) {
++    out.format = gl::TextureFormat::RGB565Unorm;
++    out.data = ByteBuffer(count * 2);
++    auto* dst = reinterpret_cast<uint16_t*>(out.data.data());
++    for (size_t i = 0; i < count; ++i) {
++      const uint8_t* p = src + i * 4;
++      dst[i] = static_cast<uint16_t>((p[0] >> 3) << 11 | (p[1] >> 2) << 5 | (p[2] >> 3));
++    }
++  }
++  return out;
++}
++
++} // namespace aurora::gfx
+diff --git a/lib/gfx/texture_compact.hpp b/lib/gfx/texture_compact.hpp
+new file mode 100644
+index 0000000..6424f9f
+--- /dev/null
++++ b/lib/gfx/texture_compact.hpp
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include "texture.hpp"
++#include "../gl/textures.hpp"
++#include "../internal.hpp"
++
++namespace aurora::gfx {
++
++// How decoded GX textures are stored on the GPU. Every mode but Off keeps the sampled colors identical
++// to the RGBA8 decode, except where noted.
++enum class CompactMode : uint8_t {
++  Off,   // always RGBA8 (the reference behavior)
++  Exact, // R8/RG8 with a swizzle for grey images, RGBA4 for 4 bit images: bit exact
++  Near,  // plus RGB5_A1/RGB565 for opaque 5/6 bit images: sampled value within 1/255 of the RGBA8 decode
++  Lossy, // plus ETC2 for what is left (compressed GX textures and photographic RGBA8)
++};
++
++// AURORA_TEXTURE_COMPACT=off|exact|near|lossy overrides the default (read once). set_compact_mode() is the
++// programmatic setting (honored unless the environment variable is present).
++CompactMode compact_mode() noexcept;
++void set_compact_mode(CompactMode mode) noexcept;
++
++struct CompactedTexture {
++  gl::TextureFormat format = gl::TextureFormat::RGBA8Unorm;
++  gl::TexSwizzle swizzle = gl::TexSwizzle::None;
++  ByteBuffer data; // empty when the input is kept as it is
++};
++
++// Chooses the smallest representation allowed by compact_mode() for `rgba` (tightly packed RGBA8, all `mips`
++// levels back to back) and converts to it. `data` stays empty when RGBA8 is kept.
++CompactedTexture compact_rgba8(uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> rgba);
++
++// The census category of a GX texture format.
++uint8_t census_tag_for(u32 gxFormat, bool tlut) noexcept;
++
++} // namespace aurora::gfx
+diff --git a/lib/gfx/texture_format.cpp b/lib/gfx/texture_format.cpp
+index 9cf78f8..5e50d58 100644
+--- a/lib/gfx/texture_format.cpp
++++ b/lib/gfx/texture_format.cpp
+@@ -25,14 +25,20 @@ TextureFormatInfo format_info(gl::TextureFormat format) noexcept {
+     return {1, 1, 1, false};
+   case gl::TextureFormat::RG8Unorm:
+   case gl::TextureFormat::R16Sint:
++  case gl::TextureFormat::RGB565Unorm:
++  case gl::TextureFormat::RGB5A1Unorm:
++  case gl::TextureFormat::RGBA4Unorm:
+     return {1, 1, 2, false};
+   case gl::TextureFormat::RGBA8Unorm:
+   case gl::TextureFormat::BGRA8Unorm:
+   case gl::TextureFormat::R32Float:
+     return {1, 1, 4, false};
+   case gl::TextureFormat::BC1RGBAUnorm:
++  case gl::TextureFormat::ETC2RGB8Unorm:
++  case gl::TextureFormat::ETC2RGB8A1Unorm:
+     return {4, 4, 8, true};
+   case gl::TextureFormat::BC3RGBAUnorm:
++  case gl::TextureFormat::ETC2RGBA8Unorm:
+   case gl::TextureFormat::BC5RGUnorm:
+   case gl::TextureFormat::BC7RGBAUnorm:
+     return {4, 4, 16, true};
+diff --git a/lib/gfx/xfb.cpp b/lib/gfx/xfb.cpp
+index 7082b28..10bb7ec 100644
+--- a/lib/gfx/xfb.cpp
++++ b/lib/gfx/xfb.cpp
+@@ -1,3 +1,4 @@
++#include "../gl/census.hpp"
+ #include "xfb.hpp"
+ #include <aurora/gl.hpp>
+ #include <cstdio>
+@@ -124,7 +125,7 @@ TextureHandle new_packed_texture(uint32_t pairs, uint32_t height) {
+   const gl::Extent3D size{pairs, height, 1};
+   // Sampled by the VI scanout and rendered by the display copy. create_gl_texture
+   // marshals the creation to the render worker and blocks.
+-  const gl::Texture texture = create_gl_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/true);
++  const gl::Texture texture = create_gl_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/true, gl::census::TagScanout);
+   return std::make_shared<TextureRef>(texture, texture, texture, size, gl::TextureFormat::RGBA8Unorm, 1,
+       ResolveFormat);
+ }
+diff --git a/lib/gl/census.cpp b/lib/gl/census.cpp
+index c0084b1..f5c6ca0 100644
+--- a/lib/gl/census.cpp
++++ b/lib/gl/census.cpp
+@@ -3,14 +3,72 @@
+ #include "../internal.hpp"
+ 
+ #include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
++#include <fmt/format.h>
+ 
+ namespace aurora::gl::census {
+ namespace {
+ Module Log("aurora::gl");
+ // Only touched from log_tick on the render worker; no synchronization needed.
+ std::chrono::steady_clock::time_point s_lastLog{};
++std::chrono::steady_clock::time_point s_start{};
++
++struct TagCounters {
++  std::atomic<int64_t> count{0};
++  std::atomic<int64_t> bytes{0};
++  std::atomic<int64_t> equiv{0};
++};
++TagCounters s_tags[TagCount];
++std::atomic<int64_t> s_texPeakBytes{0};
++
++std::atomic<int64_t> s_progSource{0};
++std::atomic<int64_t> s_progBinary{0};
++std::atomic<int64_t> s_progSourceUs{0};
++std::atomic<int64_t> s_progBinaryUs{0};
++std::atomic<int64_t> s_progMaxUs{0};
++
++double mb(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
++double mb(const Counter& c) { return mb(c.bytes.load(std::memory_order_relaxed)); }
+ 
+-double mb(const Counter& c) { return static_cast<double>(c.bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0); }
++// AURORA_CENSUS=<seconds>: detailed report period; unset or 0 keeps the quiet 10 s summary.
++int detailed_period_s() {
++  static const int period = [] {
++    const char* env = std::getenv("AURORA_CENSUS");
++    if (env == nullptr || env[0] == '\0') {
++      return 0;
++    }
++    const int v = std::atoi(env);
++    return v > 0 ? v : 0;
++  }();
++  return period;
++}
++
++// VmRSS / VmSwap / VmHWM in MB from /proc/self/status (0 when unavailable).
++struct Mem {
++  double rss = 0, swap = 0, hwm = 0;
++};
++Mem read_mem() {
++  Mem m;
++  if (FILE* f = std::fopen("/proc/self/status", "r")) {
++    char line[256];
++    while (std::fgets(line, sizeof(line), f) != nullptr) {
++      long kb = 0;
++      if (std::sscanf(line, "VmRSS: %ld kB", &kb) == 1) {
++        m.rss = static_cast<double>(kb) / 1024.0;
++      } else if (std::sscanf(line, "VmSwap: %ld kB", &kb) == 1) {
++        m.swap = static_cast<double>(kb) / 1024.0;
++      } else if (std::sscanf(line, "VmHWM: %ld kB", &kb) == 1) {
++        m.hwm = static_cast<double>(kb) / 1024.0;
++      }
++    }
++    std::fclose(f);
++  }
++  return m;
++}
+ } // namespace
+ 
+ Counter textures;
+@@ -19,17 +77,133 @@ Counter programs;
+ Counter fbos;
+ Counter samplers;
+ 
++const char* tag_name(uint8_t tag) noexcept {
++  switch (tag) {
++  case TagRenderColor:
++    return "rt-color";
++  case TagDepth:
++    return "rt-depth";
++  case TagImgui:
++    return "imgui";
++  case TagScanout:
++    return "scanout";
++  case TagI4:
++    return "I4";
++  case TagI8:
++    return "I8";
++  case TagIA4:
++    return "IA4";
++  case TagIA8:
++    return "IA8";
++  case TagRGB565:
++    return "RGB565";
++  case TagRGB5A3:
++    return "RGB5A3";
++  case TagRGBA8:
++    return "RGBA8";
++  case TagCMPR:
++    return "CMPR";
++  case TagC4:
++    return "C4";
++  case TagC8:
++    return "C8";
++  case TagC14X2:
++    return "C14X2";
++  case TagPC:
++    return "decoded/palette";
++  case TagTlut:
++    return "tlut";
++  default:
++    return "other";
++  }
++}
++
++void texture_added(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept {
++  if (tag >= TagCount) {
++    tag = TagOther;
++  }
++  textures.add(bytes);
++  s_tags[tag].count.fetch_add(1, std::memory_order_relaxed);
++  s_tags[tag].bytes.fetch_add(bytes, std::memory_order_relaxed);
++  s_tags[tag].equiv.fetch_add(equivBytes, std::memory_order_relaxed);
++  const int64_t live = textures.bytes.load(std::memory_order_relaxed);
++  int64_t peak = s_texPeakBytes.load(std::memory_order_relaxed);
++  while (live > peak && !s_texPeakBytes.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
++  }
++}
++
++void texture_removed(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept {
++  if (tag >= TagCount) {
++    tag = TagOther;
++  }
++  textures.sub(bytes);
++  s_tags[tag].count.fetch_sub(1, std::memory_order_relaxed);
++  s_tags[tag].bytes.fetch_sub(bytes, std::memory_order_relaxed);
++  s_tags[tag].equiv.fetch_sub(equivBytes, std::memory_order_relaxed);
++}
++
++void program_built(bool fromBinary, int64_t microseconds) noexcept {
++  if (fromBinary) {
++    s_progBinary.fetch_add(1, std::memory_order_relaxed);
++    s_progBinaryUs.fetch_add(microseconds, std::memory_order_relaxed);
++  } else {
++    s_progSource.fetch_add(1, std::memory_order_relaxed);
++    s_progSourceUs.fetch_add(microseconds, std::memory_order_relaxed);
++  }
++  int64_t prev = s_progMaxUs.load(std::memory_order_relaxed);
++  while (microseconds > prev && !s_progMaxUs.compare_exchange_weak(prev, microseconds, std::memory_order_relaxed)) {
++  }
++}
++
+ void log_tick() noexcept {
+   const auto now = std::chrono::steady_clock::now();
+-  if (s_lastLog.time_since_epoch().count() != 0 && now - s_lastLog < std::chrono::seconds(10)) {
++  if (s_start.time_since_epoch().count() == 0) {
++    s_start = now;
++  }
++  const int detailed = detailed_period_s();
++  const auto period = std::chrono::seconds(detailed > 0 ? detailed : 10);
++  if (s_lastLog.time_since_epoch().count() != 0 && now - s_lastLog < period) {
+     return;
+   }
+   s_lastLog = now;
+-  Log.info("[gl-census] tex {} ({:.1f} MB) buf {} ({:.1f} MB) prog {} fbo {} smp {}",
+-           textures.count.load(std::memory_order_relaxed), mb(textures),
++  const auto t = std::chrono::duration_cast<std::chrono::seconds>(now - s_start).count();
++
++  int64_t rtN = 0, rtB = 0, depN = 0, depB = 0, equivAll = 0;
++  for (int i = 0; i < TagCount; ++i) {
++    equivAll += s_tags[i].equiv.load(std::memory_order_relaxed);
++  }
++  rtN = s_tags[TagRenderColor].count + s_tags[TagScanout].count;
++  rtB = s_tags[TagRenderColor].bytes + s_tags[TagScanout].bytes;
++  depN = s_tags[TagDepth].count.load();
++  depB = s_tags[TagDepth].bytes.load();
++  const int64_t srcN = s_progSource.load(std::memory_order_relaxed);
++  const int64_t binN = s_progBinary.load(std::memory_order_relaxed);
++  const Mem mem = read_mem();
++  Log.info("[gl-census] t={} tex {} ({:.1f} MB, as RGBA8 {:.1f} MB, peak {:.1f} MB) rt {} ({:.1f} MB) depth {} ({:.1f} MB) "
++           "buf {} ({:.1f} MB) prog {} (source {} {:.0f} ms, binary {} {:.0f} ms, max {:.0f} ms) fbo {} smp {} "
++           "rss {:.0f} MB swap {:.0f} MB hwm {:.0f} MB",
++           t, textures.count.load(std::memory_order_relaxed), mb(textures), mb(equivAll),
++           mb(s_texPeakBytes.load(std::memory_order_relaxed)), rtN, mb(rtB), depN, mb(depB),
+            buffers.count.load(std::memory_order_relaxed), mb(buffers),
+-           programs.count.load(std::memory_order_relaxed), fbos.count.load(std::memory_order_relaxed),
+-           samplers.count.load(std::memory_order_relaxed));
++           programs.count.load(std::memory_order_relaxed), srcN,
++           static_cast<double>(s_progSourceUs.load(std::memory_order_relaxed)) / 1000.0, binN,
++           static_cast<double>(s_progBinaryUs.load(std::memory_order_relaxed)) / 1000.0,
++           static_cast<double>(s_progMaxUs.load(std::memory_order_relaxed)) / 1000.0,
++           fbos.count.load(std::memory_order_relaxed), samplers.count.load(std::memory_order_relaxed), mem.rss, mem.swap,
++           mem.hwm);
++  if (detailed > 0) {
++    std::string line;
++    for (int i = 0; i < TagCount; ++i) {
++      const int64_t n = s_tags[i].count.load(std::memory_order_relaxed);
++      if (n <= 0) {
++        continue;
++      }
++      line += fmt::format(" {}:{}/{:.1f}/{:.1f}", tag_name(static_cast<uint8_t>(i)), n,
++                          mb(s_tags[i].bytes.load(std::memory_order_relaxed)),
++                          mb(s_tags[i].equiv.load(std::memory_order_relaxed)));
++    }
++    Log.info("[gl-census-fmt] t={} (count/MB/MB as RGBA8){}", t, line);
++  }
+ }
+ 
+ } // namespace aurora::gl::census
+diff --git a/lib/gl/census.hpp b/lib/gl/census.hpp
+index 5256a06..87025b3 100644
+--- a/lib/gl/census.hpp
++++ b/lib/gl/census.hpp
+@@ -8,8 +8,36 @@
+ // process; the G31 OOM kills show them dominating RSS). Byte totals are exact for
+ // textures/buffers (sizes we chose); programs, FBOs and samplers are counted only
+ // (their GPU cost is driver-internal).
++//
++// Textures are also split by a Tag (the GX source format, or the kind of render target), with the
++// bytes they would take as plain RGBA8 ("equiv") next to the bytes they take now, so the effect of
++// the texture compaction is visible per format. AURORA_CENSUS=<seconds> (default off, 1 = every
++// second) logs the full report; without it only the short summary line appears every ~10 s.
+ namespace aurora::gl::census {
+ 
++enum Tag : uint8_t {
++  TagOther = 0,
++  TagRenderColor,
++  TagDepth,
++  TagImgui,
++  TagScanout,
++  TagI4,
++  TagI8,
++  TagIA4,
++  TagIA8,
++  TagRGB565,
++  TagRGB5A3,
++  TagRGBA8,
++  TagCMPR,
++  TagC4,
++  TagC8,
++  TagC14X2,
++  TagPC, // decoded or palette expanded RGBA8 handed in by the caller (GX_TF_*_PC)
++  TagTlut,
++  TagCount,
++};
++const char* tag_name(uint8_t tag) noexcept;
++
+ struct Counter {
+   std::atomic<int64_t> count{0};
+   std::atomic<int64_t> bytes{0};
+@@ -24,14 +52,21 @@ struct Counter {
+   }
+ };
+ 
+-extern Counter textures;
++extern Counter textures; // every texture, all tags
+ extern Counter buffers;
+ extern Counter programs;
+ extern Counter fbos;
+ extern Counter samplers;
+ 
+-// Rate-limited summary line (one [gl-census] INFO log every ~10 s). Called once per
+-// frame from the end-of-frame path on the render worker; cheap when not due.
++// Per tag texture accounting (also feeds `textures`).
++void texture_added(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept;
++void texture_removed(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept;
++
++// A program came from a link of GLSL source (`fromBinary` false) or from the program binary cache.
++void program_built(bool fromBinary, int64_t microseconds) noexcept;
++
++// Rate-limited summary line (one [gl-census] INFO log every ~10 s, every AURORA_CENSUS seconds when
++// set). Called once per frame from the end-of-frame path on the render worker; cheap when not due.
+ void log_tick() noexcept;
+ 
+ } // namespace aurora::gl::census
+diff --git a/lib/gl/gl_core.hpp b/lib/gl/gl_core.hpp
+index 8193dec..0d8547c 100644
+--- a/lib/gl/gl_core.hpp
++++ b/lib/gl/gl_core.hpp
+@@ -168,6 +168,13 @@ inline constexpr GLenum GL_DEPTH_STENCIL = 0x84F9;
+ inline constexpr GLint GL_RGBA8 = 0x8058;
+ inline constexpr GLint GL_SRGB8_ALPHA8 = 0x8C43;
+ inline constexpr GLint GL_R8 = 0x8229;
++inline constexpr GLint GL_RGB565 = 0x8D62;
++inline constexpr GLint GL_RGB5_A1 = 0x8057;
++inline constexpr GLint GL_RGBA4 = 0x8056;
++inline constexpr GLenum GL_RGB = 0x1907;
++inline constexpr GLenum GL_UNSIGNED_SHORT_5_6_5 = 0x8363;
++inline constexpr GLenum GL_UNSIGNED_SHORT_4_4_4_4 = 0x8033;
++inline constexpr GLenum GL_UNSIGNED_SHORT_5_5_5_1 = 0x8034;
+ inline constexpr GLint GL_RG8 = 0x822B;
+ inline constexpr GLint GL_R16I = 0x8233;
+ inline constexpr GLint GL_R32F = 0x822E;
+@@ -183,6 +190,7 @@ inline constexpr GLenum GL_COMPRESSED_RED_RGTC1_EXT = 0x8DBB;      // BC4
+ inline constexpr GLenum GL_COMPRESSED_RG_RGTC2_EXT = 0x8DBD;       // BC5
+ inline constexpr GLenum GL_COMPRESSED_RGBA_BPTC_UNORM_EXT = 0x8E8C; // BC7
+ inline constexpr GLenum GL_COMPRESSED_RGB8_ETC2 = 0x9274;
++inline constexpr GLenum GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2 = 0x9276;
+ inline constexpr GLenum GL_COMPRESSED_RGBA8_ETC2_EAC = 0x9278;
+ inline constexpr GLenum GL_COMPRESSED_RGBA_ASTC_4x4_KHR = 0x93B0;
+ inline constexpr GLenum GL_COMPRESSED_RGBA_ASTC_8x8_KHR = 0x93B7;
+diff --git a/lib/gl/handles.hpp b/lib/gl/handles.hpp
+index a487154..d932a4c 100644
+--- a/lib/gl/handles.hpp
++++ b/lib/gl/handles.hpp
+@@ -38,6 +38,7 @@ struct Texture {
+   Extent3D size{};
+   uint32_t mips = 1;
+   bool renderable = false; // has an attachable format (RGBA8/depth); FBO color/depth target
++  uint8_t tag = 0;         // census category (gl::census::Tag), for the per format memory report
+   explicit operator bool() const { return id != 0; }
+   bool operator==(const Texture& o) const { return id == o.id; }
+ };
+diff --git a/lib/gl/program.cpp b/lib/gl/program.cpp
+index 03b9fa5..c69ca75 100644
+--- a/lib/gl/program.cpp
++++ b/lib/gl/program.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <chrono>
+ #include <string>
+ #include <vector>
+ 
+@@ -44,6 +45,10 @@ GLuint compile_stage(GLenum stage, const char* source, const char* label) {
+ } // namespace
+ 
+ GLuint compile_program(const char* vertexSource, const char* fragmentSource, const char* label) {
++  const auto startTime = std::chrono::steady_clock::now();
++  const auto elapsedUs = [&] {
++    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - startTime).count();
++  };
+   const uint64_t cacheKey = binary_cache_key(vertexSource, fragmentSource);
+ 
+   // 1) Persistent program-binary cache. Try to link from a stored binary on a throwaway program
+@@ -54,6 +59,7 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
+     if (cached != 0) {
+       if (binary_cache_try_load(cacheKey, cached)) {
+         census::programs.add(0);
++        census::program_built(true, elapsedUs());
+         return cached;
+       }
+       gl.DeleteProgram(cached);
+@@ -99,6 +105,10 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
+   // 3) Persist the freshly linked binary for the next boot.
+   binary_cache_store(cacheKey, program);
+   census::programs.add(0);
++  census::program_built(false, elapsedUs());
++  if (elapsedUs() > 1000000) {
++    Log.warn("compile_program({}): slow compile, {} ms", label, elapsedUs() / 1000);
++  }
+   return program;
+ }
+ 
+diff --git a/lib/gl/textures.cpp b/lib/gl/textures.cpp
+index 73c6b40..091e04c 100644
+--- a/lib/gl/textures.cpp
++++ b/lib/gl/textures.cpp
+@@ -4,6 +4,7 @@
+ #include "census.hpp"
+ #include "../internal.hpp"
+ 
++#include <algorithm>
+ #include <vector>
+ 
+ namespace aurora::gl {
+@@ -38,7 +39,7 @@ GLint address_enum(AddressMode mode) {
+ 
+ // GPU storage the full declared mip chain occupies (glTexStorage2D allocates every
+ // level up front, whether or not it is ever uploaded).
+-int64_t texture_gpu_bytes(TextureFormat format, Extent3D size, uint32_t levels) {
++int64_t texture_gpu_bytes_impl(TextureFormat format, Extent3D size, uint32_t levels) {
+   const auto info = gl_format(format);
+   if (!info.valid) {
+     return 0;
+@@ -59,8 +60,46 @@ int64_t texture_gpu_bytes(TextureFormat format, Extent3D size, uint32_t levels)
+   }
+   return total;
+ }
++
++// What the same texture would occupy as plain RGBA8 (colors only; depth counts as 4 bytes anyway).
++int64_t texture_equiv_bytes(Extent3D size, uint32_t levels) {
++  int64_t total = 0;
++  uint32_t w = size.width;
++  uint32_t h = size.height;
++  for (uint32_t l = 0; l < levels; ++l) {
++    total += static_cast<int64_t>(w) * h * 4;
++    w = w > 1 ? w / 2 : 1;
++    h = h > 1 ? h / 2 : 1;
++  }
++  return total;
++}
++
++void apply_swizzle(TexSwizzle swizzle) {
++  GLint r = GL_RED, g = GL_GREEN, b = GL_BLUE, a = GL_ALPHA;
++  switch (swizzle) {
++  case TexSwizzle::None:
++    return;
++  case TexSwizzle::RRRR:
++    g = b = a = GL_RED;
++    break;
++  case TexSwizzle::RRR1:
++    g = b = GL_RED, a = GL_ONE;
++    break;
++  case TexSwizzle::RRRG:
++    g = b = GL_RED, a = GL_GREEN;
++    break;
++  }
++  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, r);
++  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, g);
++  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, b);
++  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, a);
++}
+ } // namespace
+ 
++int64_t texture_storage_bytes(TextureFormat format, Extent3D size, uint32_t levels) {
++  return texture_gpu_bytes_impl(format, size, levels);
++}
++
+ GlFormatInfo gl_format(TextureFormat format) {
+   GlFormatInfo i{};
+   i.valid = true;
+@@ -134,6 +173,19 @@ GlFormatInfo gl_format(TextureFormat format) {
+     i.internalFormat = GL_COMPRESSED_RGBA8_ETC2_EAC, i.compressed = true, i.blockWidth = 4, i.blockHeight = 4,
+     i.blockBytes = 16;
+     break;
++  case TextureFormat::ETC2RGB8A1Unorm:
++    i.internalFormat = GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2, i.compressed = true, i.blockWidth = 4,
++    i.blockHeight = 4, i.blockBytes = 8;
++    break;
++  case TextureFormat::RGB565Unorm:
++    i.internalFormat = GL_RGB565, i.external = GL_RGB, i.type = GL_UNSIGNED_SHORT_5_6_5, i.bytesPerPixel = 2;
++    break;
++  case TextureFormat::RGB5A1Unorm:
++    i.internalFormat = GL_RGB5_A1, i.external = GL_RGBA, i.type = GL_UNSIGNED_SHORT_5_5_5_1, i.bytesPerPixel = 2;
++    break;
++  case TextureFormat::RGBA4Unorm:
++    i.internalFormat = GL_RGBA4, i.external = GL_RGBA, i.type = GL_UNSIGNED_SHORT_4_4_4_4, i.bytesPerPixel = 2;
++    break;
+   case TextureFormat::ASTC4x4Unorm:
+     i.internalFormat = GL_COMPRESSED_RGBA_ASTC_4x4_KHR, i.compressed = true, i.blockWidth = 4, i.blockHeight = 4,
+     i.blockBytes = 16;
+@@ -150,12 +202,16 @@ GlFormatInfo gl_format(TextureFormat format) {
+   return i;
+ }
+ 
+-Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool renderable) {
++Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool renderable, uint8_t tag,
++                       TexSwizzle swizzle) {
+   const auto info = gl_format(format);
+   if (!info.valid) {
+     Log.fatal("create_texture: unsupported format {}", static_cast<int>(format));
+     return {};
+   }
++  if (tag == census::TagOther && renderable) {
++    tag = info.depth ? census::TagDepth : census::TagRenderColor;
++  }
+   const uint32_t levels = mips < 1 ? 1 : mips;
+   GLuint id = 0;
+   gl.GenTextures(1, &id);
+@@ -166,6 +222,7 @@ Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool
+   // full mip chain is declared but not necessarily uploaded, so clamp MAX_LEVEL.
+   gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+   gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(levels - 1));
++  apply_swizzle(swizzle);
+   // glTexStorage2D leaves texel memory undefined. Renderable color targets (EFB-copy /
+   // offscreen textures) can be sampled before anything renders into them (a GX effect
+   // reads last frame's copy on the first frame, or a copy that hasn't run yet), and
+@@ -178,13 +235,14 @@ Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool
+     gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(size.width), static_cast<GLsizei>(size.height),
+                      info.external, info.type, zeros.data());
+   }
+-  census::textures.add(texture_gpu_bytes(format, size, levels));
++  census::texture_added(tag, texture_gpu_bytes_impl(format, size, levels), texture_equiv_bytes(size, levels));
+   return Texture{
+       .id = id,
+       .format = format,
+       .size = size,
+       .mips = levels,
+       .renderable = renderable,
++      .tag = tag,
+   };
+ }
+ 
+@@ -200,12 +258,18 @@ void upload_texture(const Texture& texture, uint32_t level, Origin3D offset, Ext
+   gl.BindTexture(GL_TEXTURE_2D, texture.id);
+ 
+   if (info.compressed) {
+-    const uint32_t blocksW = (size.width + info.blockWidth - 1) / info.blockWidth;
+-    const uint32_t blocksH = (size.height + info.blockHeight - 1) / info.blockHeight;
++    // A level smaller than a block (2x2, 1x1 tail of the mip chain) is uploaded at its own size, not the
++    // block rounded one: GL only accepts a partial edge block when the region reaches the level edge.
++    const uint32_t levelW = std::max(texture.size.width >> level, 1u);
++    const uint32_t levelH = std::max(texture.size.height >> level, 1u);
++    const uint32_t w = std::min(size.width, levelW - std::min(offset.x, levelW));
++    const uint32_t h = std::min(size.height, levelH - std::min(offset.y, levelH));
++    const uint32_t blocksW = (w + info.blockWidth - 1) / info.blockWidth;
++    const uint32_t blocksH = (h + info.blockHeight - 1) / info.blockHeight;
+     const GLsizei imageSize = static_cast<GLsizei>(blocksW * blocksH * info.blockBytes);
+     gl.CompressedTexSubImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), static_cast<GLint>(offset.x),
+-                               static_cast<GLint>(offset.y), static_cast<GLsizei>(size.width),
+-                               static_cast<GLsizei>(size.height), info.internalFormat, imageSize, data);
++                               static_cast<GLint>(offset.y), static_cast<GLsizei>(w), static_cast<GLsizei>(h),
++                               info.internalFormat, imageSize, data);
+     return;
+   }
+ 
+@@ -223,7 +287,8 @@ void upload_texture(const Texture& texture, uint32_t level, Origin3D offset, Ext
+ 
+ void destroy_texture(Texture& texture) noexcept {
+   if (texture.id != 0) {
+-    census::textures.sub(texture_gpu_bytes(texture.format, texture.size, texture.mips));
++    census::texture_removed(texture.tag, texture_gpu_bytes_impl(texture.format, texture.size, texture.mips),
++                            texture_equiv_bytes(texture.size, texture.mips));
+     // GL reuses texture names: a cached FBO still keyed by this id would silently attach to the next texture
+     // that gets the same name (and render nowhere), so drop it with the texture.
+     invalidate_framebuffers_for(texture.id);
+diff --git a/lib/gl/textures.hpp b/lib/gl/textures.hpp
+index cf3412b..9df6294 100644
+--- a/lib/gl/textures.hpp
++++ b/lib/gl/textures.hpp
+@@ -52,11 +52,25 @@ struct SamplerDescriptor {
+   uint16_t maxAnisotropy = 1;
+ };
+ 
++// Component swizzle applied to a texture with fewer channels than the GX decode it stands in for
++// (GX intensity formats sample as (I,I,I,I) or (I,I,I,A), opaque ones as (R,G,B,1)).
++enum class TexSwizzle : uint8_t {
++  None = 0, // keep the format's own channels
++  RRRR,     // R8 intensity: (i, i, i, i)
++  RRR1,     // R8 opaque grey: (i, i, i, 1)
++  RRRG,     // RG8 intensity+alpha: (i, i, i, a)
++};
++
+ // Create an immutable 2D texture (glGenTextures + glTexStorage2D). `mips` is the
+ // full level count (>=1). `renderable` is metadata only (GL attaches textures
+ // directly); it rides along on the handle for the FBO cache. Requires the owning
+ // context current on the calling thread.
+-Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool renderable);
++// `tag` is the census category (gl::census::Tag), `swizzle` the sampling swizzle (see above).
++Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool renderable, uint8_t tag = 0,
++                       TexSwizzle swizzle = TexSwizzle::None);
++
++// GPU bytes the full mip chain of a texture occupies (what glTexStorage2D allocates).
++int64_t texture_storage_bytes(TextureFormat format, Extent3D size, uint32_t levels);
+ 
+ // Upload one mip level. `bytesPerRow` is the source row stride; 0 means tightly
+ // packed. Sets UNPACK_ALIGNMENT=1 (+ROW_LENGTH when needed) then glTexSubImage2D
+diff --git a/lib/imgui.cpp b/lib/imgui.cpp
+index 5d41ee2..193f205 100644
+--- a/lib/imgui.cpp
++++ b/lib/imgui.cpp
+@@ -14,6 +14,7 @@
+ #include "internal.hpp"
+ #include "gfx/render_worker.hpp"
+ #include "input/router.hpp"
++#include "gl/census.hpp"
+ #include "gl/gl_core.hpp"
+ #include "gl/pass.hpp"
+ #include "gl/state.hpp"
+@@ -277,7 +278,7 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
+   gl::Texture texture;
+   const gl::Extent3D size{width, height, 1};
+   gfx::render_worker::enqueue_work([&] {
+-    texture = gl::create_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/false);
++    texture = gl::create_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/false, gl::census::TagImgui);
+     gl::gl.BindTexture(gl::GL_TEXTURE_2D, texture.id);
+     gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_LINEAR);
+     gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_LINEAR);

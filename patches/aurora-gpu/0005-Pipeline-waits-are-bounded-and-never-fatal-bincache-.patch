@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 15:59:22 +0530
+Subject: [PATCH] Pipeline waits are bounded and never fatal; bincache env
+ force, crash limit 3
+
+---
+ lib/gfx/pipeline_cache.cpp | 81 +++++++++++++++++++++++++++++++-------
+ lib/gl/binary_cache.cpp    |  7 +++-
+ 2 files changed, 71 insertions(+), 17 deletions(-)
+
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index 53d9656..5e08faf 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -17,6 +17,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
++#include <cstdlib>
+ #include <deque>
+ #include <filesystem>
+ #include <functional>
+@@ -355,6 +356,22 @@ static AtomicStatRef createdPipelines{detail::resources().stats.createdPipelines
+ // Which pipeline the worker is currently inside create() for, and since when (steady_clock ms).
+ // 0 = idle. Lets a stalled blocking waiter name the build that is wedging the worker — a create()
+ // parked inside the driver can't log from its own thread.
++// Pipelines the blocking wait already gave up on. They keep compiling in the background; later requests for
++// the same pipeline do not block again (otherwise every draw using a slow shader would stall the game thread
++// for the whole wait). Guarded by g_pipelineMutex.
++static absl::flat_hash_set<PipelineRef> g_gaveUpPipelines;
++static std::atomic<uint32_t> g_pipelineWaitGiveUps{0};
++static std::atomic<uint32_t> g_pipelineDrawsWithoutPipeline{0};
++
++// Longest the game thread blocks on one pipeline (AURORA_PIPELINE_WAIT_MS, default 10000).
++static int64_t pipeline_wait_budget_ms() {
++  static const int64_t ms = [] {
++    const char* env = std::getenv("AURORA_PIPELINE_WAIT_MS");
++    const long v = env != nullptr ? std::atol(env) : 0;
++    return v > 0 ? static_cast<int64_t>(v) : int64_t{10000};
++  }();
++  return ms;
++}
+ static std::atomic<PipelineRef> g_inFlightPipeline{0};
+ static std::atomic<int64_t> g_inFlightPipelineSinceMs{0};
+ 
+@@ -556,21 +573,41 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
+     // time, name the culprit and return; bind_pipeline() skips draws whose pipeline isn't
+     // ready, so the cost of bailing is a missing UI element for a few frames, not a hang.
+     std::unique_lock lock{g_pipelineMutex};
+-    int stalls = 0;
+-    while (!g_pipelineReadyCv.wait_for(lock, std::chrono::seconds{5},
++    if (g_gaveUpPipelines.contains(runtimeKey)) {
++      return runtimeKey; // already gave up on this one: it builds in the background, its draws are skipped meanwhile
++    }
++    const int64_t budgetMs = pipeline_wait_budget_ms();
++    const auto waitStart = std::chrono::steady_clock::now();
++    int64_t warnedAtMs = 0;
++    while (!g_pipelineReadyCv.wait_for(lock, std::chrono::milliseconds{500},
+                                        [=] { return g_pipelines.contains(runtimeKey) || g_pipelineThreadEnd; })) {
+-      const PipelineRef inFlight = g_inFlightPipeline.load(std::memory_order_relaxed);
+-      const int64_t inFlightMs =
+-          inFlight != 0 ? steady_now_ms() - g_inFlightPipelineSinceMs.load(std::memory_order_relaxed) : 0;
+-      Log.warn("[pipeline-cache] blocking wait for {:016x} stalled {}s (worker in-flight {:016x} for {} ms, "
+-               "priority={} background={} counter={})",
+-               runtimeKey, (stalls + 1) * 5, inFlight, inFlightMs, g_pipelineQueue.size(), g_backgroundPipelineQueue.size(),
+-               static_cast<uint32_t>(queuedPipelines));
+-      if (++stalls >= 2) {
+-        Log.error("[pipeline-cache] giving up blocking wait for {:016x}; draws will be skipped until it builds", runtimeKey);
++      const int64_t waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                   std::chrono::steady_clock::now() - waitStart)
++                                   .count();
++      if (waitedMs - warnedAtMs >= 5000) {
++        warnedAtMs = waitedMs;
++        const PipelineRef inFlight = g_inFlightPipeline.load(std::memory_order_relaxed);
++        const int64_t inFlightMs =
++            inFlight != 0 ? steady_now_ms() - g_inFlightPipelineSinceMs.load(std::memory_order_relaxed) : 0;
++        Log.warn("[pipeline-cache] blocking wait for {:016x} stalled {} ms (worker in-flight {:016x} for {} ms, "
++                 "queue={} background={} counter={})",
++                 runtimeKey, waitedMs, inFlight, inFlightMs, g_pipelineQueue.size(), g_backgroundPipelineQueue.size(),
++                 static_cast<uint32_t>(queuedPipelines));
++      }
++      if (waitedMs >= budgetMs) {
++        // Never fatal: the pipeline keeps building on the compiler thread; bind time skips the draws that need it
++        // (gx::render / clear::render check get_pipeline) until it lands.
++        g_gaveUpPipelines.insert(runtimeKey);
++        ++g_pipelineWaitGiveUps;
++        Log.error("[pipeline-cache] giving up the blocking wait for {:016x} after {} ms; its draws are skipped until "
++                  "it builds",
++                  runtimeKey, waitedMs);
+         break;
+       }
+     }
++    if (g_pipelines.contains(runtimeKey)) {
++      g_gaveUpPipelines.erase(runtimeKey);
++    }
+   }
+   return runtimeKey;
+ }
+@@ -1187,13 +1224,27 @@ static void stop_pipeline_cache_writer() {
+   g_pipelineCacheWriteQueue.clear();
+ }
+ 
++// A pipeline that is still building (or failed to compile) is not fatal: its draws are skipped by the encoder.
++// Counted and logged at a low rate so a slow driver is visible in the log.
++static void note_pipeline_not_ready(PipelineRef ref, const char* kind) {
++  CompiledPipeline compiled;
++  if (get_pipeline(ref, compiled)) {
++    return;
++  }
++  const uint32_t n = ++g_pipelineDrawsWithoutPipeline;
++  if (n == 1 || (n & (n - 1)) == 0) { // 1, 2, 4, 8, ...
++    Log.warn("[pipeline-cache] {} pipeline {:016x} not ready (compile slow or failed): {} draws recorded without it, "
++             "{} blocking waits abandoned",
++             kind, ref, n, g_pipelineWaitGiveUps.load());
++  }
++}
++
+ PipelineRef find_pipeline(const clear::PipelineConfig& config) {
+   remember_pipeline_config(ShaderType::Clear, config, current_frame(), true);
+   // A hardware draw/clear must execute at this FIFO position. An unfinished
+   // native pipeline is a compilation wait, never permission to drop the draw.
+   const auto ref = resolve_pipeline(ShaderType::Clear, config, PipelinePriority::Blocking);
+-  CompiledPipeline compiled;
+-  AURORA_ASSERT(get_pipeline(ref, compiled), "Native Clear pipeline did not compile");
++  note_pipeline_not_ready(ref, "Clear");
+   return ref;
+ }
+ 
+@@ -1202,8 +1253,7 @@ PipelineRef find_pipeline(const gx::PipelineConfig& config) {
+   // A hardware draw/clear must execute at this FIFO position. An unfinished
+   // native pipeline is a compilation wait, never permission to drop the draw.
+   const auto ref = resolve_pipeline(ShaderType::GX, config, PipelinePriority::Blocking);
+-  CompiledPipeline compiled;
+-  AURORA_ASSERT(get_pipeline(ref, compiled), "Native GX pipeline did not compile");
++  note_pipeline_not_ready(ref, "GX");
+   return ref;
+ }
+ 
+@@ -1277,6 +1327,7 @@ void shutdown_pipeline_cache() {
+   g_pipelinesPerFrame = 0;
+   g_gpuCachePrunePending = false;
+   g_pipelines.clear();
++  g_gaveUpPipelines.clear();
+   g_knownPipelines.clear();
+   g_pipelineQueue.clear();
+   g_backgroundPipelineQueue.clear();
+diff --git a/lib/gl/binary_cache.cpp b/lib/gl/binary_cache.cpp
+index ac17fae..c2045a9 100644
+--- a/lib/gl/binary_cache.cpp
++++ b/lib/gl/binary_cache.cpp
+@@ -13,6 +13,7 @@
+ #include <cctype>
+ #include <condition_variable>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <filesystem>
+@@ -29,13 +30,15 @@ Module Log("aurora::gl::binary_cache");
+ // Master switch (no env vars -- standing rule). kForceBinaryCacheOnMesa lets a developer
+ // exercise the machinery on the desktop Mesa stack despite the format-deserializer hazard.
+ constexpr bool kProgramBinaryCache = true;
++// AURORA_GL_BINCACHE_FORCE=1 does the same without a rebuild.
+ constexpr bool kForceBinaryCacheOnMesa = false;
++bool force_on_mesa() { return kForceBinaryCacheOnMesa || std::getenv("AURORA_GL_BINCACHE_FORCE") != nullptr; }
+ 
+ constexpr int kSchemaVersion = 1;
+ constexpr size_t kMaxCacheBytes = 48 * 1024 * 1024;
+ // Two consecutive boots that both crash inside the glProgramBinary loading window -> the cache
+ // is genuinely poison on this driver; disable it permanently for this db (source-only, safe).
+-constexpr int kMaxCrashes = 2;
++constexpr int kMaxCrashes = 3;
+ 
+ constexpr const char* kDbName = "program_binary_cache.db";
+ constexpr const char* kSentinelName = "program_binary_cache.loading";
+@@ -314,7 +317,7 @@ void binary_cache_initialize() {
+     Log.info("[binary-cache] GL_NUM_PROGRAM_BINARY_FORMATS=0; source compile only");
+     return;
+   }
+-  if (renderer_is_mesa() && !kForceBinaryCacheOnMesa) {
++  if (renderer_is_mesa() && !force_on_mesa()) {
+     Log.info("[binary-cache] Mesa renderer ({}); using its own disk cache, program-binary cache off",
+              gl_string(GL_RENDERER));
+     return;

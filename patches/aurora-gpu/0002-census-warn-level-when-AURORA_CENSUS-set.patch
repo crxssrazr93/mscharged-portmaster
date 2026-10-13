@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 15:48:03 +0530
+Subject: [PATCH] census: warn level when AURORA_CENSUS set
+
+---
+ lib/gl/census.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/lib/gl/census.cpp b/lib/gl/census.cpp
+index f5c6ca0..d53d31c 100644
+--- a/lib/gl/census.cpp
++++ b/lib/gl/census.cpp
+@@ -179,7 +179,9 @@ void log_tick() noexcept {
+   const int64_t srcN = s_progSource.load(std::memory_order_relaxed);
+   const int64_t binN = s_progBinary.load(std::memory_order_relaxed);
+   const Mem mem = read_mem();
+-  Log.info("[gl-census] t={} tex {} ({:.1f} MB, as RGBA8 {:.1f} MB, peak {:.1f} MB) rt {} ({:.1f} MB) depth {} ({:.1f} MB) "
++  // Warning level when explicitly requested: the port runs Aurora at LOG_WARNING.
++  const auto emit = [&](auto&&... a) { detailed > 0 ? Log.warn(a...) : Log.info(a...); };
++  emit("[gl-census] t={} tex {} ({:.1f} MB, as RGBA8 {:.1f} MB, peak {:.1f} MB) rt {} ({:.1f} MB) depth {} ({:.1f} MB) "
+            "buf {} ({:.1f} MB) prog {} (source {} {:.0f} ms, binary {} {:.0f} ms, max {:.0f} ms) fbo {} smp {} "
+            "rss {:.0f} MB swap {:.0f} MB hwm {:.0f} MB",
+            t, textures.count.load(std::memory_order_relaxed), mb(textures), mb(equivAll),
+@@ -202,7 +204,7 @@ void log_tick() noexcept {
+                           mb(s_tags[i].bytes.load(std::memory_order_relaxed)),
+                           mb(s_tags[i].equiv.load(std::memory_order_relaxed)));
+     }
+-    Log.info("[gl-census-fmt] t={} (count/MB/MB as RGBA8){}", t, line);
++    emit("[gl-census-fmt] t={} (count/MB/MB as RGBA8){}", t, line);
+   }
+ }
+ 

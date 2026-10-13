@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 16:31:07 +0530
+Subject: [PATCH] exp: 16 MiB vertex ring
+
+---
+ lib/gfx/resources.hpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/gfx/resources.hpp b/lib/gfx/resources.hpp
+index 4cd5f2a..9e54a5f 100644
+--- a/lib/gfx/resources.hpp
++++ b/lib/gfx/resources.hpp
+@@ -5,7 +5,7 @@
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = true;
+ inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
+-inline constexpr uint64_t VertexBufferSize = 5242880;   // 5 MiB
++inline constexpr uint64_t VertexBufferSize = 16777216;  // 16 MiB
+ inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
+ inline constexpr uint64_t StorageBufferSize = 8388608;  // 8 MiB (storage-fetch path is gone; CPU-side only)
+ inline constexpr uint64_t TextureUploadSize = 25165824; // 24 MiB

@@ -1,0 +1,243 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 16:17:36 +0530
+Subject: [PATCH] Video textures: private streaming texture updated in place,
+ 48 MiB content cache, 240 idle frames
+
+---
+ lib/gfx/texture.cpp | 40 ++++++++++++++++++++++++++
+ lib/gfx/texture.hpp |  7 +++++
+ lib/gx/texture.cpp  | 70 +++++++++++++++++++++++++++++++++++++++++++--
+ lib/gx/texture.hpp  |  8 ++++--
+ 4 files changed, 121 insertions(+), 4 deletions(-)
+
+diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
+index cb8f1df..fd57250 100644
+--- a/lib/gfx/texture.cpp
++++ b/lib/gfx/texture.cpp
+@@ -166,6 +166,27 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
+   return std::make_shared<TextureRef>(texture, texture, gl::Texture{}, size, glFormat, mips, gxFormat);
+ }
+ 
++TextureHandle new_streaming_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
++                                       const char* label) noexcept {
++  ZoneScopedS(3);
++  clamp_texture_dims(width, height, mips, label);
++  gl::TextureFormat glFormat = to_gl(gxFormat);
++  gl::TexSwizzle swizzle = gl::TexSwizzle::None;
++  if (compact_mode() != CompactMode::Off && glFormat == gl::TextureFormat::RGBA8Unorm) {
++    if (gxFormat == GX_TF_I4 || gxFormat == GX_TF_I8) {
++      glFormat = gl::TextureFormat::R8Unorm, swizzle = gl::TexSwizzle::RRRR;
++    } else if (gxFormat == GX_TF_IA4 || gxFormat == GX_TF_IA8) {
++      glFormat = gl::TextureFormat::RG8Unorm, swizzle = gl::TexSwizzle::RRRG;
++    }
++  }
++  const gl::Extent3D size{.width = width, .height = height, .depthOrArrayLayers = 1};
++  gl::Texture texture =
++      create_gl_texture(glFormat, size, mips, /*renderable=*/false, census_tag_for(gxFormat, false), swizzle);
++  auto handle = std::make_shared<TextureRef>(texture, texture, gl::Texture{}, size, glFormat, mips, gxFormat);
++  handle->streaming = true;
++  return handle;
++}
++
+ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept {
+   ZoneScoped;
+ 
+@@ -215,6 +236,25 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
+     }
+   }
+ 
++  // Storage narrower than the RGBA8 decode (streaming textures): keep the channels the swizzle reads.
++  ByteBuffer packed;
++  if (!converted.data.empty() &&
++      (ref.format == gl::TextureFormat::R8Unorm || ref.format == gl::TextureFormat::RG8Unorm)) {
++    const size_t texels = converted.data.size() / 4;
++    const bool two = ref.format == gl::TextureFormat::RG8Unorm;
++    packed = ByteBuffer(texels * (two ? 2 : 1));
++    const uint8_t* src = converted.data.data();
++    for (size_t i = 0; i < texels; ++i) {
++      if (two) {
++        packed.data()[i * 2] = src[i * 4];
++        packed.data()[i * 2 + 1] = src[i * 4 + 3];
++      } else {
++        packed.data()[i] = src[i * 4];
++      }
++    }
++    data = packed;
++  }
++
+   uint32_t offset = 0;
+   for (uint32_t mip = 0; mip < ref.mipCount; ++mip) {
+     const gl::Extent3D mipSize{
+diff --git a/lib/gfx/texture.hpp b/lib/gfx/texture.hpp
+index e66e35b..93edcb5 100644
+--- a/lib/gfx/texture.hpp
++++ b/lib/gfx/texture.hpp
+@@ -50,6 +50,9 @@ struct TextureRef {
+   u32 gxFormat;
+   bool hasArbitraryMips = false;
+   bool isReplacement = false;
++  // Private texture whose contents are replaced in place by write_texture (video planes): fixed storage format,
++  // never shared through the content cache.
++  bool streaming = false;
+ 
+   TextureRef(gl::Texture texture, gl::Texture sampleTextureView, gl::Texture attachmentTextureView, gl::Extent3D size,
+              gl::TextureFormat format, uint32_t mipCount, u32 gxFormat)
+@@ -74,6 +77,10 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
+                                     ArrayRef<uint8_t> data, bool tlut, const char* label) noexcept;
+ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
+                                      const char* label) noexcept;
++// A sampleable texture for data that changes every frame (THP video planes): fixed storage format (I4/I8 as R8,
++// IA4/IA8 as RG8, with a swizzle; others RGBA8), refreshed with write_texture.
++TextureHandle new_streaming_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 gxFormat,
++                                       const char* label) noexcept;
+ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
+ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
+diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
+index 72ec7fb..2e5bfe4 100644
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -16,6 +16,7 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <list>
+ #include <optional>
+@@ -52,6 +53,9 @@ struct CachedTextureEntry {
+   u32 tlutDataVersion = 0;
+   uint64_t replacementId = 0;
+   uint64_t lastUsedFrame = 0;
++  // Video detection: how many frames in a row this texture object's data changed (see resolve_static_texture).
++  uint64_t lastChangeFrame = 0;
++  uint32_t changeStreak = 0;
+ };
+ 
+ struct CachedTlutTextureEntry {
+@@ -124,7 +128,7 @@ absl::flat_hash_map<SourceKeyCacheKey, SourceKeyCacheEntry> s_sourceKeyCache;
+ absl::flat_hash_map<uint64_t, absl::flat_hash_set<u32>> s_replacementUsers;
+ std::list<TextureContentKey> s_contentLru;
+ uint64_t s_contentCacheBytes = 0;
+-uint64_t s_contentCacheBudgetBytes = texture::ContentCacheBudgetBytes;
++uint64_t s_contentCacheBudgetBytes = texture::content_cache_budget_default();
+ uint64_t s_frameCount = 0;
+ uint64_t s_bindGeneration = 1;
+ std::atomic<uint64_t> s_pendingInvalidations = 0;
+@@ -515,6 +519,14 @@ bool use_replacement(std::optional<gfx::texture_replacement::ReplacementResult>
+ 
+ const TextureStats& texture_stats() noexcept { return s_stats; }
+ 
++namespace texture {
++uint64_t content_cache_budget_default() noexcept {
++  const char* env = std::getenv("AURORA_TEXTURE_CACHE_MB");
++  const long mb = env != nullptr ? std::atol(env) : 0;
++  return (mb > 0 ? static_cast<uint64_t>(mb) : 48ull) * 1024ull * 1024ull;
++}
++} // namespace texture
++
+ namespace texture {
+ size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noexcept {
+   if (width == 0 || height == 0 || mipCount == 0) {
+@@ -593,6 +605,50 @@ void invalidate_replacement(uint64_t replacementId) noexcept {
+   }
+ }
+ 
++// Data that changes every frame (THP video planes) must not pile up as one cached GL texture per frame. Called when a
++// texture object's data is new to the content cache: after the object missed on three consecutive frames (one miss
++// per frame at most, so objects reused for many textures within a frame never qualify), it gets one private
++// texture that is refreshed in place. Returns that texture, or null for the normal path.
++gfx::TextureHandle try_streaming_update(const GXTexObj_& obj) {
++  if (obj.texObjId == 0 || !obj.has_data() || is_palette_format(obj.format())) {
++    return {};
++  }
++  const auto it = s_textureObjectCaches.find(obj.texObjId);
++  if (it == s_textureObjectCaches.end()) {
++    return {};
++  }
++  auto& entry = it->second;
++  const auto& h = entry.handle;
++  if (!h || entry.tlutObjId != 0 || entry.replacementId != 0 || h->gxFormat != obj.format() ||
++      h->size.width != std::max(obj.width(), 1u) || h->size.height != std::max(obj.height(), 1u)) {
++    entry.changeStreak = 0;
++    return {};
++  }
++  if (!h->streaming) {
++    if (entry.lastChangeFrame == s_frameCount) {
++      entry.changeStreak = 0; // several different textures through one object in one frame: not video
++      return {};
++    }
++    entry.changeStreak = (s_frameCount - entry.lastChangeFrame <= 4) ? entry.changeStreak + 1 : 1;
++    entry.lastChangeFrame = s_frameCount;
++    if (entry.changeStreak < 3) {
++      return {};
++    }
++  }
++  const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
++  const ArrayRef<uint8_t> source{static_cast<const uint8_t*>(obj.data), sourceBytes};
++  if (!h->streaming) {
++    Log.info("[texture] texture object {} ({}x{} format {}) changes every frame: one private texture, updated in place",
++             obj.texObjId, obj.width(), obj.height(), obj.format());
++    entry.handle = gfx::new_streaming_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
++                                                 "GX Streaming Texture");
++  }
++  gfx::write_texture(*entry.handle, source);
++  ++s_stats.streamingUpdates;
++  s_stats.uploadBytes += texture_handle_size(entry.handle);
++  return entry.handle;
++}
++
+ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+   ZoneScoped;
+ 
+@@ -623,6 +679,16 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+     }
+     handle = find_content_texture(keys->contentKey);
+     if (!handle) {
++      handle = try_streaming_update(obj);
++      if (handle) {
++        // Private streaming texture: not shared, so it stays out of the content cache.
++        if (!obj.no_cache()) {
++          store_cached_texture(obj, handle, 0, 0, replacementId);
++        }
++        return handle;
++      }
++    }
++    if (!handle) {
+ #if DEBUG
+       const auto name = gfx::texture_replacement::build_texture_replacement_name(*keys->sourceKey);
+       const auto nameStr = name.c_str();
+@@ -733,7 +799,7 @@ void shutdown() noexcept {
+   s_contentLru.clear();
+   s_sourceKeyCache.clear();
+   s_contentCacheBytes = 0;
+-  s_contentCacheBudgetBytes = ContentCacheBudgetBytes;
++  s_contentCacheBudgetBytes = content_cache_budget_default();
+   s_frameCount = 0;
+   s_bindGeneration = 1;
+   s_pendingInvalidations.store(0, std::memory_order_release);
+diff --git a/lib/gx/texture.hpp b/lib/gx/texture.hpp
+index c933121..b3e24a6 100644
+--- a/lib/gx/texture.hpp
++++ b/lib/gx/texture.hpp
+@@ -20,13 +20,17 @@ struct TextureStats {
+   uint64_t pendingLoads = 0;
+   uint64_t publishes = 0;
+   uint64_t publishBytes = 0;
++  uint64_t streamingUpdates = 0; // in place refreshes of per frame changing textures (video)
+ };
+ 
+ const TextureStats& texture_stats() noexcept;
+ 
+ namespace texture {
+-constexpr uint64_t ContentCacheBudgetBytes = 128ull * 1024ull * 1024ull;
+-constexpr uint64_t ObjectCacheIdleFrames = 600;
++// Budget of the decoded texture content cache. 48 MiB covers a whole match with the compacted GPU formats; the
++// 1 GB handhelds cannot afford the old 128 MiB (AURORA_TEXTURE_CACHE_MB overrides).
++uint64_t content_cache_budget_default() noexcept;
++
++constexpr uint64_t ObjectCacheIdleFrames = 240;
+ constexpr bool AsyncTextureReplacements = true;
+ constexpr uint32_t ReplacementThumbnailDim = 64;
+ constexpr uint64_t ReplacementPublishBudgetBytes = 12ull * 1024ull * 1024ull;

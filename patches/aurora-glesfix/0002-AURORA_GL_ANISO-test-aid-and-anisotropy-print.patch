@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 14:50:19 +0530
+Subject: [PATCH] AURORA_GL_ANISO test aid and anisotropy print
+
+---
+ lib/gl/device.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/lib/gl/device.cpp b/lib/gl/device.cpp
+index a46db60..b8616f7 100644
+--- a/lib/gl/device.cpp
++++ b/lib/gl/device.cpp
+@@ -11,6 +11,8 @@
+ // creation, draws, present) runs on the worker. present_frame() is invoked from the
+ // end-frame callback, which the worker executes.
+ 
++#include <cstdio>
++#include <cstdlib>
+ #include "../webgpu/gpu.hpp"
+ 
+ #include "../gfx/recording.hpp"
+@@ -80,6 +82,13 @@ void query_caps() {
+     gl::gl.GetIntegerv(gl::GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
+     anisotropy = static_cast<uint16_t>(maxAniso > 0 ? maxAniso : 0);
+   }
++  // Test aid: AURORA_GL_ANISO=<n> overrides the detected maximum (0 disables), and prints the result.
++  if (const char* forced = std::getenv("AURORA_GL_ANISO")) {
++    anisotropy = static_cast<uint16_t>(std::atoi(forced));
++    std::fprintf(stderr, "[gl] anisotropy forced to %u\n", static_cast<unsigned>(anisotropy));
++  } else if (std::getenv("AURORA_GL_DEBUG") != nullptr) {
++    std::fprintf(stderr, "[gl] anisotropy max %u\n", static_cast<unsigned>(anisotropy));
++  }
+   g_graphicsConfig.textureAnisotropy = anisotropy;
+ 
+   gl::GLint uboAlign = 256;

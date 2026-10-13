@@ -457,7 +457,7 @@ index 83cb693a..c29e237f 100644
      std::array<std::int16_t,96> samples{};
      NativeAXADPCMState next{};
 diff --git a/src/platform/ax_bootstrap_device.cpp b/src/platform/ax_bootstrap_device.cpp
-index d555cb29..83f2cf70 100644
+index d555cb29..6fd22a5d 100644
 --- a/src/platform/ax_bootstrap_device.cpp
 +++ b/src/platform/ax_bootstrap_device.cpp
 @@ -1,4 +1,5 @@
@@ -466,15 +466,59 @@ index d555cb29..83f2cf70 100644
  #include "platform/ax_command_service.h"
  #include "platform/dsp_instruction_core.h"
  #include "platform/dsp_control_abi.h"
-@@ -216,6 +217,7 @@ struct NativeAXBootstrapDevice::State {
+@@ -83,6 +84,11 @@ struct NativeAXBootstrapDevice::State {
+     void (*native_validate_reset)(void*){};
+     void (*native_reset)(void*){};
+     NativeAXDeviceFrameResult (*native_process)(void*,NativeDSPMemoryEndpoint,std::uint32_t,std::size_t){};
++    void (*native_begin)(void*,NativeDSPMemoryEndpoint,std::uint32_t,std::size_t){};
++    bool (*native_poll)(void*,NativeAXDeviceFrameResult&,bool){};
++    void (*native_drain)(void*){};
++    bool processing{};
++    std::uint64_t perf_owner_ns{};
+     bool CommandsEnabled() const noexcept {return stopped_voice_commands||processor.process||native_process;}
+     NativeAXStoppedVoiceStatus frames{};
+     bool servicing{},attached{};
+@@ -115,6 +121,7 @@ struct NativeAXBootstrapDevice::State {
+     static void ValidateControl(void* context,std::uint16_t previous,std::uint16_t request) {
+         auto& s=*static_cast<State*>(context);s.RequireOwner();
+         if(request&2)throw std::logic_error("AX bootstrap PI interrupt/task continuation is not implemented");
++        if((request&1)&&s.processing)s.DrainJob();
+         if((request&1)&&s.native_process &&
+            (s.servicing || GetNativeDSPMailboxStatus().cpu_mail_full ||
+             GetNativeDSPMailboxStatus().dsp_mail_full || (previous&0x80)))
+@@ -133,6 +140,12 @@ struct NativeAXBootstrapDevice::State {
+         if(!(request&Halt)&&((request&Init)||s.native_process)&&s.phase==NativeAXBootstrapPhase::Faulted)
+             throw std::logic_error("AX bootstrap device fault needs real halted reset");
+     }
++    // Waits for a running asynchronous frame job and drops its result (reset/retirement abandons the frame).
++    void DrainJob() {
++        if(native_drain)native_drain(native_context);
++        processing=false;
++        if(frames.phase==NativeAXFramePhase::Processing)frames.phase=NativeAXFramePhase::ReadyForListSize;
++    }
+     static void ApplyControl(void* context,std::uint16_t previous,std::uint16_t request) {
+         auto& s=*static_cast<State*>(context);s.RequireOwner();
+         if(request&1) {
+@@ -215,7 +228,18 @@ struct NativeAXBootstrapDevice::State {
+             // The actual command service validates contributors and all output
              // owners before stores. Unsupported work publishes no completion.
              DSPBackendValidateMemory(memory,word,128,false);
++            if(native_begin) {
++                // The frame is computed on another thread while the CPU keeps running, like the real DSP. The SYNC
++                // cause is published by FinishProcessing once the job is done.
++                const auto begin_start=g_ax_perf_on?AXPerfNowNs():0;
++                native_begin(native_context,memory,word,128);
++                if(g_ax_perf_on)perf_owner_ns=AXPerfNowNs()-begin_start;
++                frames.last_list_address=word;
++                processing=true;frames.phase=NativeAXFramePhase::Processing;
++                break;
++            }
              NativeAXDeviceFrameResult result;
 +            const auto perf_start=g_ax_perf_on?AXPerfNowNs():0;
              if(native_process)result=native_process(native_context,memory,word,128);
              else if(processor.process)result=processor.process(processor.context,memory,word,128);
              else {
-@@ -223,6 +225,7 @@ struct NativeAXBootstrapDevice::State {
+@@ -223,6 +247,7 @@ struct NativeAXBootstrapDevice::State {
                  result={zero.consumed_words,zero.stopped_voices,zero.stereo_frames,
                          zero.remote_samples_per_channel,zero.written_bytes};
              }
@@ -482,14 +526,117 @@ index d555cb29..83f2cf70 100644
              frames.last_list_address=word;frames.written_bytes=result.written_bytes;
              frames.stopped_voices=result.stopped_voices;
              frames.stereo_frames=result.stereo_frames;
-@@ -264,6 +267,7 @@ struct NativeAXBootstrapDevice::State {
+@@ -247,6 +272,27 @@ struct NativeAXBootstrapDevice::State {
+             throw std::logic_error("AX frame request is out of order or its hardware service is unavailable");
+         }
+     }
++    // Completes an asynchronous frame job if it is done (or, with wait, once it is): the SYNC cause follows.
++    bool FinishProcessing(bool wait) {
++        if(!processing)return false;
++        NativeAXDeviceFrameResult result;
++        const auto finish_start=g_ax_perf_on?AXPerfNowNs():0;
++        if(!native_poll(native_context,result,wait))return false;
++        processing=false;
++        if(g_ax_perf_on){
++            AXPerfAdd(g_ax_perf.frames);AXPerfAdd(g_ax_perf.frame_ns,perf_owner_ns+(AXPerfNowNs()-finish_start));
++            AXPerfTick();
++        }
++        frames.written_bytes=result.written_bytes;
++        frames.stopped_voices=result.stopped_voices;
++        frames.stereo_frames=result.stereo_frames;
++        frames.remote_samples=result.remote_samples_per_channel;
++        ++frames.processed_frames;
++        frames.phase=NativeAXFramePhase::WaitingSyncAcknowledgment;
++        PublishFrameCause(4);
++        ++frames.sync_interrupts;
++        return true;
++    }
+     void ConsumePending() {
+         const auto high=DSPBackendMailToHigh(mailboxes);
+         if(high&0x8000) {
+@@ -264,7 +310,12 @@ struct NativeAXBootstrapDevice::State {
          return false;
      }
      void Poll() {
 +        AXPerfAdd(g_ax_perf.poll_calls);
          RequireOwner();
++        if(processing) {
++            try {FinishProcessing(false);}
++            catch(...) {processing=false;phase=NativeAXBootstrapPhase::Faulted;frames.phase=NativeAXFramePhase::Faulted;throw;}
++        }
          if(servicing) {
              // Original handlers synchronously wait for CONTINUE consumption.
+             // A late AI period may also make the source resume callback send
+@@ -334,6 +385,7 @@ NativeAXBootstrapDevice::NativeAXBootstrapDevice(NativeDSPMemoryEndpoint memory,
+     auto& s=*state_;s.native_context=processor.context_;s.native_initialize=processor.initialize_;
+     s.native_validate_reset=processor.validate_reset_;
+     s.native_reset=processor.reset_;s.native_process=processor.process_;
++    s.native_begin=processor.begin_;s.native_poll=processor.poll_;s.native_drain=processor.drain_;
+ }
+ NativeAXBootstrapDevice::~NativeAXBootstrapDevice() {
+     if(state_&&state_->attached) {
+@@ -368,6 +420,9 @@ void NativeAXBootstrapDevice::DetachFrameProcessor(void* context) {
+     s.processor={};if(!s.stopped_voice_commands)s.frames.phase=NativeAXFramePhase::Unavailable;
+ }
+ void NativeAXBootstrapDevice::ServiceOwner() {state_->Poll();}
++void NativeAXBootstrapDevice::DrainProcessing() {
++    auto& s=*state_;s.RequireOwner();if(s.processing)s.DrainJob();
++}
+ NativeAXBootstrapStatus NativeAXBootstrapDevice::Status() const {
+     const auto& s=*state_;s.RequireOwner();return {s.phase,s.words,(s.core&&s.words==10)?s.core->Registers().instructions:0,s.resets,
+         (GetNativeDSPControlStatus().csr&Halt)!=0};
+@@ -376,7 +431,7 @@ NativeAXStoppedVoiceStatus NativeAXBootstrapDevice::FrameStatus() const {
+     state_->RequireOwner();return state_->frames;
+ }
+ void NativeAXBootstrapDevice::Close() {
+-    auto& s=*state_;s.RequireOwner();if(!(GetNativeDSPControlStatus().csr&Halt)||s.servicing)
++    auto& s=*state_;s.RequireOwner();if(s.processing)s.DrainJob();if(!(GetNativeDSPControlStatus().csr&Halt)||s.servicing)
+         throw std::logic_error("AX bootstrap processor must halt/drain before owner retirement");
+     if(s.processor.process)throw std::logic_error("AX hardware processor must detach before device retirement");
+     DetachNativeDSPMailboxService(s.mailboxes,&s);DetachNativeDSPProcessorControl(s.control,&s);
+diff --git a/src/platform/ax_bootstrap_device.h b/src/platform/ax_bootstrap_device.h
+index 61521308..3bca9386 100644
+--- a/src/platform/ax_bootstrap_device.h
++++ b/src/platform/ax_bootstrap_device.h
+@@ -28,9 +28,17 @@ private:
+     void (*validate_reset_)(void*);
+     void (*reset_)(void*);
+     NativeAXDeviceFrameResult (*process_)(void*,NativeDSPMemoryEndpoint,std::uint32_t,std::size_t);
++    // Optional asynchronous form (the real DSP runs beside the CPU): begin_ starts a frame job on another thread,
++    // poll_ returns true with the result once it is done (waiting for it when `wait` is set) and rethrows a failure
++    // of the job. drain_ waits for a running job and discards its result. When begin_ is set it replaces process_.
++    void (*begin_)(void*,NativeDSPMemoryEndpoint,std::uint32_t,std::size_t){};
++    bool (*poll_)(void*,NativeAXDeviceFrameResult&,bool){};
++    void (*drain_)(void*){};
+     NativeAXFunctionalProcessor(void* context,decltype(initialize_) initialize,
+-        decltype(validate_reset_) validate_reset,decltype(reset_) reset,decltype(process_) process)
+-        :context_(context),initialize_(initialize),validate_reset_(validate_reset),reset_(reset),process_(process) {}
++        decltype(validate_reset_) validate_reset,decltype(reset_) reset,decltype(process_) process,
++        decltype(begin_) begin=nullptr,decltype(poll_) poll=nullptr,decltype(drain_) drain=nullptr)
++        :context_(context),initialize_(initialize),validate_reset_(validate_reset),reset_(reset),process_(process),
++         begin_(begin),poll_(poll),drain_(drain) {}
+     friend class NativeAXFunctionalDevice;
+     friend class NativeAXBootstrapDevice;
+ };
+@@ -47,7 +55,8 @@ struct NativeAXBootstrapStatus {
+ enum class NativeAXFrameMode { BootstrapOnly, StoppedVoices };
+ enum class NativeAXFramePhase {
+     Unavailable, ReadyForListSize, ReadyForListAddress,
+-    WaitingSyncAcknowledgment, WaitingContinue, Faulted
++    WaitingSyncAcknowledgment, WaitingContinue, Faulted,
++    Processing // an asynchronous frame job is running; the SYNC cause is published when it completes
+ };
+ struct NativeAXStoppedVoiceStatus {
+     NativeAXFramePhase phase;
+@@ -104,6 +113,8 @@ public:
+     void AttachFrameProcessor(NativeAXFrameProcessor processor);
+     void DetachFrameProcessor(void* context);
+     void ServiceOwner();
++    // Waits for a running asynchronous frame job and drops its result (retirement, reset).
++    void DrainProcessing();
+     NativeAXBootstrapStatus Status() const;
+     NativeAXStoppedVoiceStatus FrameStatus() const;
+     // Read actual initialized master/AUX words; reject cold/loading/fault/reset.
 diff --git a/src/platform/ax_command_service.cpp b/src/platform/ax_command_service.cpp
 index 3f4a19f5..127480cd 100644
 --- a/src/platform/ax_command_service.cpp
@@ -821,10 +968,10 @@ index 16969009..0bf64290 100644
                                    const NativeAXPreparedCommandFrame& frame,
                                    const NativeAXCommandHistory& history);
 diff --git a/src/platform/ax_functional_device.cpp b/src/platform/ax_functional_device.cpp
-index 95cc3f5f..9c5b9d12 100644
+index 95cc3f5f..5eb16170 100644
 --- a/src/platform/ax_functional_device.cpp
 +++ b/src/platform/ax_functional_device.cpp
-@@ -1,10 +1,16 @@
+@@ -1,11 +1,21 @@
  #include "platform/ax_functional_device.h"
 +#include "platform/ax_perf.h"
  #include "platform/os_audio_registers.h"
@@ -836,12 +983,17 @@ index 95cc3f5f..9c5b9d12 100644
 +#ifdef MSCHARGED_AX_REFERENCE_CHECK
 +#include "platform/ax_reference/ax_frame_commands.h"
 +#endif
++#include <atomic>
++#include <condition_variable>
 +#include <cstdio>
 +#include <cstdlib>
++#include <exception>
  #include <limits>
++#include <mutex>
  #include <stdexcept>
  #include <thread>
-@@ -19,14 +25,104 @@ std::uint32_t Address(const NativeAXCommand& command,unsigned at=0) {
+ 
+@@ -19,16 +29,124 @@ std::uint32_t Address(const NativeAXCommand& command,unsigned at=0) {
  bool Contains(std::uint32_t base,std::size_t bytes,std::uint32_t at,std::size_t count) {
      return at>=base&&std::uint64_t(at)+count<=std::uint64_t(base)+bytes;
  }
@@ -946,58 +1098,179 @@ index 95cc3f5f..9c5b9d12 100644
 +    const bool paranoid=[]{const char* v=std::getenv("MSCHARGED_AXCHECK");return v&&*v&&*v!='0';}();
      std::uint16_t active{},aux{};
      bool initialized{},retired{};
++    // Frame jobs run on a worker thread (the real DSP runs beside the CPU). MSCHARGED_AX_THREAD=0 keeps the old
++    // synchronous processing on the owner thread. At most one job is in flight; the worker owns `frame` and reads
++    // `history` while it runs, the owner touches them again only after the job is done.
++    const bool threaded=[]{const char* v=std::getenv("MSCHARGED_AX_THREAD");return !(v&&*v=='0');}();
++    std::thread worker;
++    std::mutex worker_mutex;
++    std::condition_variable worker_wake,worker_finished;
++    std::atomic<int> job_state{0}; // 0 idle, 1 running, 2 done (result and error published)
++    bool job_posted{},worker_stop{};
++    NativeDSPMemoryEndpoint job_memory{};
++    std::uint32_t job_address{};
++    std::exception_ptr job_error;
++    ~State() {
++        if(worker.joinable()) {
++            {std::lock_guard lock(worker_mutex);worker_stop=true;}
++            worker_wake.notify_all();worker.join();
++        }
++    }
      void RequireOwner() const {
-@@ -96,24 +192,46 @@ struct NativeAXFunctionalDevice::State {
+         if(retired||owner!=std::this_thread::get_id())
+             throw std::logic_error("functional AX device needs its actual live native owner");
+@@ -95,28 +213,118 @@ struct NativeAXFunctionalDevice::State {
+             throw std::logic_error("functional AX reset requires stopped/drained actual AI DMA");
      }
      static void Reset(void* context) {
-         auto& s=*static_cast<State*>(context);s.RequireOwner();
+-        auto& s=*static_cast<State*>(context);s.RequireOwner();
 -        s.history={};s.initialized=false;s.processed=0;s.active=s.aux=0;
++        auto& s=*static_cast<State*>(context);s.RequireOwner();Drain(context);
 +        s.history={};s.initialized=false;s.processed=0;s.active=s.aux=0;s.bindings_validated=false;
      }
-     static NativeAXDeviceFrameResult Process(void* context,NativeDSPMemoryEndpoint memory,
-                                              std::uint32_t address,std::size_t bytes) {
-         auto& s=*static_cast<State*>(context);s.RequireOwner();
-         if(!s.initialized||memory.generation!=s.memory.generation)
+-    static NativeAXDeviceFrameResult Process(void* context,NativeDSPMemoryEndpoint memory,
+-                                             std::uint32_t address,std::size_t bytes) {
+-        auto& s=*static_cast<State*>(context);s.RequireOwner();
+-        if(!s.initialized||memory.generation!=s.memory.generation)
++    // Owner-thread admission of one frame: binding proof and request geometry.
++    void Admit(NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes) {
++        RequireOwner();
++        if(!initialized||memory.generation!=this->memory.generation)
              throw std::logic_error("functional AX processing precedes its actual native initialization");
 -        s.ValidateBindings();
+-        if(bytes!=128||(address!=s.bindings.addresses[0]&&address!=s.bindings.addresses[0]+128))
 +        const auto t0=g_ax_perf_on?AXPerfNowNs():0;
 +        // The static spans stay pinned and live until a pin changes; re-prove them then (and every 256th frame).
 +        const auto epoch=DSPBackendMemoryEpoch();
-+        if(s.paranoid||!s.bindings_validated||epoch!=s.validated_epoch||(s.processed&255)==0) {
-+            s.ValidateBindings();s.validated_epoch=epoch;s.bindings_validated=true;
-+        } else s.RequireOwner();
-+        const auto t1=g_ax_perf_on?AXPerfNowNs():0;
-         if(bytes!=128||(address!=s.bindings.addresses[0]&&address!=s.bindings.addresses[0]+128))
++        if(paranoid||!bindings_validated||epoch!=validated_epoch||(processed&255)==0) {
++            ValidateBindings();validated_epoch=epoch;bindings_validated=true;
++        }
++        if(g_ax_perf_on)AXPerfAdd(g_ax_perf.bind_ns,AXPerfNowNs()-t0);
++        if(bytes!=128||(address!=bindings.addresses[0]&&address!=bindings.addresses[0]+128))
              throw std::invalid_argument("functional AX request is not an actual source command slot");
-         s.ValidateList(ReadNativeAXCommandList(memory,address,bytes));
+-        s.ValidateList(ReadNativeAXCommandList(memory,address,bytes));
 -        auto frame=PrepareNativeAXCommandFrame(memory,address,bytes,s.history,s.filter.View());
++    }
++    // Reads memory and computes the whole frame into `frame` (no stores to the source). Runs on the worker thread
++    // when threaded, so it only uses the thread-safe memory transport.
++    void Compute(NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes) {
++        const auto t1=g_ax_perf_on?AXPerfNowNs():0;
++        ValidateList(ReadNativeAXCommandList(memory,address,bytes));
 +        const auto t2=g_ax_perf_on?AXPerfNowNs():0;
-+        auto& frame=s.frame;
-+        PrepareNativeAXCommandFrameInto(frame,memory,address,bytes,s.history,s.filter.View(),s.paranoid);
++        PrepareNativeAXCommandFrameInto(frame,memory,address,bytes,history,filter.View(),paranoid);
 +#ifdef MSCHARGED_AX_REFERENCE_CHECK
-+        if(g_ax_ref_on)CompareWithReference(memory,address,bytes,s.history,s.filter.View(),frame);
++        if(g_ax_ref_on)CompareWithReference(memory,address,bytes,history,filter.View(),frame);
 +#endif
 +        const auto t3=g_ax_perf_on?AXPerfNowNs():0;
          for(const auto& voice:frame.voices) {
-             s.Role(1,voice.parameter_address,320);
-             if((voice.parameter_address-s.bindings.addresses[1])%320)
+-            s.Role(1,voice.parameter_address,320);
+-            if((voice.parameter_address-s.bindings.addresses[1])%320)
++            Role(1,voice.parameter_address,320);
++            if((voice.parameter_address-bindings.addresses[1])%320)
                  throw std::invalid_argument("functional AX PB has a non-original record boundary");
          }
 -        CommitNativeAXCommandFrame(memory,frame,s.history);
+-        ++s.processed;s.active=frame.active_voices;s.aux=frame.aux_commands;
 +        if(g_ax_perf_on) {
 +            AXPerfAdd(g_ax_perf.voices,frame.voices.size());AXPerfAdd(g_ax_perf.active_voices,frame.active_voices);
 +            for(const auto& v:frame.voices)AXPerfAdd(g_ax_perf.decoded_samples,v.decoded_samples);
++            AXPerfAdd(g_ax_perf.list_ns,t2-t1);AXPerfAdd(g_ax_perf.prepare_ns,t3-t2);
 +        }
++    }
++    // Owner thread: the stores of a computed frame, then the bookkeeping.
++    NativeAXDeviceFrameResult Commit(NativeDSPMemoryEndpoint memory) {
++        const auto t3=g_ax_perf_on?AXPerfNowNs():0;
 +        if(g_ax_hash_on)AXPerfFrameHash(frame);
-+        CommitNativeAXCommandFrame(memory,frame,s.history,s.paranoid);
-+        if(g_ax_perf_on) {
-+            const auto t4=AXPerfNowNs();
-+            AXPerfAdd(g_ax_perf.bind_ns,t1-t0);AXPerfAdd(g_ax_perf.list_ns,t2-t1);
-+            AXPerfAdd(g_ax_perf.prepare_ns,t3-t2);AXPerfAdd(g_ax_perf.commit_ns,t4-t3);
-+        }
-         ++s.processed;s.active=frame.active_voices;s.aux=frame.aux_commands;
++        CommitNativeAXCommandFrame(memory,frame,history,paranoid);
++        if(g_ax_perf_on)AXPerfAdd(g_ax_perf.commit_ns,AXPerfNowNs()-t3);
++        ++processed;active=frame.active_voices;aux=frame.aux_commands;
          return {frame.consumed_words,std::uint16_t(frame.voice_count-frame.active_voices),96,18,frame.written_bytes};
      }
++    static NativeAXDeviceFrameResult Process(void* context,NativeDSPMemoryEndpoint memory,
++                                             std::uint32_t address,std::size_t bytes) {
++        auto& s=*static_cast<State*>(context);
++        s.Admit(memory,address,bytes);
++        s.Compute(memory,address,bytes);
++        return s.Commit(memory);
++    }
++    void WorkerMain() {
++        std::unique_lock lock(worker_mutex);
++        for(;;) {
++            worker_wake.wait(lock,[&]{return worker_stop||job_posted;});
++            if(worker_stop)return;
++            job_posted=false;
++            const auto mem=job_memory;const auto address=job_address;
++            lock.unlock();
++            std::exception_ptr error;
++            try {Compute(mem,address,128);}
++            catch(...) {error=std::current_exception();}
++            lock.lock();
++            job_error=error;
++            job_state.store(2,std::memory_order_release);
++            worker_finished.notify_all();
++        }
++    }
++    static void Begin(void* context,NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes) {
++        auto& s=*static_cast<State*>(context);
++        s.Admit(memory,address,bytes);
++        if(s.job_state.load(std::memory_order_acquire)!=0)
++            throw std::logic_error("functional AX frame job started while another is in flight");
++        if(!s.worker.joinable())s.worker=std::thread([&s]{s.WorkerMain();});
++        {
++            std::lock_guard lock(s.worker_mutex);
++            s.job_memory=memory;s.job_address=address;s.job_error=nullptr;
++            s.job_posted=true;s.job_state.store(1,std::memory_order_release);
++        }
++        s.worker_wake.notify_one();
++    }
++    // Owner thread. True once the job has been committed; false while it is still running (unless wait).
++    static bool Poll(void* context,NativeAXDeviceFrameResult& result,bool wait) {
++        auto& s=*static_cast<State*>(context);s.RequireOwner();
++        if(s.job_state.load(std::memory_order_acquire)==0)return false;
++        if(s.job_state.load(std::memory_order_acquire)!=2) {
++            if(!wait)return false;
++            std::unique_lock lock(s.worker_mutex);
++            s.worker_finished.wait(lock,[&]{return s.job_state.load(std::memory_order_acquire)==2;});
++        }
++        std::exception_ptr error;
++        {std::lock_guard lock(s.worker_mutex);error=s.job_error;s.job_error=nullptr;}
++        s.job_state.store(0,std::memory_order_release);
++        if(error)std::rethrow_exception(error);
++        result=s.Commit(s.memory);
++        return true;
++    }
++    static void Drain(void* context) {
++        auto& s=*static_cast<State*>(context);
++        if(s.job_state.load(std::memory_order_acquire)==0)return;
++        {
++            std::unique_lock lock(s.worker_mutex);
++            s.worker_finished.wait(lock,[&]{return s.job_state.load(std::memory_order_acquire)==2;});
++            s.job_error=nullptr;
++        }
++        s.job_state.store(0,std::memory_order_release);
++    }
+ };
+ NativeAXFunctionalDevice::NativeAXFunctionalDevice(NativeDSPMemoryEndpoint memory,
+     NativeDSPMailboxEndpoint mailboxes,NativeDSPControlEndpoint control,
+@@ -125,7 +333,8 @@ NativeAXFunctionalDevice::NativeAXFunctionalDevice(NativeDSPMemoryEndpoint memor
+     if(policy!=NativeAXCoefficientPolicy::NativeWindowedSinc4TapV1)
+         throw std::invalid_argument("functional AX requires explicitly selected NativeWindowedSinc4TapV1 policy");
+     auto& s=*state_;s.memory=memory;s.bindings=bindings;s.ValidateBindings();
+-    const NativeAXFunctionalProcessor processor(&s,State::Initialize,State::ValidateReset,State::Reset,State::Process);
++    const NativeAXFunctionalProcessor processor(&s,State::Initialize,State::ValidateReset,State::Reset,State::Process,
++        s.threaded?State::Begin:nullptr,s.threaded?State::Poll:nullptr,s.threaded?State::Drain:nullptr);
+     protocol_=std::make_unique<NativeAXBootstrapDevice>(memory,mailboxes,control,bindings.addresses[12],processor);
+     const NativeOSAudioRegisterOwner::Operations operations{
+         [](void* p,std::uint32_t r){return static_cast<NativeAXFunctionalDevice*>(p)->ReadOSDSP(r);},
+@@ -180,7 +389,7 @@ NativeAXFunctionalStatus NativeAXFunctionalDevice::Status() const {
+         NativeAXCoefficientPolicy::NativeWindowedSinc4TapV1,s.initializations,s.processed,s.active,s.aux,s.initialized};
+ }
+ void NativeAXFunctionalDevice::Close() {
+-    NativeInterruptGuard exclusion;auto& s=*state_;s.RequireOwner();
++    NativeInterruptGuard exclusion;auto& s=*state_;s.RequireOwner();protocol_->DrainProcessing();
+     const auto ai=GetNativeAIStatus();
+     if(ai.running||ai.interrupt_pending||ai.callback_active)
+         throw std::logic_error("functional AX retirement requires actual AI stop/drain");
 diff --git a/src/platform/ax_perf.h b/src/platform/ax_perf.h
 new file mode 100644
 index 00000000..cc5b4066
