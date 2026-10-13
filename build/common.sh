@@ -11,6 +11,7 @@ SHIM_COMMIT=6057d79ba             # SDL 3.5.0-dev with the SDL2-delegating video
 
 # Runs a command in the build container with the workspace mounted at the same path.
 in_container() {
+  docker run --rm -u 0 -v mscharged-pm-cache:/cache "$IMAGE" chmod -R a+rwX /cache
   docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/cache/cargo \
     -v "$W:$W" -v mscharged-pm-cache:/cache -w "$W" "$IMAGE" bash -c "$*"
 }

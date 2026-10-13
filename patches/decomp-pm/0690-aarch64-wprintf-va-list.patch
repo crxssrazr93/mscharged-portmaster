@@ -1,0 +1,26 @@
+From: mscharged-portmaster
+Subject: Parse wide printf arguments from the AAPCS64 va_list
+Upstream-base: 7a6bf165d9f1c5914181c079c7d4bfa7204f3509
+Classification: aarch64 Linux host adaptation; apply after 0689.
+
+On aarch64 Linux va_list is a struct, so the function parameter is the cursor itself
+(like the pointer-shaped case). The generic branch is not a template, so clang compiles
+it too and rejects the cast; select the branch with the preprocessor.
+
+diff --git a/src/MSL/wprintf.c b/src/MSL/wprintf.c
+index c6a7a29..d0c38c0 100644
+--- a/src/MSL/wprintf.c
++++ b/src/MSL/wprintf.c
+@@ -1046,7 +1046,11 @@ int __wpformatter(void* (*WriteProc)(void*, const wchar_t*, size_t), void* Write
+         }
+ 
+         format_ptr = curr_format;
+-#if defined(MSCHARGED_NATIVE) && defined(__cplusplus)
++#if defined(MSCHARGED_NATIVE) && defined(__cplusplus) && defined(__aarch64__) && !defined(__APPLE__) \
++    && !defined(_WIN32)
++        // AAPCS64 va_list is a struct: the function parameter is the cursor itself.
++        format_ptr = parse_format(format_ptr, (va_list*)&arg, &format);
++#elif defined(MSCHARGED_NATIVE) && defined(__cplusplus)
+         // Pointer-shaped va_list addresses the local cursor. An array-shaped
+         // function parameter already carries the underlying cursor by address.
+         if constexpr (__is_same(va_list, decltype(arg))) {

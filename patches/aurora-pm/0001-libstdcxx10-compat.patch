@@ -1,0 +1,439 @@
+diff --git a/lib/dolphin/dvd/fst.cpp b/lib/dolphin/dvd/fst.cpp
+index c416f8a..fdd074e 100644
+--- a/lib/dolphin/dvd/fst.cpp
++++ b/lib/dolphin/dvd/fst.cpp
+@@ -198,7 +198,7 @@ void makeFstRecursive(IterateNode& node, FstIndex parent) {
+     return;
+   }
+ 
+-  std::ranges::sort(node.children, [](const auto& a, const auto& b) { return a->name < b->name; });
++  std::sort(node.children.begin(), node.children.end(), [](const auto& a, const auto& b) { return a->name < b->name; });
+ 
+   const FstIndex ourIndex = static_cast<FstIndex>(s_fstEntries.size());
+   s_fstEntries.emplace_back(node.name, true, parent, 0, node.overlayData, node.isOverlay, node.originalEntryNum);
+diff --git a/lib/dolphin/os/OSTime.cpp b/lib/dolphin/os/OSTime.cpp
+index daebe0b..2845856 100644
+--- a/lib/dolphin/os/OSTime.cpp
++++ b/lib/dolphin/os/OSTime.cpp
+@@ -12,12 +12,20 @@
+ #include <dolphin/gx/GXManage.h>
+ #endif
+ 
++// libstdc++ before 13 has no C++20 calendar types (year_month_day, local_time, ...): convert calendar times
++// with the C library instead. Same results, only the local time zone lookup differs in implementation.
++#if defined(__GLIBCXX__) && defined(_GLIBCXX_RELEASE) && _GLIBCXX_RELEASE < 13
++#define AURORA_OSTIME_C_CALENDAR 1
++#endif
++
+ namespace chrono = std::chrono;
+ using namespace std::literals::chrono_literals;
+ 
+ using SystemDuration = chrono::system_clock::duration;
+ using SystemTime = chrono::time_point<chrono::system_clock>;
++#ifndef AURORA_OSTIME_C_CALENDAR
+ using LocalTime = chrono::local_time<SystemDuration>;
++#endif
+ 
+ #if defined(AURORA_WII_CLOCK) && AURORA_WII_CLOCK
+ // Hardware time keeps advancing while presentation/game time is paused.
+@@ -33,6 +41,7 @@ std::once_flag s_gameEpochOnce;
+ OSTime s_gameEpochOffset;
+ std::atomic<AuroraHardwareService> s_hardwareService{nullptr};
+ 
++#ifndef AURORA_OSTIME_C_CALENDAR
+ LocalTime system_time_to_local_time(SystemTime time) {
+ #if defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
+   return chrono::zoned_time(chrono::current_zone(), time).get_local_time();
+@@ -91,6 +100,8 @@ SystemTime local_time_to_system_time(LocalTime time) {
+ #endif
+ }
+ 
++#endif // !AURORA_OSTIME_C_CALENDAR
++
+ template <typename Duration>
+ OSTime duration_to_ticks(const Duration duration) {
+   const auto seconds = chrono::floor<chrono::seconds>(duration);
+@@ -162,6 +173,49 @@ void AuroraInitClock() {
+ #endif
+ }
+ 
++#ifdef AURORA_OSTIME_C_CALENDAR
++void OSTicksToCalendarTime(OSTime ticks, OSCalendarTime* td) {
++  // Input ticks are UTC relative to the GCN epoch; break them up in local time.
++  const int64_t micros = OSTicksToMicroseconds(ticks) + 946684800LL * 1000000LL;
++  int64_t seconds = micros / 1000000;
++  int64_t fraction = micros % 1000000;
++  if (fraction < 0) {
++    fraction += 1000000;
++    --seconds;
++  }
++  const std::time_t wallClock = static_cast<std::time_t>(seconds);
++  std::tm localTm{};
++  const std::tm* result = localtime_r(&wallClock, &localTm);
++  AURORA_ASSERT(result != nullptr, "localtime_r failed in OSTicksToCalendarTime");
++
++  td->sec = localTm.tm_sec;
++  td->min = localTm.tm_min;
++  td->hour = localTm.tm_hour;
++  td->mday = localTm.tm_mday;
++  td->mon = localTm.tm_mon;
++  td->year = localTm.tm_year + 1900;
++  td->wday = localTm.tm_wday;
++  td->yday = localTm.tm_yday;
++  td->msec = static_cast<int>(fraction / 1000);
++  td->usec = static_cast<int>(fraction % 1000);
++}
++
++OSTime OSCalendarTimeToTicks(OSCalendarTime* td) {
++  std::tm localTm{};
++  localTm.tm_sec = td->sec;
++  localTm.tm_min = td->min;
++  localTm.tm_hour = td->hour;
++  localTm.tm_mday = td->mday;
++  localTm.tm_mon = td->mon;
++  localTm.tm_year = td->year - 1900;
++  localTm.tm_isdst = -1;
++  const std::time_t utcTime = mktime(&localTm);
++  AURORA_ASSERT(utcTime != -1, "mktime failed in OSCalendarTimeToTicks");
++  const int64_t micros = static_cast<int64_t>(utcTime) * 1000000LL + td->msec * 1000LL + td->usec -
++                         946684800LL * 1000000LL;
++  return OSMicrosecondsToTicks(micros);
++}
++#else
+ void OSTicksToCalendarTime(OSTime ticks, OSCalendarTime* td) {
+   // We assume that all input times (ticks) are in UTC, relative to GCN epoch
+   // So convert that to the local time
+@@ -206,4 +260,6 @@ OSTime OSCalendarTimeToTicks(OSCalendarTime* td) {
+   return OSMicrosecondsToTicks(chrono::duration_cast<chrono::microseconds>(sys - kGcnEpochUnix).count());
+ }
+ 
++#endif // AURORA_OSTIME_C_CALENDAR
++
+ OSTime OSGetSystemTime() { return duration_to_ticks(aurora::time::wall_clock::now() - kGcnEpochUnix); }
+diff --git a/lib/dolphin/pad/adapter.cpp b/lib/dolphin/pad/adapter.cpp
+index 011f593..5023b58 100644
+--- a/lib/dolphin/pad/adapter.cpp
++++ b/lib/dolphin/pad/adapter.cpp
+@@ -270,7 +270,7 @@ private:
+ 
+     if (deadZones.emulateTriggers) {
+       const auto emulate = [&](PADAxis padAxis, ControlId target, u16 zone) {
+-        const auto mapping = std::ranges::find(axes, padAxis, &PADAxisMapping::padAxis);
++        const auto mapping = std::find_if(axes.begin(), axes.end(), [padAxis](const PADAxisMapping& m) { return m.padAxis == padAxis; });
+         if (const auto input = mapping != axes.end() ? controller_input(*mapping, controller) : std::nullopt) {
+           out.push_back({
+               .input = *input,
+@@ -475,12 +475,12 @@ const Controls& controls() {
+ 
+ ControlId control_for_button(PADButton button) {
+   const auto& c = controls();
+-  const auto it = std::ranges::find(kButtons, button, &std::pair<PADButton, ControlId Controls::*>::first);
++  const auto it = std::find_if(std::begin(kButtons), std::end(kButtons), [button](const auto& p) { return p.first == button; });
+   return it != kButtons.end() ? c.*(it->second) : kInvalidControlId;
+ }
+ 
+ ControlId control_for_ext_button(PADExtButton button) {
+-  const auto it = std::ranges::find(kExtButtons, button, &std::pair<SDL_GamepadButton, PADExtButton>::second);
++  const auto it = std::find_if(std::begin(kExtButtons), std::end(kExtButtons), [button](const auto& p) { return p.second == button; });
+   return it != kExtButtons.end() ? controls().ext[it - kExtButtons.begin()] : kInvalidControlId;
+ }
+ 
+diff --git a/lib/dolphin/pad/pad.cpp b/lib/dolphin/pad/pad.cpp
+index fed5bc2..7278418 100644
+--- a/lib/dolphin/pad/pad.cpp
++++ b/lib/dolphin/pad/pad.cpp
+@@ -1127,7 +1127,8 @@ void PADSerializeMappings() {
+   }
+   const auto basePath = aurora::io::fs_path_from_string(aurora::g_config.userPath);
+ 
+-  for (auto& controller : aurora::gamepad::g_GameControllers | std::views::values) {
++  for (auto& controllerEntry : aurora::gamepad::g_GameControllers) {
++    auto& controller = controllerEntry.second;
+     EnsureMappingLoaded(&controller);
+     const auto filePath =
+         basePath / fmt::format("{}_{:04X}_{:04X}.controller", aurora::gamepad::controller_name(controller.m_index),
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index a1df0c6..53d9656 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -1220,11 +1220,12 @@ void rebuild_pipeline_cache() {
+   {
+     std::lock_guard lock{g_pipelineMutex};
+     known.reserve(g_knownPipelines.size());
+-    for (const auto& pipeline : g_knownPipelines | std::views::values) {
+-      known.push_back(pipeline);
++    for (const auto& entry : g_knownPipelines) {
++      known.push_back(entry.second);
+     }
+   }
+-  std::ranges::sort(known, {}, &KnownPipeline::firstFrameUsed);
++  std::sort(known.begin(), known.end(),
++            [](const KnownPipeline& a, const KnownPipeline& b) { return a.firstFrameUsed < b.firstFrameUsed; });
+   for (const auto& pipeline : known) {
+     std::visit(
+         [&](const auto& config) {
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index ef185c2..c2e2af6 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -608,7 +608,8 @@ RecordedFrame end_recording() {
+   }
+ #if defined(AURORA_GFX_DEBUG_GROUPS)
+   if (!g_recorder.debugGroupStack.empty()) {
+-    for (auto& item : std::ranges::reverse_view(g_recorder.debugGroupStack)) {
++    for (auto it = g_recorder.debugGroupStack.rbegin(); it != g_recorder.debugGroupStack.rend(); ++it) {
++      auto& item = *it;
+       Log.warn("Debug group was not popped at end of frame: {}", item);
+     }
+     g_recorder.debugGroupStack.clear();
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index 30bdcf6..c6dc4ea 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -33,6 +33,27 @@ uint32_t sDlSize = 0;
+ uint32_t sDlWritePos = 0;
+ } // namespace detail
+ 
++#if !defined(__cpp_lib_atomic_wait) && defined(__linux__)
++// libstdc++ before 11 has no std::atomic::wait/notify_*: use a futex on the 32 bit counter.
++#include <linux/futex.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++namespace {
++void atomic_wait_u32(std::atomic<uint32_t>& value, uint32_t old) {
++  static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t));
++  syscall(SYS_futex, reinterpret_cast<uint32_t*>(&value), FUTEX_WAIT_PRIVATE, old, nullptr, nullptr, 0);
++}
++void atomic_notify_all_u32(std::atomic<uint32_t>& value) {
++  syscall(SYS_futex, reinterpret_cast<uint32_t*>(&value), FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
++}
++} // namespace
++#define AURORA_ATOMIC_WAIT(a, old, order) atomic_wait_u32(a, old)
++#define AURORA_ATOMIC_NOTIFY_ALL(a) atomic_notify_all_u32(a)
++#else
++#define AURORA_ATOMIC_WAIT(a, old, order) (a).wait(old, order)
++#define AURORA_ATOMIC_NOTIFY_ALL(a) (a).notify_all()
++#endif
++
+ namespace {
+ constexpr Module Log{"aurora::gx::fifo"};
+ // AURORA_DEBUG_FIFO_INLINE=1 parses the FIFO on the GX owner thread instead of
+@@ -86,7 +107,7 @@ void latch_gpu_draw_done() {
+ 
+ void wake_worker() noexcept {
+   sWorkerWake.fetch_add(1, std::memory_order_release);
+-  sWorkerWake.notify_all();
++  AURORA_ATOMIC_NOTIFY_ALL(sWorkerWake);
+ }
+ 
+ void process_to(uint64_t target, std::memory_order order) noexcept {
+@@ -123,7 +144,7 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
+       sProcessed.store(processed, order);
+       sParsed.store(processed, std::memory_order_release);
+     }
+-    sProcessed.notify_all();
++    // (no thread waits on sProcessed itself; waiters use sProcessProgress)
+     sProcessProgress.notify_all();
+   }
+ }
+@@ -142,7 +163,7 @@ void worker_main(std::stop_token token) noexcept {
+     if (token.stop_requested()) {
+       break;
+     }
+-    sWorkerWake.wait(event, std::memory_order_acquire);
++    AURORA_ATOMIC_WAIT(sWorkerWake, event, std::memory_order_acquire);
+   }
+ }
+ 
+diff --git a/lib/input/binding.cpp b/lib/input/binding.cpp
+index c0d4949..8eebff9 100644
+--- a/lib/input/binding.cpp
++++ b/lib/input/binding.cpp
+@@ -85,7 +85,7 @@ bool uses(const Binding& binding, input::SourceId source, const Address& address
+     return input.source == source && (address.type == Address::Type::None || Address::of(input) == address);
+   };
+   return matches(binding.input) ||
+-         std::ranges::any_of(binding.held, [&](const HeldInput& held) { return matches(held.input); });
++         std::any_of(binding.held.begin(), binding.held.end(), [&](const HeldInput& held) { return matches(held.input); });
+ }
+ 
+ } // namespace
+@@ -119,7 +119,7 @@ const ControlDescriptor* describe_control(ControlId control) {
+ }
+ 
+ bool BindingSet::references(input::SourceId source) const {
+-  return std::ranges::any_of(bindings, [&](const Binding& binding) { return uses(binding, source, Address{}); });
++  return std::any_of(bindings.begin(), bindings.end(), [&](const Binding& binding) { return uses(binding, source, Address{}); });
+ }
+ 
+ struct State::Impl {
+@@ -155,7 +155,7 @@ struct State::Impl {
+   }
+ 
+   [[nodiscard]] float contribution(const Binding& binding) const {
+-    if (binding.target == kInvalidControlId || std::ranges::any_of(binding.held, [&](const HeldInput& held) {
++    if (binding.target == kInvalidControlId || std::any_of(binding.held.begin(), binding.held.end(), [&](const HeldInput& held) {
+           return input_value(held.input) < held.threshold;
+         })) {
+       return 0.f;
+@@ -172,17 +172,19 @@ struct State::Impl {
+ 
+   [[nodiscard]] float aggregate(ControlId control) const {
+     const auto bindings = list();
+-    const auto producerValues = producers | std::views::values | std::views::transform([control](const Producer& p) {
+-                                  const auto it = p.find(control);
+-                                  return it != p.end() ? it->second : 0.f;
+-                                });
++    std::vector<float> producerValues;
++    producerValues.reserve(producers.size());
++    for (const auto& entry : producers) {
++      const auto it = entry.second.find(control);
++      producerValues.push_back(it != entry.second.end() ? it->second : 0.f);
++    }
+     if (kind_of(control) == ControlKind::Button) {
+       for (size_t i = 0; i < bindings.size(); ++i) {
+         if (bindings[i].target == control && contributions[i] != 0.f) {
+           return 1.f;
+         }
+       }
+-      return std::ranges::any_of(producerValues, [](float value) { return value >= 0.5f; }) ? 1.f : 0.f;
++      return std::any_of(producerValues.begin(), producerValues.end(), [](float value) { return value >= 0.5f; }) ? 1.f : 0.f;
+     }
+     float sum = 0.f;
+     for (size_t i = 0; i < bindings.size(); ++i) {
+@@ -236,7 +238,7 @@ struct State::Impl {
+     std::vector<ControlId> result;
+     for (const auto& binding : list()) {
+       if (binding.target != kInvalidControlId && uses(binding, source, address) &&
+-          std::ranges::find(result, binding.target) == result.end()) {
++          std::find(result.begin(), result.end(), binding.target) == result.end()) {
+         result.push_back(binding.target);
+       }
+     }
+@@ -245,8 +247,9 @@ struct State::Impl {
+ 
+   std::vector<ControlChange> cancel_all() {
+     admitted.clear();
+-    std::ranges::fill(contributions, 0.f);
+-    for (auto& producer : producers | std::views::values) {
++    std::fill(contributions.begin(), contributions.end(), 0.f);
++    for (auto& producerEntry : producers) {
++      auto& producer = producerEntry.second;
+       producer.clear();
+     }
+     std::vector<ControlChange> changes;
+@@ -264,8 +267,11 @@ struct State::Impl {
+     if (it == producers.end()) {
+       return changes;
+     }
+-    const auto keys = std::views::keys(it->second);
+-    const std::vector<ControlId> controls{keys.begin(), keys.end()};
++    std::vector<ControlId> controls;
++    controls.reserve(it->second.size());
++    for (const auto& entry : it->second) {
++      controls.push_back(entry.first);
++    }
+     if (remove) {
+       producers.erase(it);
+     } else {
+diff --git a/lib/input/router.cpp b/lib/input/router.cpp
+index aa60a3a..1646218 100644
+--- a/lib/input/router.cpp
++++ b/lib/input/router.cpp
+@@ -122,12 +122,12 @@ struct Router {
+   [[nodiscard]] bool deferring() const { return depth > 0 || draining; }
+ 
+   [[nodiscard]] Source* find_source(SourceId id) const {
+-    const auto it = std::ranges::find(sources, id, [](const auto& source) { return source->info.id; });
++    const auto it = std::find_if(sources.begin(), sources.end(), [id](const auto& source) { return source->info.id == id; });
+     return it != sources.end() ? it->get() : nullptr;
+   }
+ 
+   [[nodiscard]] Source* find_gamepad(SDL_JoystickID joystick) const {
+-    const auto it = std::ranges::find_if(sources, [joystick](const auto& source) {
++    const auto it = std::find_if(sources.begin(), sources.end(), [joystick](const auto& source) {
+       return source->live && source->info.kind == InputSource::Kind::Controller &&
+              source->info.origin == InputSource::Origin::Physical && source->joystick == joystick;
+     });
+@@ -135,12 +135,12 @@ struct Router {
+   }
+ 
+   Layer* find_layer(LayerId id) {
+-    const auto it = std::ranges::find(layers, id, &Layer::id);
++    const auto it = std::find_if(layers.begin(), layers.end(), [id](const Layer& l) { return l.id == id; });
+     return it != layers.end() ? &*it : nullptr;
+   }
+ 
+   [[nodiscard]] size_t layer_index(LayerId id) const {
+-    return std::ranges::find(layers, id, &Layer::id) - layers.begin();
++    return std::find_if(layers.begin(), layers.end(), [id](const Layer& l) { return l.id == id; }) - layers.begin();
+   }
+ 
+   Source& add_source(InputSource::Kind kind, InputSource::Origin origin, std::string_view name) {
+@@ -165,7 +165,7 @@ struct Router {
+     layer.id = nextLayer++;
+     const LayerId id = layer.id;
+     mutate([this, layer = std::move(layer)]() mutable {
+-      const auto it = std::ranges::find_if(layers, [&](const Layer& other) { return other.priority < layer.priority; });
++      const auto it = std::find_if(layers.begin(), layers.end(), [&](const Layer& other) { return other.priority < layer.priority; });
+       layers.insert(it, std::move(layer));
+     });
+     return id;
+@@ -216,8 +216,8 @@ struct Router {
+   }
+ 
+   [[nodiscard]] bool holds_state(const Source& source, LayerId layer) const {
+-    return std::ranges::any_of(routes, [&](const Route& route) {
+-      return route.source == source.info.id && std::ranges::find(route.layers, layer) != route.layers.end();
++    return std::any_of(routes.begin(), routes.end(), [&](const Route& route) {
++      return route.source == source.info.id && std::find(route.layers.begin(), route.layers.end(), layer) != route.layers.end();
+     });
+   }
+ 
+@@ -392,7 +392,7 @@ struct Router {
+   }
+ 
+   Route* find_route(SourceId source, RouteKind kind, uint64_t code) {
+-    const auto it = std::ranges::find_if(routes, [&](const Route& route) { return route.is(source, kind, code); });
++    const auto it = std::find_if(routes.begin(), routes.end(), [&](const Route& route) { return route.is(source, kind, code); });
+     return it != routes.end() ? &*it : nullptr;
+   }
+ 
+@@ -419,9 +419,10 @@ struct Router {
+     Route* route = find_route(source.info.id, kind, code);
+     if (route == nullptr) {
+       routes.push_back({.source = source.info.id, .kind = kind, .code = code, .layers = {layer}});
+-    } else if (std::ranges::find(route->layers, layer) == route->layers.end()) {
++    } else if (std::find(route->layers.begin(), route->layers.end(), layer) == route->layers.end()) {
+       route->layers.push_back(layer);
+-      std::ranges::sort(route->layers, {}, [this](LayerId id) { return layer_index(id); });
++      std::sort(route->layers.begin(), route->layers.end(),
++                [this](LayerId a, LayerId b) { return layer_index(a) < layer_index(b); });
+     }
+   }
+ 
+diff --git a/lib/system_info.cpp b/lib/system_info.cpp
+index d004fbf..4763280 100644
+--- a/lib/system_info.cpp
++++ b/lib/system_info.cpp
+@@ -17,6 +17,7 @@ extern "C" NTSYSAPI NTSTATUS NTAPI RtlGetVersion(PRTL_OSVERSIONINFOEXW lpVersion
+ #elif __APPLE__
+ #include "sys/sysctl.h"
+ #elif linux
++#include <algorithm>
+ #include <ranges>
+ #include <fstream>
+ #include <filesystem>
+@@ -276,10 +277,10 @@ void LogMisc() {
+ 
+ // https://stackoverflow.com/questions/216823/how-can-i-trim-a-stdstring
+ static void ltrim(std::string& s) {
+-  s.erase(s.begin(), std::ranges::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
++  s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+ }
+ static void rtrim(std::string& s) {
+-  s.erase(std::ranges::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(),
++  s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(),
+           s.end());
+ }
+ inline std::string trim(std::string str) {

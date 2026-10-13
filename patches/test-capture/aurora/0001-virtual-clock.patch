@@ -1,0 +1,310 @@
+diff --git a/include/aurora/time.hpp b/include/aurora/time.hpp
+index 6920896..97ee68c 100644
+--- a/include/aurora/time.hpp
++++ b/include/aurora/time.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <cstddef>
+ #include <cstdint>
+ 
+ namespace aurora::time {
+@@ -33,6 +34,23 @@ public:
+ 
+ using wall_clock = std::chrono::system_clock;
+ 
++/**
++ * Test only: a virtual clock for deterministic runs. When enabled, native_clock, game_clock,
++ * the native VI field clock and the Wii system time all read this counter instead of the host
++ * clocks. It advances only where the host explicitly moves it (VIWaitForRetrace jumps to the next
++ * field, SDK clock queries from game code add one microsecond, timed waits add their timeout).
++ */
++namespace vclock {
++void enable() noexcept;
++bool enabled() noexcept;
++int64_t ns() noexcept;
++void advance(int64_t nanoseconds) noexcept;
++void advance_to(int64_t nanoseconds) noexcept;
++// Diagnostics: how often each caller of the SDK clock advanced the virtual clock since the last dump.
++void note_query(const void* caller) noexcept;
++std::size_t dump_queries(char* buffer, std::size_t capacity) noexcept;
++} // namespace vclock
++
+ /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-kMaximumTimeScale. */
+ void set_scale(float scale) noexcept;
+ 
+diff --git a/lib/dolphin/dvd/dvd.cpp b/lib/dolphin/dvd/dvd.cpp
+index a593052..b22e900 100644
+--- a/lib/dolphin/dvd/dvd.cpp
++++ b/lib/dolphin/dvd/dvd.cpp
+@@ -1,3 +1,4 @@
++#include <aurora/time.hpp>
+ #include <aurora/dvd.h>
+ #include <dolphin/dvd.h>
+ #include "platform/interrupts.h"
+@@ -430,7 +431,9 @@ public:
+         finishCommand(block, DVD_RESULT_IGNORED, 0);
+         return false;
+       }
+-      if (!m_running || m_shutdown) {
++      // Test only (virtual clock): complete every read on the calling thread so that its
++      // completion does not depend on how fast the worker is.
++      if (!m_running || m_shutdown || aurora::time::vclock::enabled()) {
+         executeNow = true;
+       } else {
+         atomic_store_release(block->state, DVD_STATE_WAITING);
+diff --git a/lib/dolphin/os/OSTime.cpp b/lib/dolphin/os/OSTime.cpp
+index daebe0b..875b6e1 100644
+--- a/lib/dolphin/os/OSTime.cpp
++++ b/lib/dolphin/os/OSTime.cpp
+@@ -102,6 +102,28 @@ OSTime duration_to_ticks(const Duration duration) {
+ void initialize_game_epoch() {
+   s_gameEpochOffset = OSGetSystemTime() - duration_to_ticks(OSTimeClock::now().time_since_epoch());
+ }
++
++// Test only (aurora::time::vclock): SDK clock queries made by game code, outside the host's own
++// hardware servicing, move the virtual clock by one microsecond so that game loops which poll the
++// SDK clock for a timeout or for a time driven device (AI DMA, VI) make progress. Queries from
++// the servicing itself (alarms) and queries made while a GX draw done is outstanding (the GPU
++// finishes in real time, which must not leak into virtual time) do not advance it.
++constexpr int64_t kVirtualQueryNs = 1000;
++thread_local int s_serviceDepth = 0;
++} // namespace
++
++#ifdef AURORA_ENABLE_GX
++extern "C" bool aurora_test_gx_draw_done_outstanding();
++#endif
++
++namespace {
++bool virtual_query_advances() {
++  if (s_serviceDepth != 0) return false;
++#ifdef AURORA_ENABLE_GX
++  if (aurora_test_gx_draw_done_outstanding()) return false;
++#endif
++  return true;
++}
+ } // namespace
+ 
+ extern "C" bool aurora_register_hardware_service(AuroraHardwareService service) {
+@@ -118,7 +140,11 @@ extern "C" bool aurora_unregister_hardware_service(AuroraHardwareService service
+ extern "C" void aurora_service_hardware_owner() {
+   // Optional host endpoint owns thread, exclusion and borrowed-data lifetime.
+   // Worker time queries never change ordinary clock behavior or run game code.
+-  if (const auto service = s_hardwareService.load(std::memory_order_acquire)) service();
++  if (const auto service = s_hardwareService.load(std::memory_order_acquire)) {
++    ++s_serviceDepth;
++    struct Depth { ~Depth() { --s_serviceDepth; } } depth;
++    service();
++  }
+ }
+ 
+ extern "C" void aurora_service_hardware_interrupts() {
+@@ -145,6 +171,7 @@ OSTime OSGetTime() {
+   // causes and GX completion still progress here without blocking on a surface.
+   aurora_service_hardware_interrupts();
+   std::call_once(s_gameEpochOnce, initialize_game_epoch);
++  if (aurora::time::vclock::enabled() && virtual_query_advances()) { aurora::time::vclock::note_query(__builtin_return_address(0)); aurora::time::vclock::advance(kVirtualQueryNs); }
+   return s_gameEpochOffset + duration_to_ticks(OSTimeClock::now().time_since_epoch());
+ }
+ 
+@@ -206,4 +233,10 @@ OSTime OSCalendarTimeToTicks(OSCalendarTime* td) {
+   return OSMicrosecondsToTicks(chrono::duration_cast<chrono::microseconds>(sys - kGcnEpochUnix).count());
+ }
+ 
+-OSTime OSGetSystemTime() { return duration_to_ticks(aurora::time::wall_clock::now() - kGcnEpochUnix); }
++OSTime OSGetSystemTime() {
++  if (aurora::time::vclock::enabled()) {
++    // Fixed calendar start (2026-01-01 12:00:00 UTC) plus virtual time.
++    return duration_to_ticks(chrono::seconds{820584000} + chrono::nanoseconds{aurora::time::vclock::ns()});
++  }
++  return duration_to_ticks(aurora::time::wall_clock::now() - kGcnEpochUnix);
++}
+diff --git a/lib/dolphin/vi/vi.cpp b/lib/dolphin/vi/vi.cpp
+index 32df98b..3409a1d 100644
+--- a/lib/dolphin/vi/vi.cpp
++++ b/lib/dolphin/vi/vi.cpp
+@@ -1,6 +1,7 @@
+ // Real source video hardware is opt-in while historical probes are migrated.
+ // Original game boot must enable it and install explicit pre-entry settings.
+ #if defined(AURORA_NATIVE_VIDEO)
++#include <aurora/time.hpp>
+ #include <dolphin/vi.h>
+ #include <dolphin/os.h>
+ #include <dolphin/os/OSContext.h>
+@@ -42,7 +43,18 @@ Vec2<uint32_t> configured_fb_size() noexcept { return render_mode_size(); }
+ } // namespace aurora::vi
+ 
+ namespace {
+-using Clock = std::chrono::steady_clock;
++// The native VI field clock: the host steady clock, or aurora::time::vclock in a deterministic test.
++struct Clock {
++  using rep = int64_t;
++  using period = std::nano;
++  using duration = std::chrono::duration<rep, period>;
++  using time_point = std::chrono::time_point<Clock>;
++  static constexpr bool is_steady = true;
++  static time_point now() noexcept {
++    if (aurora::time::vclock::enabled()) return time_point{duration{aurora::time::vclock::ns()}};
++    return time_point{duration{std::chrono::steady_clock::now().time_since_epoch().count()}};
++  }
++};
+ using Nanoseconds = std::chrono::nanoseconds;
+ // Pinned RVL VI timing[]. 27/54 MHz hardware clocks, two clocks/sample.
+ struct Timing { uint16_t half_lines, half_width, active_lines; uint32_t clock_hz; };
+@@ -541,7 +553,12 @@ void VIWaitForRetrace() {
+       Clock::time_point deadline;
+       { std::lock_guard lock(state.mutex); UpdateClock(state, Clock::now());
+         deadline = state.anchor + FieldOffset(state.fields + 1, state.timing); }
+-      std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::milliseconds{1}));
++      if (aurora::time::vclock::enabled())
++        aurora::time::vclock::advance_to(deadline.time_since_epoch().count());  // jump to the next field
++      else
++        std::this_thread::sleep_until(std::min(
++          std::chrono::steady_clock::time_point{std::chrono::steady_clock::duration{deadline.time_since_epoch().count()}},
++          std::chrono::steady_clock::now() + std::chrono::milliseconds{1}));
+       aurora_service_hardware_interrupts();
+     }
+     OSDisableInterrupts();
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index 19371c5..c237022 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -314,6 +314,13 @@ void publish_draw_done() noexcept {
+   else process_to(target, std::memory_order_relaxed);
+ }
+ 
++bool test_owner() { return sOwner == std::this_thread::get_id(); }
++
++bool test_draw_done_outstanding() {
++  return sGpuFinishPending.load(std::memory_order_acquire) ||
++         sDrawDoneLatches.load(std::memory_order_acquire) < sDrawDoneTokens;
++}
++
+ bool service_draw_done() {
+   // A background SDK yield never dispatches game callbacks on that worker.
+   if (sOwner != std::this_thread::get_id()) return false;
+@@ -531,6 +538,18 @@ void clear_buffer() {
+ 
+ } // namespace aurora::gx::fifo
+ 
++// Test only (virtual clock): whether a GX draw done token is still waiting for its GPU finish or
++// for delivery to the game callback.
++// On the owner thread the token is first finished and delivered (a real wait for the GPU, which
++// leaves virtual time untouched), so that the answer never depends on how fast the GPU is.
++extern "C" bool aurora_test_gx_draw_done_outstanding() {
++  if (aurora::gx::fifo::test_owner()) {
++    aurora::gx::fifo::deliver_prior_draw_done();
++    return aurora::gx::fifo::test_draw_done_outstanding();
++  }
++  return false;
++}
++
+ extern "C" void aurora_configure_native_gx_hardware() {
+   aurora::gx::fifo::configure_native_recording();
+ }
+diff --git a/lib/gx/fifo.hpp b/lib/gx/fifo.hpp
+index 9888384..745f33a 100644
+--- a/lib/gx/fifo.hpp
++++ b/lib/gx/fifo.hpp
+@@ -108,6 +108,8 @@ DrawDoneCallback set_draw_done_callback(DrawDoneCallback callback) noexcept;
+ void reset_draw_done() noexcept;
+ void publish_draw_done() noexcept;
+ bool service_draw_done();
++bool test_draw_done_outstanding();
++bool test_owner();
+ void wait_draw_done();
+ // Owner, before writing a new draw-done token: wait until every earlier token
+ // has been processed, then deliver its finish (see fifo.cpp).
+diff --git a/lib/time.cpp b/lib/time.cpp
+index 1ef2ee1..eb2f74b 100644
+--- a/lib/time.cpp
++++ b/lib/time.cpp
+@@ -5,13 +5,23 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
++#include <array>
++#include <execinfo.h>
++#include <map>
+ #include <mutex>
++#include <cstdio>
+ #include <shared_mutex>
+ 
+ namespace aurora::time {
+ namespace {
+ 
++std::atomic<bool> s_vclockEnabled{false};
++std::atomic<int64_t> s_vclockNs{0};
++
+ native_clock::time_point default_native_now() noexcept {
++  if (s_vclockEnabled.load(std::memory_order_acquire)) {
++    return native_clock::time_point{native_clock::duration{s_vclockNs.load(std::memory_order_acquire)}};
++  }
+   const auto elapsed = std::chrono::steady_clock::now().time_since_epoch();
+   return native_clock::time_point{std::chrono::duration_cast<native_clock::duration>(elapsed)};
+ }
+@@ -35,7 +45,8 @@ native_clock::time_point get_native_now() noexcept { return s_nativeNow.load(std
+ 
+ game_clock::time_point game_now_locked(const ClockState& clockState,
+                                        const native_clock::time_point nativeNow) noexcept {
+-  if (clockState.pauseReasons != 0 || clockState.requestedScale == 0.0) {
++  if (!s_vclockEnabled.load(std::memory_order_acquire) &&
++      (clockState.pauseReasons != 0 || clockState.requestedScale == 0.0)) {
+     return clockState.gameAnchor;
+   }
+ 
+@@ -81,6 +92,53 @@ float scale() noexcept {
+   return static_cast<float>(clockState.requestedScale);
+ }
+ 
++namespace vclock {
++void enable() noexcept {
++  s_vclockNs.store(0, std::memory_order_release);
++  s_vclockEnabled.store(true, std::memory_order_release);
++  internal::reset();
++}
++bool enabled() noexcept { return s_vclockEnabled.load(std::memory_order_acquire); }
++int64_t ns() noexcept { return s_vclockNs.load(std::memory_order_acquire); }
++void advance(const int64_t nanoseconds) noexcept {
++  if (nanoseconds > 0) s_vclockNs.fetch_add(nanoseconds, std::memory_order_acq_rel);
++}
++namespace {
++std::mutex s_queryMutex;
++std::map<std::array<const void*, 4>, uint64_t> s_queries;
++}
++void note_query(const void*) noexcept {
++  std::array<const void*, 4> frames{};
++  void* raw[6]{};
++  const int n = backtrace(raw, 6);
++  for (int i = 0; i < 4 && i + 2 < n; ++i) frames[static_cast<std::size_t>(i)] = raw[i + 2];
++  std::lock_guard lock{s_queryMutex};
++  ++s_queries[frames];
++}
++std::size_t dump_queries(char* buffer, const std::size_t capacity) noexcept {
++  std::lock_guard lock{s_queryMutex};
++  std::size_t used = 0;
++  for (const auto& [caller, count] : s_queries) {
++    const int n = std::snprintf(buffer + used, capacity - used, " %llx,%llx,%llx,%llx:%llu",
++                                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(caller[0])),
++                                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(caller[1])),
++                                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(caller[2])),
++                                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(caller[3])),
++                                static_cast<unsigned long long>(count));
++    if (n < 0 || static_cast<std::size_t>(n) >= capacity - used) break;
++    used += static_cast<std::size_t>(n);
++  }
++  s_queries.clear();
++  return used;
++}
++void advance_to(const int64_t nanoseconds) noexcept {
++  int64_t current = s_vclockNs.load(std::memory_order_acquire);
++  while (current < nanoseconds &&
++         !s_vclockNs.compare_exchange_weak(current, nanoseconds, std::memory_order_acq_rel)) {
++  }
++}
++} // namespace vclock
++
+ namespace internal {
+ 
+ void set_pause_reason(const PauseReason reason, const bool paused) noexcept {

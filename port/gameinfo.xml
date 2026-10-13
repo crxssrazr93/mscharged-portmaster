@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+  <game>
+    <path>./Mario Strikers Charged.sh</path>
+    <name>Mario Strikers Charged</name>
+    <desc>A native port of Mario Strikers Charged, the rough and tumble five a side football game from the Wii, built from the community decompilation of the game and run on an OpenGL ES 3 renderer. You need your own USA disc image of the game.</desc>
+    <releasedate>20071207T000000</releasedate>
+    <developer>Next Level Games</developer>
+    <publisher>Nintendo</publisher>
+    <genre>Sports</genre>
+    <image>./mscharged/cover.png</image>
+  </game>
+</gameList>

@@ -1,0 +1,444 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -56,6 +56,9 @@
+     add_compile_definitions(MSCHARGED_GRAPHICS_GLES=1)
+     message(STATUS "Graphics backend: GLES (Aurora extra patches: ${MSCHARGED_AURORA_EXTRA_PATCH_DIR})")
+ endif()
++# Test only (patches/test-capture): virtual time, scripted input and in-process capture.
++option(MSCHARGED_TEST_CAPTURE "Compile the deterministic test capture hooks (never in shipped builds)" OFF)
++set(MSCHARGED_AURORA_TEST_PATCH_DIR "" CACHE PATH "Vulkan test build: extra Aurora series (test capture patches)")
+ option(MSCHARGED_BUILD_LAUNCHER "Build the graphical launcher" ON)
+ option(MSCHARGED_BUILD_AURORA_HOST "Build the Aurora core initialization check (no GX rendering)" OFF)
+ option(MSCHARGED_BUILD_GAME_STARTUP "Build the experimental original-game startup path (not playable)" OFF)
+@@ -111,6 +114,12 @@
+     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+         "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_sources.py" ${gles_patch_inputs})
+ endif()
++if(MSCHARGED_TEST_CAPTURE AND NOT MSCHARGED_GLES AND MSCHARGED_AURORA_TEST_PATCH_DIR)
++    set(MSCHARGED_PREPARER "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_gles_sources.py")
++    set(MSCHARGED_PREPARER_EXTRA_ARGS --aurora-extra-patch-dir "${MSCHARGED_AURORA_TEST_PATCH_DIR}")
++    file(GLOB_RECURSE test_patch_inputs CONFIGURE_DEPENDS "${MSCHARGED_AURORA_TEST_PATCH_DIR}/*")
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${test_patch_inputs})
++endif()
+ set(MSCHARGED_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/mscharged-decomp")
+ file(GLOB_RECURSE patch_inputs CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/*")
+ execute_process(
+@@ -281,9 +290,17 @@
+ if(MSCHARGED_BUILD_AURORA_HOST)
+     include(cmake/AuroraHost.cmake)
+ endif()
++if(MSCHARGED_TEST_CAPTURE)
++    # After the third party providers (Dawn) so that their objects are unaffected.
++    add_compile_definitions(MSCHARGED_TEST_CAPTURE=1)
++endif()
+ if(MSCHARGED_BUILD_LAUNCHER)
+     include(cmake/Launcher.cmake)
+ endif()
++if(MSCHARGED_TEST_CAPTURE AND TARGET mscharged)
++    target_sources(mscharged PRIVATE src/testcapture/test_capture.cpp)
++    target_include_directories(mscharged PRIVATE src "${MSCHARGED_AURORA_PREPARED}/include")
++endif()
+ if(MSCHARGED_BUILD_GAME_STARTUP)
+     include(cmake/GameStartup.cmake)
+ endif()
+--- a/src/platform/ai.cpp
++++ b/src/platform/ai.cpp
+@@ -17,6 +17,12 @@
+ #include <thread>
+ #include <vector>
+ 
++#if defined(MSCHARGED_TEST_CAPTURE)
++#include "testcapture/test_capture.h"
++static inline std::uint64_t TestNowNs() { return mscharged::testcap::NowNs(); }
++#else
++static inline std::uint64_t TestNowNs() { return SDL_GetTicksNS(); }
++#endif
+ namespace {
+ using mscharged::platform::NativeInterruptGuard;
+ using mscharged::platform::NativeInterruptRead;
+@@ -238,7 +244,7 @@
+     }
+     std::lock_guard lock(state.mutex);
+     state.output_started = true;
+-    state.output.device_start_ns = SDL_GetTicksNS();
++    state.output.device_start_ns = TestNowNs();
+ }
+ 
+ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nullptr) noexcept {
+@@ -246,7 +252,7 @@
+     // only try the lock; they never wait for source code while holding SDL's
+     // stream lock. A source critical section defers this native safe point.
+     NativeInterruptRead source_access;
+-    const auto now = SDL_GetTicksNS();
++    const auto now = TestNowNs();
+     // The owner's own masked section or IRQ context keeps hardware replay below.
+     const bool unmasked = mscharged::platform::NativeInterruptsEnabled() &&
+                           !mscharged::platform::NativeInterruptDispatchActive();
+@@ -332,11 +338,14 @@
+ 
+ void SDLCALL Feed(void* userdata, SDL_AudioStream* stream, int additional, int total) noexcept {
+     auto& state = *static_cast<AIState*>(userdata);
++#if defined(MSCHARGED_TEST_CAPTURE)
++    if (mscharged::testcap::VirtualTime()) return;  // the owner services the DMA clock at deterministic points
++#endif
+     if (state.observing.load(std::memory_order_relaxed)) {
+         std::lock_guard lock(state.mutex);
+         if (state.observing) {
+             auto& observed = state.observations;
+-            const auto now = SDL_GetTicksNS();
++            const auto now = TestNowNs();
+             if (observed.last_sdl_pull_ns)
+                 observed.maximum_sdl_pull_gap_ns = std::max(observed.maximum_sdl_pull_gap_ns, now - observed.last_sdl_pull_ns);
+             observed.last_sdl_pull_ns = now;
+@@ -501,7 +510,7 @@
+         if (state.running) return;
+         if (!state.address || !state.length) throw std::invalid_argument("AI DMA needs a source buffer and nonzero hardware length");
+         Latch(state);
+-        state.clock_epoch = state.last_service = SDL_GetTicksNS();
++        state.clock_epoch = state.last_service = TestNowNs();
+         state.output_started = false;
+         state.output = {};
+         state.output.dma_start_ns = state.clock_epoch;
+@@ -563,7 +572,7 @@
+     }
+     std::lock_guard lock(state.mutex);
+     state.rate = selected;
+-    state.clock_epoch = state.last_service = SDL_GetTicksNS();
++    state.clock_epoch = state.last_service = TestNowNs();
+     state.epoch_cells = 0;
+ }
+ 
+@@ -606,7 +615,7 @@
+                 call.state.callback_active = true;
+                 if (call.state.observing) {
+                     auto& observed = call.state.observations;
+-                    observation_start = SDL_GetTicksNS();
++                    observation_start = TestNowNs();
+                     auto& delivery = call.state.delivery;
+                     const auto latency = observation_start > call.state.cause_ns ?
+                         observation_start - call.state.cause_ns : 0;
+@@ -632,7 +641,7 @@
+                 call.state.callback_active = false;
+                 if (observation_start) {
+                     auto& observed = call.state.observations;
+-                    const auto duration = SDL_GetTicksNS() - observation_start;
++                    const auto duration = TestNowNs() - observation_start;
+                     ++observed.callbacks_failed;
+                     observed.total_callback_duration_ns += duration;
+                     observed.maximum_callback_duration_ns = std::max(observed.maximum_callback_duration_ns, duration);
+@@ -643,7 +652,7 @@
+             call.state.callback_active = false;
+             if (observation_start) {
+                 auto& observed = call.state.observations;
+-                const auto duration = SDL_GetTicksNS() - observation_start;
++                const auto duration = TestNowNs() - observation_start;
+                 ++observed.callbacks_completed;
+                 observed.total_callback_duration_ns += duration;
+                 observed.maximum_callback_duration_ns = std::max(observed.maximum_callback_duration_ns, duration);
+@@ -713,7 +722,7 @@
+     if (state.owner != std::this_thread::get_id() || state.callback_active)
+         throw std::logic_error("AI observations must start on the idle initialization/game owner");
+     state.observations = {};
+-    state.observations.observation_start_ns = SDL_GetTicksNS();
++    state.observations.observation_start_ns = TestNowNs();
+     state.observation_end_ns = 0;
+     state.delivery = {};
+     state.queue_observed = false;
+@@ -727,7 +736,7 @@
+     RequireInitialized(state);
+     if (state.owner != std::this_thread::get_id() || state.callback_active)
+         throw std::logic_error("AI observations must end on the idle initialization/game owner");
+-    if (state.observing) state.observation_end_ns = SDL_GetTicksNS();
++    if (state.observing) state.observation_end_ns = TestNowNs();
+     state.observing = false;
+ }
+ 
+@@ -737,7 +746,7 @@
+     std::lock_guard lock(state.mutex);
+     auto observed = state.observations;
+     if (observed.observation_start_ns) {
+-        const auto end = state.observing ? SDL_GetTicksNS() : state.observation_end_ns;
++        const auto end = state.observing ? TestNowNs() : state.observation_end_ns;
+         observed.observed_elapsed_ns = end - observed.observation_start_ns;
+     }
+     return observed;
+@@ -799,7 +808,7 @@
+         std::lock_guard lock(state.mutex);
+         audio_reference = state.audio_reference;
+         state.audio_reference = false;
+-        if (state.observing) state.observation_end_ns = SDL_GetTicksNS();
++        if (state.observing) state.observation_end_ns = TestNowNs();
+         state.observing = false;
+         state.stream = nullptr;
+         state.initialized = false;
+--- a/src/platform/desktop_wpad.cpp
++++ b/src/platform/desktop_wpad.cpp
+@@ -4,6 +4,9 @@
+ #include "platform/wpad_sdl.h"
+ #include <revolution/wpad/WPAD.h>
+ #include <SDL3/SDL.h>
++#if defined(MSCHARGED_TEST_CAPTURE)
++#include "testcapture/test_capture.h"
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -19,7 +22,19 @@
+ #include <thread>
+ 
+ namespace {
++#if defined(MSCHARGED_TEST_CAPTURE)
++// Test only: input timing follows the (virtual) test clock.
++struct Clock {
++    using rep = std::int64_t;
++    using period = std::nano;
++    using duration = std::chrono::duration<rep, period>;
++    using time_point = std::chrono::time_point<Clock>;
++    static constexpr bool is_steady = true;
++    static time_point now() noexcept { return time_point{duration{std::int64_t(mscharged::testcap::NowNs())}}; }
++};
++#else
+ using Clock = std::chrono::steady_clock;
++#endif
+ constexpr auto ReportPeriod = std::chrono::milliseconds(10);
+ // A keyboard shake is one flick: +2.5 g then -2.5 g along X for six reports
+ // each (60 ms at the report period), then rest. The original cAIPad smooths the
+@@ -562,6 +577,16 @@
+         mouse_buttons = state.mouse_buttons;
+         mouse_used = state.mouse_used;
+     }
++#if defined(MSCHARGED_TEST_CAPTURE)
++    if (mscharged::testcap::InputActive()) {
++        // Scripted input by game frame number replaces the raw SDL state.
++        focused = true;
++        mscharged::testcap::InputState(keys, mouse_x, mouse_y, mouse_buttons);
++        mouse_known = mouse_inside = true;
++        mouse_used = Clock::now();
++        shake_requests = {};
++    }
++#endif
+     NativeDpdObservation observation{};
+     if (state.settings.mouse) {
+         DesktopDpdProjection projection{};
+--- a/src/platform/hardware_owner.cpp
++++ b/src/platform/hardware_owner.cpp
+@@ -22,6 +22,13 @@
+ #include <thread>
+ #include <vector>
+ 
++#if defined(MSCHARGED_TEST_CAPTURE)
++#include "testcapture/test_capture.h"
++static inline std::uint64_t TestNowNs() { return mscharged::testcap::NowNs(); }
++#else
++#include <SDL3/SDL.h>
++static inline std::uint64_t TestNowNs() { return SDL_GetTicksNS(); }
++#endif
+ namespace {
+ struct Owner {
+     std::mutex latch;
+@@ -35,7 +42,7 @@
+     SDL_Window* close_window{};
+     std::uint32_t close_type{};
+     std::uint64_t close_timestamp{};
+-    std::chrono::steady_clock::time_point next_input{};
++    std::uint64_t next_input{};
+ };
+ Owner& State() { static Owner owner; return owner; }
+ 
+@@ -117,10 +124,10 @@
+     mscharged::platform::NativeInterruptRead exclusion;
+     if (!exclusion) return;
+     mscharged::platform::ServiceNativeAlarms();
+-    const auto now = std::chrono::steady_clock::now();
++    const std::uint64_t now = TestNowNs();
+     // Desktop devices and real remotes are serviced every 10 ms.
+     if ((!state.desktop_cadence && !mscharged::platform::WiimoteHidHasDevices()) || now >= state.next_input) {
+-        state.next_input = now + std::chrono::milliseconds(10);
++        state.next_input = now + 10000000ull;
+         SDL_PumpEvents();
+         mscharged::platform::ServiceWiimoteHid();
+         mscharged::platform::ServiceDesktopWpad();
+--- a/src/runtime/original_main_credits.cpp
++++ b/src/runtime/original_main_credits.cpp
+@@ -53,6 +53,9 @@
+ #include <revolution/ipc.h>
+ #include "credits_movie_hardware.h"
+ #include "runtime/frame_rate_title.h"
++#if defined(MSCHARGED_TEST_CAPTURE)
++#include "testcapture/test_capture.h"
++#endif
+ #include "runtime/frame_timing_log.h"
+ #if defined(MSCHARGED_HAS_ORIGINAL_GAME_AUDIO_INITIALIZE)
+ #include "original_game_audio_hardware.h"
+@@ -813,7 +816,18 @@
+                 // caught up, instead of growing it to the full-drain limit below.
+                 aurora::gx::fifo::rebase_if_caught_up();
+                 if(frameTiming)frameTiming->BeginFrame();
++#if defined(MSCHARGED_TEST_CAPTURE)
++                mscharged::testcap::BeforeFrame(frames);
++#endif
+                 frame(delta); observeOptions(); observeBoot(); AuroraGXEndDrawReceipt(); ++frames;
++#if defined(MSCHARGED_TEST_CAPTURE)
++                if(mscharged::testcap::AfterFrame(frames-1)) {
++                    AuroraGXSync(); aurora::gfx::synchronize();
++                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
++                    mscharged::platform::Trace("testcap: done after %u frames\n",frames);
++                    std::fflush(nullptr);mscharged::platform::TerminateProcessNow(0);
++                }
++#endif
+                 if(frameTiming)frameTiming->EndFrame(ReadFrameTimingCounters());
+                 // Nothing else drains once no host observation is due: without
+                 // this the buffer grows every frame until Aurora aborts on its
+--- /dev/null
++++ b/src/testcapture/test_capture.h
+@@ -0,0 +1,20 @@
++// Test only (patches/test-capture): deterministic virtual time, scripted input by game frame
++// number and in-process capture of the presented picture. Compiled only with MSCHARGED_TEST_CAPTURE.
++#pragma once
++#include <SDL3/SDL.h>
++#include <array>
++#include <cstdint>
++
++namespace mscharged::testcap {
++bool VirtualTime();                       // CAPTURE_VTIME=1
++std::uint64_t NowNs();                    // virtual ns, or SDL ticks
++// Called by the main loop around each game frame (frame numbers start at 0).
++void BeforeFrame(unsigned frame);
++// Returns true when the run is finished and the process should stop.
++bool AfterFrame(unsigned frame);
++unsigned CurrentFrame();
++// Scripted desktop input: overrides the raw state read by the desktop WPAD service.
++bool InputActive();
++void InputState(std::array<bool, SDL_SCANCODE_COUNT>& keys, float& mouse_x, float& mouse_y,
++                std::uint32_t& mouse_buttons);
++}
+--- /dev/null
++++ b/src/testcapture/test_capture.cpp
+@@ -0,0 +1,127 @@
++#include "testcapture/test_capture.h"
++#include <aurora/time.hpp>
++#include <aurora/video.h>
++#include <algorithm>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <fstream>
++#include <set>
++#include <sstream>
++#include <string>
++#include <vector>
++
++namespace mscharged::testcap {
++namespace {
++struct Config {
++    bool vtime = false;
++    std::string dir;
++    std::set<unsigned> frames;
++    unsigned exit_after = 0;       // 0: after the last capture + 30 frames
++    bool input = false;
++    bool trace = false;
++};
++struct Event { unsigned frame; std::string op; float a, b; std::string key; };
++std::vector<Event> g_events;
++size_t g_next_event = 0;
++std::array<bool, SDL_SCANCODE_COUNT> g_keys{};
++float g_mx = 0, g_my = 0;
++std::uint32_t g_buttons = 0;
++std::atomic<unsigned> g_frame{0};
++Config g_cfg;
++FILE* g_trace = nullptr;
++unsigned g_last_capture = 0;
++
++Config Load() {
++    Config c;
++    const char* v = std::getenv("CAPTURE_VTIME");
++    c.vtime = v && *v && *v != '0';
++    if (const char* d = std::getenv("CAPTURE_DIR")) c.dir = d;
++    if (const char* f = std::getenv("CAPTURE_FRAMES")) {
++        // "10,20,100-200/10"
++        std::stringstream list(f); std::string item;
++        while (std::getline(list, item, ',')) {
++            unsigned a = 0, b = 0, s = 1;
++            if (std::sscanf(item.c_str(), "%u-%u/%u", &a, &b, &s) == 3 || std::sscanf(item.c_str(), "%u-%u", &a, &b) == 2) {
++                for (unsigned n = a; n <= b; n += std::max(1u, s)) c.frames.insert(n);
++            } else if (std::sscanf(item.c_str(), "%u", &a) == 1) c.frames.insert(a);
++        }
++    }
++    if (const char* e = std::getenv("CAPTURE_EXIT_FRAME")) c.exit_after = unsigned(std::atoi(e));
++    c.trace = std::getenv("CAPTURE_TRACE") != nullptr;
++    if (const char* in = std::getenv("CAPTURE_INPUT")) {
++        std::ifstream file(in); std::string line;
++        while (std::getline(file, line)) {
++            if (line.empty() || line[0] == '#') continue;
++            std::stringstream ss(line); Event ev{}; ss >> ev.frame >> ev.op;
++            if (ev.op == "keydown" || ev.op == "keyup") ss >> ev.key;
++            else if (ev.op == "mouse") ss >> ev.a >> ev.b;
++            else if (ev.op == "mdown" || ev.op == "mup") ss >> ev.key;
++            g_events.push_back(ev);
++        }
++        std::stable_sort(g_events.begin(), g_events.end(), [](auto& x, auto& y) { return x.frame < y.frame; });
++        c.input = true;
++    }
++    return c;
++}
++// Static initialisation enables the virtual clock before Aurora creates any clock anchor.
++struct Init {
++    Init() {
++        g_cfg = Load();
++        if (g_cfg.vtime) aurora::time::vclock::enable();
++        if (!g_cfg.dir.empty()) std::filesystem::create_directories(g_cfg.dir);
++        if (g_cfg.trace && !g_cfg.dir.empty()) g_trace = std::fopen((g_cfg.dir + "/trace.txt").c_str(), "w");
++        if (!g_cfg.frames.empty()) g_last_capture = *g_cfg.frames.rbegin();
++    }
++} g_init;
++}
++
++bool VirtualTime() { return g_cfg.vtime; }
++std::uint64_t NowNs() { return g_cfg.vtime ? std::uint64_t(aurora::time::vclock::ns()) : SDL_GetTicksNS(); }
++unsigned CurrentFrame() { return g_frame.load(); }
++bool InputActive() { return g_cfg.input; }
++void InputState(std::array<bool, SDL_SCANCODE_COUNT>& keys, float& mx, float& my, std::uint32_t& buttons) {
++    keys = g_keys; mx = g_mx; my = g_my; buttons = g_buttons;
++}
++
++void BeforeFrame(unsigned frame) {
++    g_frame = frame;
++    if (frame == 3 && !g_cfg.dir.empty()) {
++        std::ifstream in("/proc/self/maps"); std::ofstream out(g_cfg.dir + "/maps.txt"); out << in.rdbuf();
++    }
++    while (g_next_event < g_events.size() && g_events[g_next_event].frame <= frame) {
++        const auto& e = g_events[g_next_event++];
++        if (e.op == "keydown" || e.op == "keyup") {
++            const SDL_Scancode code = SDL_GetScancodeFromName(e.key.c_str());
++            if (code != SDL_SCANCODE_UNKNOWN) g_keys[code] = e.op == "keydown";
++            else std::fprintf(stderr, "testcap: unknown key %s\n", e.key.c_str());
++        } else if (e.op == "mouse") { g_mx = e.a; g_my = e.b; }
++        else if (e.op == "mdown" || e.op == "mup") {
++            const std::uint32_t bit = e.key == "right" ? SDL_BUTTON_RMASK : SDL_BUTTON_LMASK;
++            g_buttons = e.op == "mdown" ? (g_buttons | bit) : (g_buttons & ~bit);
++        }
++    }
++    if (g_cfg.frames.count(frame) && !g_cfg.dir.empty()) {
++        char name[64]; std::snprintf(name, sizeof name, "/f%06u.png", frame);
++        const std::string path = g_cfg.dir + name;
++        if (!aurora_request_video_screenshot(path.c_str())) std::fprintf(stderr, "testcap: screenshot busy at %u\n", frame);
++    }
++}
++
++bool AfterFrame(unsigned frame) {
++    if (g_trace) {
++        AuroraVIHardwareState vi{};
++        aurora_get_video_hardware_state(&vi);
++        std::fprintf(g_trace, "%u %lld %u\n", frame, (long long)aurora::time::vclock::ns(), vi.retrace_count);
++        if (std::getenv("CAPTURE_TRACE")[0] == '2') {
++            static char buffer[8192];
++            const auto n = aurora::time::vclock::dump_queries(buffer, sizeof buffer);
++            std::fprintf(g_trace, "Q%.*s\n", int(n), buffer);
++        }
++        if (frame % 16 == 0) std::fflush(g_trace);
++    }
++    const unsigned limit = g_cfg.exit_after ? g_cfg.exit_after : (g_last_capture ? g_last_capture + 30 : 0);
++    return limit && frame >= limit;
++}
++}

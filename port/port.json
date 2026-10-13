@@ -1,0 +1,34 @@
+{
+    "version": 4,
+    "name": "mscharged.zip",
+    "items": [
+        "Mario Strikers Charged.sh",
+        "mscharged"
+    ],
+    "items_opt": null,
+    "attr": {
+        "title": "Mario Strikers Charged",
+        "porter": [
+            "crxssrazr93"
+        ],
+        "desc": "A native port of Mario Strikers Charged, the rough and tumble five a side football game from the Wii, built from the community decompilation of the game and run on an OpenGL ES 3 renderer. You need your own USA disc image of the game.",
+        "desc_md": null,
+        "inst": "Dump your own Mario Strikers Charged USA disc (game ID R4QE01, revision 1) and copy the .rvz or .iso file into ports/mscharged/. The disc image is read directly, nothing has to be extracted or converted.",
+        "inst_md": "Dump your own Mario Strikers Charged USA disc (game ID `R4QE01`, revision 1) and copy the `.rvz` or `.iso` file into `ports/mscharged/`. The disc image is read directly, nothing has to be extracted or converted.",
+        "genres": [
+            "sports",
+            "action"
+        ],
+        "image": {},
+        "rtr": false,
+        "exp": true,
+        "runtime": [],
+        "store": [],
+        "availability": "paid",
+        "reqs": [],
+        "arch": [
+            "aarch64"
+        ],
+        "min_glibc": "2.31"
+    }
+}

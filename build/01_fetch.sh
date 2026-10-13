@@ -22,6 +22,11 @@ apply() {  # apply a patch once
   else echo "cannot apply $1" >&2; exit 1; fi
 }
 for p in "$W"/patches/port-gles/*.patch "$W"/patches/port-pm/*.patch; do apply "$p"; done
+# Decomp host adaptations (appended to the port's own decomp series).
+for p in "$W"/patches/decomp-pm/*.patch; do
+  cp "$p" patches/mscharged-decomp/
+  grep -qxF "$(basename "$p")" patches/mscharged-decomp/series || echo "$(basename "$p")" >> patches/mscharged-decomp/series
+done
 python3 tools/setup_dependencies.py --graphics-backend gles
 if [ ! -d "$SHIM_SRC/.git" ]; then git clone -q --branch sdl2-backend "$SHIM_REPO" "$SHIM_SRC"; fi
 git -C "$SHIM_SRC" checkout -q "$SHIM_COMMIT"
