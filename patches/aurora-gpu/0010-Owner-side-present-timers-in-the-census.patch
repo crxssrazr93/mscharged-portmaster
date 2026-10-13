@@ -1,0 +1,68 @@
+diff --git a/lib/gl/census.cpp b/lib/gl/census.cpp
+--- a/lib/gl/census.cpp	2026-10-13 20:50:09.094473956 +0530
++++ b/lib/gl/census.cpp	2026-10-13 21:05:25.869177821 +0530
+@@ -243,9 +243,10 @@
+     head += fmt::format("\n[gl-count] per second: tex-new {:.1f} tex-stream {:.1f} tex-upload {:.2f} MB", cps[CtTexNew],
+                         cps[CtTexStream], cps[CtTexBytes] / 1.0e6);
+     head += fmt::format("\n[gl-time] ms per second: ops {:.0f} (upload {:.0f}) finish {:.0f} sync-wait {:.0f} "
+-                        "drawdone-wait {:.0f} parse {:.0f} pipeline-wait {:.0f} slot-wait {:.0f} fence-wait {:.0f} present {:.0f}",
++                        "drawdone-wait {:.0f} parse {:.0f} pipeline-wait {:.0f} slot-wait {:.0f} fence-wait {:.0f} present {:.0f} owner-wait {:.0f} owner-swap {:.0f} rev-wait {:.0f}",
+                         ms[TmOps], ms[TmUpload], ms[TmFinish], ms[TmSyncWait], ms[TmDrawDone], ms[TmParse],
+-                        ms[TmPipeline], ms[TmSlotWait], ms[TmFenceWait], ms[TmPresent]);
++                        ms[TmPipeline], ms[TmSlotWait], ms[TmFenceWait], ms[TmPresent], ms[TmOwnerWait], ms[TmOwnerSwap],
++                        ms[TmRevWait]);
+   }
+   s_timeMark = now;
+   const auto emit = [&](const std::string& m) { detailed > 0 ? Log.warn("{}", m) : Log.info("{}", m); };
+diff --git a/lib/gl/census.hpp b/lib/gl/census.hpp
+--- a/lib/gl/census.hpp	2026-10-13 20:50:09.094626842 +0530
++++ b/lib/gl/census.hpp	2026-10-13 21:05:25.868664674 +0530
+@@ -83,9 +83,12 @@
+ //   pipeline   recording thread blocked on a shader compile
+ //   slot-wait  recording thread waiting for a free frame slot (the render worker is two frames behind)
+ //   fence-wait render worker waiting for the GPU to release a slot's ring buffers
++//   owner-wait game thread waiting in flush_present for the render worker's finished frame
++//   owner-swap game thread in the panel blit and swap (vsync lands here)
++//   rev-wait   render worker waiting for the panel blit of a slot to retire
+ //   present    render worker drawing and presenting the VI picture
+ enum Timer : uint8_t {
+-  TmOps, TmUpload, TmFinish, TmSyncWait, TmDrawDone, TmParse, TmPipeline, TmSlotWait, TmFenceWait, TmPresent, TmCount
++  TmOps, TmUpload, TmFinish, TmSyncWait, TmDrawDone, TmParse, TmPipeline, TmSlotWait, TmFenceWait, TmPresent, TmOwnerWait, TmOwnerSwap, TmRevWait, TmCount
+ };
+ void time_add(Timer timer, int64_t nanoseconds) noexcept;
+ // Event counters shown per second in the [gl-time] line: textures created (new_static_texture_2d from game data),
+diff --git a/lib/webgpu/sdl2shim_present.cpp b/lib/webgpu/sdl2shim_present.cpp
+--- a/lib/webgpu/sdl2shim_present.cpp	2026-10-13 20:50:09.090803009 +0530
++++ b/lib/webgpu/sdl2shim_present.cpp	2026-10-13 21:05:25.869521124 +0530
+@@ -11,6 +11,7 @@
+ #include <tracy/Tracy.hpp>
+ 
+ #include "../gfx/frame.hpp"
++#include "../gl/census.hpp"
+ #include "../gl/gl_core.hpp"
+ #include "../internal.hpp"
+ #include "../window.hpp"
+@@ -221,6 +222,7 @@
+ // Blit the finished slot into the window's default framebuffer and swap. Main thread, shim context.
+ void blit_and_swap(Slot& slot) {
+   ZoneScopedN("EFB blit + swap");
++  gl::census::ScopedTimer swapTimer{gl::census::TmOwnerSwap};
+   SDL_Window* window = window::get_sdl_window();
+   int drawableWidth = static_cast<int>(g_width);
+   int drawableHeight = static_cast<int>(g_height);
+@@ -396,6 +398,7 @@
+   // steady state the fence retired a frame ago and this returns immediately; on timeout we render
+   // anyway (one torn frame, loudly).
+   if (slot.revSync != nullptr && gl::gl.eglClientWaitSyncKHR != nullptr) {
++    gl::census::ScopedTimer revTimer{gl::census::TmRevWait};
+     const int32_t waited = gl::gl.eglClientWaitSyncKHR(g_display, slot.revSync, 0, RevSyncWaitTimeoutNs);
+     if (waited != gl::EGL_CONDITION_SATISFIED_KHR) {
+       Log.warn("[sdl2shim-efb] slot {} reverse-fence wait returned 0x{:x}; rendering into it anyway", slotIndex,
+@@ -481,6 +484,7 @@
+     // g_framesOwed drops to zero when the worker reports a frame it could not present, which is
+     // also a reason to stop waiting.
+     const auto ready = [&] { return g_aborting || g_hasReadyFrame || g_framesOwed <= 0; };
++    gl::census::ScopedTimer ownerTimer{gl::census::TmOwnerWait};
+     if (!g_frameReady.wait_for(lock, PresentWaitTimeout, ready)) {
+       Log.warn("[sdl2shim-efb] timed out waiting for the render worker to submit a frame");
+       return;
