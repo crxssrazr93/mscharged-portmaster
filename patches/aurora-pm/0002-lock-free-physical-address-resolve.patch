@@ -1,0 +1,154 @@
+diff --git a/lib/dolphin/os/OSAddress.cpp b/lib/dolphin/os/OSAddress.cpp
+--- a/lib/dolphin/os/OSAddress.cpp
++++ b/lib/dolphin/os/OSAddress.cpp
+@@ -1,6 +1,8 @@
+ #include "internal.hpp"
+ #include <dolphin/os.h>
+ #include <dolphin/os/OSNativeMemory.h>
++#include <atomic>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+@@ -38,6 +40,76 @@
+ };
+ AddressState& Addresses() { static AddressState state; return state; }
+ uintptr_t Value(const void* p) { return reinterpret_cast<uintptr_t>(p); }
++
++// Lock-free read path for OSPhysicalToCached. The static region table changes only on register/release/reset
++// (rare, under the address mutex); readers use a seqlock snapshot of it and fall back to the locked resolver
++// for anything unusual (inside a region but not live, out of range, a torn read), so errors are unchanged.
++constexpr unsigned FastRegionMax = 16;
++struct FastRegion { std::atomic<u64> start{}, reserved{}, address{}, bytes{}; std::atomic<bool> active{}; };
++struct FastMap {
++    std::atomic<u64> seq{0};
++    std::atomic<u32> count{0};
++    std::atomic<bool> overflow{false};
++    FastRegion regions[FastRegionMax];
++};
++FastMap g_fast;
++std::atomic<u64> g_p2c_calls{0}, g_c2p_calls{0};
++const bool g_count_calls = [] { const char* v = std::getenv("MSCHARGED_AXSTATS"); return v && *v && *v != '0'; }();
++void PublishFast(AddressState& state) {  // caller holds state.mutex
++    const auto seq = g_fast.seq.load(std::memory_order_relaxed);
++    g_fast.seq.store(seq + 1, std::memory_order_relaxed);
++    std::atomic_thread_fence(std::memory_order_release);
++    u32 n = 0;
++    for (const auto& [physical, entry] : state.regions) {
++        if (n == FastRegionMax) break;
++        auto& r = g_fast.regions[n++];
++        r.start.store(physical, std::memory_order_relaxed);
++        r.reserved.store(entry.reserved, std::memory_order_relaxed);
++        r.address.store(entry.address, std::memory_order_relaxed);
++        r.bytes.store(entry.bytes, std::memory_order_relaxed);
++        r.active.store(entry.active, std::memory_order_relaxed);
++    }
++    g_fast.count.store(n, std::memory_order_relaxed);
++    g_fast.overflow.store(state.regions.size() > FastRegionMax, std::memory_order_relaxed);
++    g_fast.seq.store(seq + 2, std::memory_order_release);
++}
++bool FastResolvePhysical(u32 physical, void** out) {
++    const auto s1 = g_fast.seq.load(std::memory_order_acquire);
++    if ((s1 & 1) || g_fast.overflow.load(std::memory_order_relaxed)) return false;
++    void* result = nullptr;
++    bool ok = false;
++    const auto n = g_fast.count.load(std::memory_order_relaxed);
++    bool inside = false;
++    for (u32 i = 0; i < n; ++i) {
++        const auto& r = g_fast.regions[i];
++        const u64 offset = static_cast<u64>(physical) - r.start.load(std::memory_order_relaxed);
++        if (static_cast<u64>(physical) >= r.start.load(std::memory_order_relaxed) &&
++            offset < r.reserved.load(std::memory_order_relaxed)) {
++            inside = true;
++            if (r.active.load(std::memory_order_relaxed) && offset < r.bytes.load(std::memory_order_relaxed)) {
++                result = reinterpret_cast<void*>(r.address.load(std::memory_order_relaxed) + offset);
++                ok = true;
++            }
++            break;
++        }
++    }
++    if (!inside) {
++        const auto b1 = Value(MEM1Start), e1 = Value(MEM1End);
++        if (b1 && e1 >= b1 && e1 - b1 <= std::numeric_limits<u32>::max() && physical <= e1 - b1) {
++            result = reinterpret_cast<void*>(b1 + physical); ok = true;
++        } else {
++            const auto b2 = Value(MEM2Start), e2 = Value(MEM2End);
++            if (b2 && e2 >= b2 && e2 - b2 <= std::numeric_limits<u32>::max() && physical >= MEM2_PHYSICAL_BASE &&
++                physical - MEM2_PHYSICAL_BASE <= e2 - b2) {
++                result = reinterpret_cast<void*>(b2 + physical - MEM2_PHYSICAL_BASE); ok = true;
++            }
++        }
++    }
++    std::atomic_thread_fence(std::memory_order_acquire);
++    if (!ok || g_fast.seq.load(std::memory_order_relaxed) != s1) return false;
++    *out = result;
++    return true;
++}
+ u32 BankSize(void* start, void* end) {
+     const auto begin = Value(start), finish = Value(end);
+     if (!begin || finish < begin || finish - begin > std::numeric_limits<u32>::max())
+@@ -118,12 +190,19 @@
+ }
+ }
+ 
++void OSNativeAddressCallCounts(u64* physical_to_cached, u64* cached_to_physical) {
++    if (physical_to_cached) *physical_to_cached = g_p2c_calls.load(std::memory_order_relaxed);
++    if (cached_to_physical) *cached_to_physical = g_c2p_calls.load(std::memory_order_relaxed);
++}
+ void* OSPhysicalToCached(u32 physical) {
++    if (g_count_calls) g_p2c_calls.fetch_add(1, std::memory_order_relaxed);
++    if (void* fast; FastResolvePhysical(physical, &fast)) return fast;
+     auto& state = Addresses(); std::lock_guard lock(state.mutex);
+     return ResolvePhysical(state, physical);
+ }
+ void* OSPhysicalToUncached(u32 physical) { return OSPhysicalToCached(physical); }
+ u32 OSCachedToPhysical(void* address) {
++    if (g_count_calls) g_c2p_calls.fetch_add(1, std::memory_order_relaxed);
+     auto& state = Addresses(); std::lock_guard lock(state.mutex);
+     return ResolvePointer(state, address, 0, FALSE, nullptr);
+ }
+@@ -202,14 +281,18 @@
+             // Allocate all metadata before committing the real SDK reservation.
+             auto [it, inserted] = state.regions.emplace(physical, std::move(entry));
+             if (!inserted) throw std::logic_error("Native physical reservation collision");
++            PublishFast(state);
+             if (Value(OSAllocFromArenaHi(reserved, 32)) != Value(MEM1Start) + physical) {
+                 it->second.active = false;
++                PublishFast(state);
+                 throw std::logic_error("SDK physical reservation differs from its arena allocation");
+             }
+         } else existing->second = std::move(entry);
++        PublishFast(state);
+         state.owner = std::this_thread::get_id();
+         return {identity, physical, owner->bytes};
+     } catch (...) {
++        PublishFast(state);
+         lock.unlock(); owner->release(owner->context); throw;
+     }
+ }
+@@ -222,6 +305,7 @@
+     if (entry.pins) throw std::logic_error("Native static backing still has live device owners");
+     auto release = entry.release; auto* context = entry.context;
+     entry.active = false; entry.address = 0; entry.context = nullptr; entry.release = nullptr;
++    PublishFast(state);
+     lock.unlock(); release(context);
+     // Keep the physical reservation excluded until SDK reset. A reloaded exact
+     // module/resource contract can reuse it; a different identity cannot alias it.
+@@ -247,4 +331,5 @@
+     for (const auto& [physical, entry] : state.regions)
+         if (entry.active || entry.pins) throw std::logic_error("SDK memory reset requires drained native static owners");
+     state.regions.clear(); state.owner = {};
++    PublishFast(state);
+ }
+diff --git a/include/dolphin/os/OSNativeMemory.h b/include/dolphin/os/OSNativeMemory.h
+--- a/include/dolphin/os/OSNativeMemory.h
++++ b/include/dolphin/os/OSNativeMemory.h
+@@ -29,6 +29,8 @@
+ // device ownership. Zero is returned only for real SDK MEM1/MEM2 bank backing.
+ u64 OSNativePinAddress(const void* address, u32 bytes, BOOL writable, u32* physical_address);
+ void OSNativeUnpinAddress(u64 identity);
++/* Diagnostics (counted only when MSCHARGED_AXSTATS is set): calls of OSPhysicalToCached / OSCachedToPhysical. */
++void OSNativeAddressCallCounts(u64* physical_to_cached, u64* cached_to_physical);
+ #ifdef __cplusplus
+ }
+ #endif

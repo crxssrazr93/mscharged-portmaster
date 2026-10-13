@@ -3,7 +3,7 @@
 # Nothing is shown on the desktop: Wayland is unset and the game uses a private X display.
 # Usage: tests/pc/gles_boot.sh <out dir> [seconds, default 60]
 # Host screenshots (key "p" in KEYS) are collected into <out dir>/host.
-# Environment: INI (config file, default tests/pc/gles_mscharged.ini), EVERY (screenshot period, default 10),
+# Environment: BUILD (build dir, default upstream/build/gles-release), BIN (executable name in it, default mscharged), INI (config file, default tests/pc/gles_mscharged.ini), EVERY (screenshot period, default 10),
 #   ACTIONS (file with "<second> <xdotool args>" lines), KEYS ("<second>:<xdotool key> ...", e.g. "40:Return 50:x"), ARGS (extra mscharged arguments).
 O=$(realpath -m "$1"); T=${2:-60}
 W="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -12,9 +12,9 @@ rm -rf "$O"; mkdir -p "$O/home"
 N=$((300 + RANDOM % 600))
 Xvfb :$N -screen 0 640x480x24 > "$O/xvfb.log" 2>&1 & X=$!
 sleep 2
-cd "$W/upstream/build/gles-release"
+cd "${BUILD:-$W/upstream/build/gles-release}"
 env -u WAYLAND_DISPLAY DISPLAY=:$N SDL_VIDEODRIVER=x11 HOME="$O/home" \
-  ./mscharged ${INI:+--config "$INI"} --disc "$W/disc/R4QE01.rvz" --window --size 576x432 $ARGS \
+  ./${BIN:-mscharged} ${INI:+--config "$INI"} --disc "$W/disc/R4QE01.rvz" --window --size 576x432 $ARGS \
   > "$O/game.log" 2>&1 & G=$!
 start=$SECONDS
 [ -n "$KEYS" ] && ( sleep 5; env -u WAYLAND_DISPLAY DISPLAY=:$N xdotool mousemove 300 200 ) &
