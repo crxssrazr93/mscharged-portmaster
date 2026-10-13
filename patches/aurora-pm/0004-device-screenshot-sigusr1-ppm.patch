@@ -1,0 +1,81 @@
+--- a/lib/gfx/scanout.cpp
++++ b/lib/gfx/scanout.cpp
+@@ -19,6 +19,10 @@
+ #include <aurora/video.h>
+ #include <dolphin/vi.h>
+ #include <algorithm>
++#include <atomic>
++#include <csignal>
++#include <cstdio>
++#include <cstdlib>
+ #include <array>
+ #include <cmath>
+ #include <filesystem>
+@@ -233,6 +237,59 @@
+   if (sScreenshotPath.empty()) sScreenshotPath = path;
+ }
+ 
++// Device screenshot (SIGUSR1 or a trigger file), uncompressed PPM, no libpng. The signal handler only sets an
++// atomic flag; the readback runs on the render worker right after the frame was drawn into the present target.
++// Idle cost: one relaxed atomic load per Present and one stat() every 16 Presents.
++std::atomic<bool> sShotFlag{false};
++void shot_signal_handler(int) { sShotFlag.store(true, std::memory_order_relaxed); }
++std::string shot_base() {
++  const char* d = std::getenv("GAMEDIR");
++  return d != nullptr && *d != 0 ? d : ".";
++}
++std::string shot_dir() {
++  const char* d = std::getenv("MSCHARGED_SHOT_DIR");
++  return d != nullptr && *d != 0 ? std::string(d) : shot_base() + "/screenshots";
++}
++bool shot_requested() {
++  static std::once_flag once;
++  static uint32_t tick = 0;
++  std::call_once(once, [] { std::signal(SIGUSR1, shot_signal_handler); });
++  if (sShotFlag.load(std::memory_order_relaxed)) { sShotFlag.store(false, std::memory_order_relaxed); return true; }
++  if ((++tick & 15) != 0) return false;
++  static const std::string trigger = shot_base() + "/screenshot.request";
++  std::error_code ec;
++  return std::filesystem::remove(trigger, ec);
++}
++// Worker only. Reads the presented RGBA frame of targetFbo (0 = default framebuffer, back buffer before the swap).
++void shot_capture(gl::GLuint targetFbo, uint32_t width, uint32_t height) {
++  std::vector<uint8_t> rgba(static_cast<size_t>(width) * height * 4);
++  gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, targetFbo);
++  gl::gl.PixelStorei(gl::GL_PACK_ALIGNMENT, 1);
++  gl::gl.ReadPixels(0, 0, static_cast<gl::GLsizei>(width), static_cast<gl::GLsizei>(height), gl::GL_RGBA,
++      gl::GL_UNSIGNED_BYTE, rgba.data());
++  gl::gl.PixelStorei(gl::GL_PACK_ALIGNMENT, 4);
++  gl::reset_state_cache();
++  static std::atomic<uint32_t> counter{0};
++  std::thread([rgba = std::move(rgba), width, height] {
++    std::error_code ec;
++    const std::filesystem::path dir{shot_dir()};
++    std::filesystem::create_directories(dir, ec);
++    std::filesystem::path file;
++    do { file = dir / ("shot_" + std::to_string(counter.fetch_add(1)) + ".ppm"); } while (std::filesystem::exists(file, ec));
++    std::FILE* f = std::fopen(file.c_str(), "wb");
++    if (f == nullptr) { Log.warn("Screenshot could not be written: {}", file.string()); return; }
++    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
++    std::vector<uint8_t> row(static_cast<size_t>(width) * 3);
++    for (uint32_t y = 0; y < height; ++y) {  // GL reads bottom-up, PPM is top-down
++      const uint8_t* src = rgba.data() + static_cast<size_t>(height - 1 - y) * width * 4;
++      for (uint32_t x = 0; x < width; ++x, src += 4) { row[x * 3] = src[0]; row[x * 3 + 1] = src[1]; row[x * 3 + 2] = src[2]; }
++      std::fwrite(row.data(), 1, row.size(), f);
++    }
++    std::fclose(f);
++    Log.info("Screenshot saved: {}", file.string());
++  }).detach();
++}
++
+ // Fixed-function state of every scanout draw: opaque overwrite of one RGBA8 target.
+ gl::BakedState opaque_state() {
+   gl::BakedState state{};
+@@ -575,6 +632,7 @@
+     if (window::is_presentable() && (!deviceMode || slot)) {
+       const gl::GLuint targetFbo = deviceMode ? slot->fbo : 0;
+       draw_window_signal(programs, targetFbo, surfaceWidth, surfaceHeight, viewport, desktop, effective.black);
++      if (shot_requested()) shot_capture(targetFbo, surfaceWidth, surfaceHeight);
+       // An unpresented frame keeps the request for the next successful Present.
+       if (!screenshot.empty()) take_screenshot(programs, viewport, desktop, effective.black, screenshot);
+       if (deviceMode) {

@@ -16,7 +16,7 @@ The base is yannicksuter/mscharged-port `64dcb73b` (1.0.8) with the pins unchang
 |---|---|---|
 | `patches/aurora-gles` | Aurora, after the port's own `patches/aurora` 0001 to 0089 | The GLES backend, merged onto the port's Aurora pin and its own Aurora patches |
 | `patches/aurora-glesfix` | Aurora | Rendering fixes found by the Vulkan against GLES comparison |
-| `patches/aurora-pm` | Aurora | Device build fixes, lock free address lookup, faster THP movie decoder |
+| `patches/aurora-pm` | Aurora | Device build fixes, lock free address lookup, faster THP movie decoder, device screenshot (`kill -USR1` the game or create `screenshot.request` in the game folder: PPM in `screenshots/`) |
 | `patches/aurora-gpu` | Aurora | GPU memory and speed on the device (texture compaction, census, bounded pipeline waits, texture cache frame counter), 0001 to 0006 |
 | `patches/aurora-handheld` | Aurora | `AURORA_LEAN`: no ImGui overlay and no PNG screenshots (handheld build only) |
 | `patches/aurora-gpu-wip` | none | Pending GPU work, not built |
