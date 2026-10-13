@@ -14,10 +14,10 @@ index 50d2c14b0f2e527efd845bbd6041a55c71a8acae..eb189106be3ab3e664f8efb03a4e2275
  _aurora_dependency_version(AURORA_SDL3_REF "refs/tags/release-3.4.10" "SDL3 commit ref (https://github.com/libsdl-org/SDL)")
  _aurora_dependency_version(AURORA_NOD_VERSION "v2.0.0-alpha.12" "nod version tag (https://github.com/encounter/nod/releases)"
 diff --git a/cmake/aurora_core.cmake b/cmake/aurora_core.cmake
-index 4534e60fa6e6a3775b4564a65643c838c140f7b3..1ca7b4c7f6cb8938e35ce2b8dc934da5a3d5250c 100644
+index 4534e60fa6e6a3775b4564a65643c838c140f7b3..0ea8dd1d4a68091a06179858659f6c8c1afb4585 100644
 --- a/cmake/aurora_core.cmake
 +++ b/cmake/aurora_core.cmake
-@@ -87,43 +87,26 @@ if (AURORA_ENABLE_RMLUI)
+@@ -87,43 +87,27 @@ if (AURORA_ENABLE_RMLUI)
  endif ()
  
  if (AURORA_ENABLE_GX)
@@ -47,6 +47,7 @@ index 4534e60fa6e6a3775b4564a65643c838c140f7b3..1ca7b4c7f6cb8938e35ce2b8dc934da5
 +            lib/gl/fbo_cache.cpp
 +            lib/gl/state.cpp
 +            lib/gl/public_api.cpp
++            lib/gl/trace.cpp
      )
 -    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
 -        set_source_files_properties(lib/dawn/TracyPlatform.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)

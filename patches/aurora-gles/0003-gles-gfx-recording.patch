@@ -1086,10 +1086,10 @@ index 47e9a0aadfe1b88ae7e177f226e5b05f36b681e3..7489ea385a2bbb32240068cdca20960f
  
  namespace testing {
 diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
-index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e38943ac29 100644
+index a91a5e08df5a973bb67957002954fe68511fe3f5..fe584ed095efa5fc156ec036ea96a6dbd40d5fa1 100644
 --- a/lib/gfx/encoding.cpp
 +++ b/lib/gfx/encoding.cpp
-@@ -2,12 +2,18 @@
+@@ -2,12 +2,19 @@
  #include "xfb.hpp"
  
  #include "frame.hpp"
@@ -1104,11 +1104,12 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
 +#include "../gl/fbo_cache.hpp"
 +#include "../gl/gl_core.hpp"
 +#include "../gl/state.hpp"
++#include "../gl/trace.hpp"
 +#include "../gl/textures.hpp"
  #include "../gx/gx.hpp"
  #include "../gx/pipeline.hpp"
  #ifdef AURORA_ENABLE_RMLUI
-@@ -26,44 +32,32 @@
+@@ -26,44 +33,32 @@
  
  #include <tracy/Tracy.hpp>
  
@@ -1167,7 +1168,7 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
    const auto drawType = find_runtime_draw_type(draw.type);
    if (!drawType) {
      // Unregistered between record and replay; the command is a no-op.
-@@ -74,41 +68,27 @@ void render_custom_draw(const CustomDrawCommand& draw, const wgpu::RenderPassEnc
+@@ -74,41 +69,27 @@ void render_custom_draw(const CustomDrawCommand& draw, const wgpu::RenderPassEnc
    drawType->draw(context, pass, draw.payload.data(), draw.payloadSize, drawType->userdata);
  }
  
@@ -1219,7 +1220,7 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
  #ifdef AURORA_GFX_DEBUG_GROUPS
    std::vector<std::string> lastDebugGroupStack;
  #endif
-@@ -117,8 +97,8 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
+@@ -117,8 +98,8 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
    bool hasViewport = false;
    bool hasScissor = false;
  
@@ -1230,7 +1231,7 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
    pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
  
    for (auto& cmd : passInfo.commands) {
-@@ -149,7 +129,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
+@@ -149,7 +130,7 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
      } break;
      case CommandType::SetScissor: {
        const auto& sc = cmd.data.setScissor;
@@ -1239,7 +1240,7 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
        currentScissor = sc;
        hasScissor = true;
      } break;
-@@ -161,19 +141,18 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
+@@ -161,19 +142,18 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
      } break;
      case CommandType::CustomDraw: {
        render_custom_draw(cmd.data.customDraw, pass, passInfo);
@@ -1262,7 +1263,7 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
  #endif
      } break;
      }
-@@ -186,84 +165,137 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
+@@ -186,84 +166,144 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
  #endif
  }
  
@@ -1418,12 +1419,12 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
 +    gl::gl.ClearBufferiv(gl::GL_STENCIL, 0, &stencilValue);
 +  }
 +  gl::gl.Enable(gl::GL_SCISSOR_TEST);
-+
+ 
+-  auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
 +  // The raw clears desynced color/depth mask + scissor from the state-cache shadow; reset it so the
 +  // first replayed draw re-issues its full baked pipeline state.
 +  gl::reset_state_cache();
- 
--  auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
++
 +  gl::PassEncoder pass{gl::PassTarget{
 +      .fbo = fbo,
 +      .width = passInfo.targetSize.width,
@@ -1431,6 +1432,13 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
 +  }};
    render_pass(pass, frame, passInfo);
    pass.End();
++  gl::trace::bump(gl::trace::Passes);
++  if (passInfo.hasDraws) {
++    gl::trace::bump(gl::trace::PassesWithDraws);
++  }
++  if (gl::trace::report_due()) {
++    gl::trace::report();
++  }
  
    if (passInfo.captureDepthSnapshot) {
 -    depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView,
@@ -1453,7 +1461,7 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
      const tex_copy_conv::ConvRequest convReq{
          .fmt = passInfo.resolveFormat,
          .srcFmt = passInfo.resolveSourceFormat,
-@@ -272,177 +304,153 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+@@ -272,177 +312,156 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
          .dst = passInfo.resolveTarget,
          .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
      };
@@ -1464,12 +1472,14 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
 -      xfb::encode(cmd, passInfo.copySourceView, passInfo.resolveUniformRange, passInfo.resolveTarget);
 +      // Display copy (XFB): the uniform words were captured into the frame's CPU uniform buffer.
 +      const auto& range = passInfo.resolveUniformRange;
++      gl::trace::bump(gl::trace::XfbEncodes);
 +      xfb::encode(passInfo.copySourceView, frame.uniforms.data() + range.offset, range.size,
 +                  passInfo.resolveTarget);
      } else if (needsConversion) {
 -      tex_copy_conv::run(cmd, convReq);
 -    } else if (needsScaling || needsOpaqueAlpha || !sameFormat) {
 -      tex_copy_conv::blit(cmd, convReq);
++      gl::trace::bump(gl::trace::EfbResolves);
 +      tex_copy_conv::run(convReq);
      } else {
 -      const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
@@ -1493,6 +1503,7 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
 +      // No format conversion: the passthrough blit handles both the scaled and the exact 1:1 case
 +      // (Dawn special-cased 1:1 with CopyTextureToTexture; the shader blit is equivalent and keeps
 +      // the crop/orientation/opaque-alpha handling in one place). Depth copies are gated off inside.
++      gl::trace::bump(gl::trace::EfbResolves);
 +      tex_copy_conv::blit(convReq);
      }
    }
@@ -1511,14 +1522,14 @@ index a91a5e08df5a973bb67957002954fe68511fe3f5..02c509860092886c5a982e06ba7751e3
 -        .depthOrArrayLayers = 1,
 -    };
 -    cmd.CopyTextureToTexture(&src, &dst, &size);
+-  }
+-  if (passInfo.snapshotDepthDst) {
+-    tex_copy_conv::snapshot_depth(cmd, passInfo.copySourceDepthView, passInfo.msaaSamples, passInfo.snapshotDepthDst);
 +  // Full-target color snapshot for the public resolve_pass API (depth snapshots stay gated off).
 +  if (passInfo.snapshotColorDst.id != 0) {
 +    blit_texture_region(passInfo.copySourceTexture, gl::Origin3D{}, passInfo.snapshotColorDst, gl::Origin3D{},
 +                        passInfo.targetSize, /*flipY=*/false);
    }
--  if (passInfo.snapshotDepthDst) {
--    tex_copy_conv::snapshot_depth(cmd, passInfo.copySourceDepthView, passInfo.msaaSamples, passInfo.snapshotDepthDst);
--  }
 -  if (passInfo.snapshotNormalDst) {
 -    const webgpu::gpu_prof::Zone zone{cmd, "Normal snapshot"};
 -    const wgpu::TexelCopyTextureInfo src{
@@ -1765,10 +1776,12 @@ index 1920bc85488edf18006a0e0476a0da7c6aa7f9f1..3e87f2cb5980c9d6d2844a64f76cc90f
  
  } // namespace aurora::gfx
 diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
-index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a14b6814d 100644
+index b307c9716a7137f241200a2ceeaef8998aea82fa..c7631c69280bb4436192554e57fe6d4a54416716 100644
 --- a/lib/gfx/frame.cpp
 +++ b/lib/gfx/frame.cpp
-@@ -2,6 +2,8 @@
+@@ -1,7 +1,10 @@
+ #include "frame.hpp"
++#include "../gl/trace.hpp"
  #include "xfb.hpp"
  
  #include "depth_peek.hpp"
@@ -1777,7 +1790,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
  #include "pipeline_cache.hpp"
  #include "recording.hpp"
  #include "render_worker.hpp"
-@@ -9,21 +11,27 @@
+@@ -9,21 +12,27 @@
  #include "tex_copy_conv.hpp"
  #include "tex_palette_conv.hpp"
  #include "texture_replacement.hpp"
@@ -1807,7 +1820,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
  #include <optional>
  #include <string>
  #include <thread>
-@@ -31,33 +39,88 @@
+@@ -31,33 +40,88 @@
  #include <vector>
  
  #include <tracy/Tracy.hpp>
@@ -1911,7 +1924,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
  
  struct RuntimeDrawType {
    std::string label;
-@@ -70,7 +133,6 @@ struct RuntimeEncoderTaskType {
+@@ -70,7 +134,6 @@ struct RuntimeEncoderTaskType {
    std::string label;
    EncoderTaskCallback callback = nullptr;
    void* userdata = nullptr;
@@ -1919,7 +1932,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
    uint32_t generation = 1;
  };
  
-@@ -116,23 +178,23 @@ using PresentClock = std::chrono::steady_clock;
+@@ -116,23 +179,23 @@ using PresentClock = std::chrono::steady_clock;
  constexpr auto PresentFpsWindow = std::chrono::seconds{1};
  std::mutex g_presentStatsMutex;
  std::deque<PresentClock::time_point> g_presentTimes;
@@ -1949,7 +1962,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
  void update_ema(std::atomic_int64_t& value, int64_t sample) {
    if (sample <= 0 || sample > duration_ns(MaxPacingSample)) {
      return;
-@@ -153,102 +215,49 @@ void prune_present_times(PresentClock::time_point now) {
+@@ -153,102 +216,49 @@ void prune_present_times(PresentClock::time_point now) {
    }
  }
  
@@ -1976,6 +1989,13 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
 -    process_events();
 -    g_processEventsQueued.store(false, std::memory_order_release);
 -  });
+-}
+-
+-void wait_for_gpu_progress(std::chrono::nanoseconds sleepDuration) {
+-  if (render_worker::is_idle()) {
+-    enqueue_process_events();
+-  }
+-  std::this_thread::sleep_for(sleepDuration);
 +void reset_present_stats() {
 +  g_lastPresentNs.store(0, std::memory_order_release);
 +  g_presentPeriodNs.store(0, std::memory_order_release);
@@ -1985,36 +2005,29 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
 +  g_presentTimes.clear();
  }
  
--void wait_for_gpu_progress(std::chrono::nanoseconds sleepDuration) {
--  if (render_worker::is_idle()) {
--    enqueue_process_events();
--  }
--  std::this_thread::sleep_for(sleepDuration);
--}
-+// No Dawn instance to pump on GL: async GPU work is driven by the render worker and GL fences.
-+void process_events() {}
- 
 -void pace_frame_start() {
 -  ZoneScopedN("Frame start pacing");
 -  if (g_frameSlots.free_count() == FrameSlotCount) {
 -    return;
 -  }
-+void wait_for_gpu_progress(std::chrono::nanoseconds sleepDuration) { std::this_thread::sleep_for(sleepDuration); }
- 
+-
 -  const int64_t lastPresentNs = g_lastPresentNs.load(std::memory_order_acquire);
 -  const int64_t presentPeriodNs = g_presentPeriodNs.load(std::memory_order_acquire);
 -  const int64_t cpuFrameTimeNs = g_cpuFrameTimeNs.load(std::memory_order_acquire);
 -  if (lastPresentNs == 0 || presentPeriodNs == 0 || cpuFrameTimeNs == 0) {
 -    return;
 -  }
--
++// No Dawn instance to pump on GL: async GPU work is driven by the render worker and GL fences.
++void process_events() {}
+ 
 -  const int64_t safetyMarginNs = duration_ns(FrameStartSafetyMargin);
 -  const int64_t targetStartNs = lastPresentNs + presentPeriodNs - cpuFrameTimeNs - safetyMarginNs;
 -  int64_t nowNs = timestamp_ns(PresentClock::now());
 -  if (targetStartNs <= nowNs) {
 -    return;
 -  }
--
++void wait_for_gpu_progress(std::chrono::nanoseconds sleepDuration) { std::this_thread::sleep_for(sleepDuration); }
+ 
 -  const double initialWaitMs = static_cast<double>(targetStartNs - nowNs) / 1'000'000.0;
 -  TracyPlot("aurora: frameStartPaceWaitMs", initialWaitMs);
 -  while (nowNs < targetStartNs) {
@@ -2082,7 +2095,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
  
  std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id) {
    std::lock_guard lock{g_runtimeTypeMutex};
-@@ -268,45 +277,18 @@ std::optional<RegisteredEncoderTaskType> find_runtime_encoder_task_type(EncoderT
+@@ -268,45 +278,18 @@ std::optional<RegisteredEncoderTaskType> find_runtime_encoder_task_type(EncoderT
    return RegisteredEncoderTaskType{
        .callback = slot->callback,
        .userdata = slot->userdata,
@@ -2133,7 +2146,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
  
  bool uses_reversed_z() noexcept { return gx::UseReversedZ; }
  
-@@ -365,7 +347,6 @@ EncoderTaskId register_encoder_task_type(const EncoderTaskDescriptor& desc) {
+@@ -365,7 +348,6 @@ EncoderTaskId register_encoder_task_type(const EncoderTaskDescriptor& desc) {
    slot.label = desc.label != nullptr ? desc.label : "";
    slot.callback = desc.callback;
    slot.userdata = desc.userdata;
@@ -2141,7 +2154,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
    return make_draw_type_id(idx, slot.generation);
  }
  
-@@ -379,150 +360,84 @@ void unregister_encoder_task_type(EncoderTaskId type) noexcept {
+@@ -379,150 +361,84 @@ void unregister_encoder_task_type(EncoderTaskId type) noexcept {
    slot.label.clear();
    slot.callback = nullptr;
    slot.userdata = nullptr;
@@ -2358,7 +2371,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
    gx::initialize();
  #ifdef AURORA_ENABLE_RMLUI
    rmlui::initialize_pipeline();
-@@ -531,18 +446,14 @@ void initialize() {
+@@ -531,18 +447,14 @@ void initialize() {
  }
  
  void shutdown() {
@@ -2382,7 +2395,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
    depth_peek::shutdown();
    tex_copy_conv::shutdown();
    xfb::shutdown();
-@@ -561,109 +472,65 @@ void shutdown() {
+@@ -561,109 +473,65 @@ void shutdown() {
      g_runtimeEncoderTaskTypes.clear();
      g_freeEncoderTaskTypeSlots.clear();
    }
@@ -2534,7 +2547,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
    });
    g_cpuFrameStart = PresentClock::now();
    return true;
-@@ -672,14 +539,44 @@ static bool begin_frame_impl(bool preserveEfb) {
+@@ -672,14 +540,44 @@ static bool begin_frame_impl(bool preserveEfb) {
  bool begin_frame() { return begin_frame_impl(false); }
  bool begin_hardware_frame() { return begin_frame_impl(true); }
  
@@ -2580,7 +2593,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
    const auto recorded = end_recording();
    auto& frame = *recorded.packet;
    const size_t frameSlot = recorded.frameSlot;
-@@ -687,156 +584,119 @@ void end_frame(EndFrameCallback callback) {
+@@ -687,156 +585,123 @@ void end_frame(EndFrameCallback callback) {
    end_pipeline_frame();
    ++g_frameIndex;
  
@@ -2685,6 +2698,10 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
  void submit_hardware_frame_and_wait() {
 -  // Actual original finish opcode retires bounded native storage. The next
 -  // hardware packet Loads EFB; this boundary adds no game frame or VI present.
++  gl::trace::bump(gl::trace::HardwareSubmits);
++  if (gl::trace::report_due()) {
++    gl::trace::report();
++  }
 +  // The original finish opcode retires bounded native storage. The next hardware packet Loads the
 +  // EFB; this boundary adds no game frame or VI present. Returns only once the render worker has
 +  // executed every recorded op and glFinish has confirmed the GPU is done with them.
@@ -2825,7 +2842,7 @@ index b307c9716a7137f241200a2ceeaef8998aea82fa..bc88dde2e82b26f67ca7fd0bf8dd321a
      process_events();
    });
    render_worker::synchronize();
-@@ -874,5 +734,5 @@ float calculate_fps() noexcept {
+@@ -874,5 +739,5 @@ float calculate_fps() noexcept {
  }
  } // namespace aurora::gfx
  

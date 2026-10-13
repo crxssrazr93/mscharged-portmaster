@@ -1526,6 +1526,32 @@ index c4859264530e9c3baa42f48205ad15d8e0bffec0..a0d0aa9b32e98ae36ea3c4b11b502f42
 -} // namespace aurora::gx::fifo
 +} // namespace aurora::gx::fifo
 \ No newline at end of file
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index 19371c57f53d052ba2086fa59a95c373afc3167d..30bdcf6bb8d73b973d4b76ce6d332d3ef082de50 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -5,6 +5,8 @@
+ #include "command_processor.hpp"
+ #include "poke.hpp"
+ #include "../gfx/frame.hpp"
++#include "../gl/trace.hpp"
++#include <cstdio>
+ #include <dolphin/os.h>
+ #include <dolphin/os/OSContext.h>
+ 
+@@ -360,6 +362,12 @@ void deliver_prior_draw_done() {
+       progress.unlock();
+       aurora_service_hardware_interrupts();
+       progress.lock();
++      if (gl::trace::report_due()) {
++        std::fprintf(stderr, "[fifo-trace] waiting for draw done: tokens=%llu latches=%llu published=%llu processed=%llu parsed=%llu\n",
++                     (unsigned long long)target, (unsigned long long)sDrawDoneLatches.load(),
++                     (unsigned long long)sPublished.load(), (unsigned long long)sProcessed.load(),
++                     (unsigned long long)sParsed.load());
++      }
+     }
+   }
+   service_draw_done();
 diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
 index 63af3543126f6b5dc5d37164d8cb8a9cd3f36199..d17407719c4811e198f71036254f64e38e5d16ae 100644
 --- a/lib/gx/gx.cpp
@@ -2120,10 +2146,10 @@ index 01c8896bc32a296b190c7efeef8c986adb1e9334..17eaf456a8915278669b9792a408ee0f
  
  u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 diff --git a/lib/gx/pipeline.cpp b/lib/gx/pipeline.cpp
-index 02dd95f113f452f8e6f5443816e79d9ec11e92f8..e5c68cbd85b00be9dce4810416f444f533b378e4 100644
+index 02dd95f113f452f8e6f5443816e79d9ec11e92f8..16a50508143a5f39b1b6ff6237402ad5a56dc700 100644
 --- a/lib/gx/pipeline.cpp
 +++ b/lib/gx/pipeline.cpp
-@@ -1,7 +1,6 @@
+@@ -1,9 +1,9 @@
  #include "pipeline.hpp"
  
 -#include "../gfx/encoding.hpp"
@@ -2131,8 +2157,11 @@ index 02dd95f113f452f8e6f5443816e79d9ec11e92f8..e5c68cbd85b00be9dce4810416f444f5
 +#include "../gfx/common.hpp"
  #include "../gfx/pipeline_cache.hpp"
  #include "../gfx/resource_cache.hpp"
++#include "../gl/trace.hpp"
  
-@@ -13,13 +12,13 @@
+ #include "gx_fmt.hpp"
+ #include "shader_info.hpp"
+@@ -13,13 +13,13 @@
  namespace aurora::gx {
  std::atomic<uint64_t> lastEncodedDrawReceipt{0};
  
@@ -2150,7 +2179,7 @@ index 02dd95f113f452f8e6f5443816e79d9ec11e92f8..e5c68cbd85b00be9dce4810416f444f5
    };
  
    PipelineOptions options{
-@@ -36,10 +35,8 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
+@@ -36,10 +36,8 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
                                    (usesSourceAlpha(config.blendFacSrc) || usesSourceAlpha(config.blendFacDst));
      if (!needsSourceAlpha) {
        options.dstAlphaMode = DstAlphaMode::Replace;
@@ -2162,7 +2191,7 @@ index 02dd95f113f452f8e6f5443816e79d9ec11e92f8..e5c68cbd85b00be9dce4810416f444f5
        auto alpha = options;
        alpha.dstAlphaMode = DstAlphaMode::Replace;
        alpha.colorUpdate = false;
-@@ -58,21 +55,34 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
+@@ -58,21 +56,36 @@ gfx::CompiledPipeline create_pipeline(const PipelineConfig& config, const gfx::R
    return pipeline;
  }
  
@@ -2170,10 +2199,12 @@ index 02dd95f113f452f8e6f5443816e79d9ec11e92f8..e5c68cbd85b00be9dce4810416f444f5
 +void render(const DrawData& data, gl::PassEncoder& pass) {
    gfx::CompiledPipeline pipeline;
    if (!gfx::get_pipeline(data.pipeline, pipeline)) {
++    gl::trace::bump(gl::trace::DrawsSkippedNoPipeline);
      return;
    }
 -  const auto& resources = gfx::detail::resources();
 -  pass.SetImmediates(0, &data.immediateData, sizeof(data.immediateData));
++  gl::trace::bump(gl::trace::DrawsExecuted);
 +  // Group 1: the GX uniform block, bound with a per-draw dynamic offset.
 +  gl::BindingSet uniformSet{};
 +  uniformSet.buffers[0] = gl::BindingSet::BufferBinding{
@@ -2248,10 +2279,10 @@ index 9df1317afb5419c0bf51442191ea9ecf96164012..5c4e7ba4b5d6f6472b083b8b9323487b
  void queue_surface(const u8* dlStart, uint32_t dlSize, bool bigEndian) noexcept;
  } // namespace aurora::gx
 diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
-index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2907d24d0 100644
+index 7c39f26026afef1eaf8f346877618e0136235812..e768814b077ef6835517de4f84664a476948276b 100644
 --- a/lib/gx/shader.cpp
 +++ b/lib/gx/shader.cpp
-@@ -1,6 +1,7 @@
+@@ -1,15 +1,19 @@
  #include "../gfx/hash.hpp"
  #include "../gfx/types.hpp"
  
@@ -2259,7 +2290,9 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
  #include "../internal.hpp"
  #include "../webgpu/gpu.hpp"
  #include "gx.hpp"
-@@ -9,7 +10,9 @@
+ #include "gx_fmt.hpp"
+ #include "shader_info.hpp"
++#include "../gl/trace.hpp"
  
  #include <dolphin/gx/GXEnum.h>
  
@@ -2269,7 +2302,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
  #include <mutex>
  #include <string_view>
  #include <utility>
-@@ -21,10 +24,21 @@ using namespace fmt::literals;
+@@ -21,10 +25,21 @@ using namespace fmt::literals;
  using namespace std::string_literals;
  using namespace std::string_view_literals;
  
@@ -2294,7 +2327,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (chan) {
    case GX_CH_RED:
      return "r";
-@@ -39,14 +53,14 @@ std::string_view chan_comp(GXTevColorChan chan) noexcept {
+@@ -39,14 +54,14 @@ std::string_view chan_comp(GXTevColorChan chan) noexcept {
    }
  }
  
@@ -2312,7 +2345,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    if (stage.indTexStage >= config.numIndStages || stage.indTexAlphaSel == GX_ITBA_OFF) {
      return "0.0";
    }
-@@ -80,7 +94,7 @@ std::string alpha_bump_sel(size_t stageIdx, const ShaderConfig& config, const Te
+@@ -80,7 +95,7 @@ std::string alpha_bump_sel(size_t stageIdx, const ShaderConfig& config, const Te
    }
  }
  
@@ -2321,7 +2354,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    if (stage.texMapId == GX_TEXMAP_NULL) {
      return false;
    }
-@@ -91,7 +105,8 @@ bool uses_texture_sample(const TevStage& stage) noexcept {
+@@ -91,7 +106,8 @@ bool uses_texture_sample(const TevStage& stage) noexcept {
           a.c == GX_CA_TEXA || a.d == GX_CA_TEXA;
  }
  
@@ -2331,7 +2364,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (arg) {
      DEFAULT_FATAL("invalid color arg {}", underlying(arg));
    case GX_CC_CPREV:
-@@ -230,7 +245,8 @@ std::string color_arg_reg(GXTevColorArg arg, size_t stageIdx, const ShaderConfig
+@@ -230,7 +246,8 @@ std::string color_arg_reg(GXTevColorArg arg, size_t stageIdx, const ShaderConfig
    }
  }
  
@@ -2341,7 +2374,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (arg) {
      DEFAULT_FATAL("invalid alpha arg {}", underlying(arg));
    case GX_CA_APREV:
-@@ -324,8 +340,8 @@ std::string alpha_arg_reg(GXTevAlphaArg arg, size_t stageIdx, const ShaderConfig
+@@ -324,8 +341,8 @@ std::string alpha_arg_reg(GXTevAlphaArg arg, size_t stageIdx, const ShaderConfig
    }
  }
  
@@ -2352,7 +2385,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (arg) {
    case GX_CC_CPREV:
      return colorNormalized[GX_TEVPREV];
-@@ -348,7 +364,7 @@ bool tev_color_arg_is_normalized(GXTevColorArg arg, const std::array<bool, MaxTe
+@@ -348,7 +365,7 @@ bool tev_color_arg_is_normalized(GXTevColorArg arg, const std::array<bool, MaxTe
    }
  }
  
@@ -2361,7 +2394,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (arg) {
    case GX_CA_APREV:
      return alphaNormalized[GX_TEVPREV];
-@@ -363,8 +379,11 @@ bool tev_alpha_arg_is_normalized(GXTevAlphaArg arg, const std::array<bool, MaxTe
+@@ -363,8 +380,11 @@ bool tev_alpha_arg_is_normalized(GXTevAlphaArg arg, const std::array<bool, MaxTe
    }
  }
  
@@ -2375,7 +2408,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (op) {
      DEFAULT_FATAL("unimplemented tev op {}", underlying(op));
    case GX_TEV_ADD:
-@@ -373,50 +392,50 @@ std::string tev_op(GXTevOp op, std::string_view bias, std::string_view scale, st
+@@ -373,50 +393,50 @@ std::string tev_op(GXTevOp op, std::string_view bias, std::string_view scale, st
      return fmt::format("(({0}mix({1}, {2}, {3}) + {4}){5}){6}", neg, a, b, c, d, bias, scale);
    }
    case GX_TEV_COMP_R8_GT:
@@ -2441,7 +2474,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (bias) {
      DEFAULT_FATAL("invalid tev bias {}", underlying(bias));
    case GX_TB_ZERO:
-@@ -433,16 +452,16 @@ struct AlphaCompareExpr {
+@@ -433,16 +453,16 @@ struct AlphaCompareExpr {
    int constant = -1;
  };
  
@@ -2461,7 +2494,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    if (lhs.constant == 0 || rhs.constant == 0) {
      return alpha_compare_const(false);
    }
-@@ -455,7 +474,7 @@ AlphaCompareExpr alpha_compare_and(const AlphaCompareExpr& lhs, const AlphaCompa
+@@ -455,7 +475,7 @@ AlphaCompareExpr alpha_compare_and(const AlphaCompareExpr& lhs, const AlphaCompa
    return {fmt::format("({} && {})", lhs.expr, rhs.expr), -1};
  }
  
@@ -2470,7 +2503,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    if (lhs.constant == 1 || rhs.constant == 1) {
      return alpha_compare_const(true);
    }
-@@ -468,7 +487,7 @@ AlphaCompareExpr alpha_compare_or(const AlphaCompareExpr& lhs, const AlphaCompar
+@@ -468,7 +488,7 @@ AlphaCompareExpr alpha_compare_or(const AlphaCompareExpr& lhs, const AlphaCompar
    return {fmt::format("({} || {})", lhs.expr, rhs.expr), -1};
  }
  
@@ -2479,7 +2512,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    if (lhs.constant != -1 && rhs.constant != -1) {
      return alpha_compare_const(lhs.constant != rhs.constant);
    }
-@@ -487,7 +506,7 @@ AlphaCompareExpr alpha_compare_xor(const AlphaCompareExpr& lhs, const AlphaCompa
+@@ -487,7 +507,7 @@ AlphaCompareExpr alpha_compare_xor(const AlphaCompareExpr& lhs, const AlphaCompa
    return {fmt::format("({} != {})", lhs.expr, rhs.expr), -1};
  }
  
@@ -2488,7 +2521,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    if (lhs.constant != -1 && rhs.constant != -1) {
      return alpha_compare_const(lhs.constant == rhs.constant);
    }
-@@ -506,7 +525,7 @@ AlphaCompareExpr alpha_compare_xnor(const AlphaCompareExpr& lhs, const AlphaComp
+@@ -506,7 +526,7 @@ AlphaCompareExpr alpha_compare_xnor(const AlphaCompareExpr& lhs, const AlphaComp
    return {fmt::format("({} == {})", lhs.expr, rhs.expr), -1};
  }
  
@@ -2497,7 +2530,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    const auto iref = static_cast<u32>(ref);
    switch (comp) {
      DEFAULT_FATAL("invalid alpha comp {}", underlying(comp));
-@@ -541,7 +560,7 @@ AlphaCompareExpr alpha_compare(GXCompare comp, u8 ref) {
+@@ -541,7 +561,7 @@ AlphaCompareExpr alpha_compare(GXCompare comp, u8 ref) {
    }
  }
  
@@ -2506,7 +2539,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    switch (scale) {
      DEFAULT_FATAL("invalid tev scale {}", underlying(scale));
    case GX_CS_SCALE_1:
-@@ -555,11 +574,11 @@ std::string_view tev_scale(GXTevScale scale) {
+@@ -555,11 +575,11 @@ std::string_view tev_scale(GXTevScale scale) {
    }
  }
  
@@ -2520,7 +2553,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
      }
      if (attr == GX_VA_NRM) {
        // Default normal
-@@ -594,215 +613,35 @@ std::string vtx_attr(const ShaderConfig& config, GXAttr attr) {
+@@ -594,215 +614,35 @@ std::string vtx_attr(const ShaderConfig& config, GXAttr attr) {
    UNLIKELY FATAL("unhandled vtx attr {}", underlying(attr));
  }
  
@@ -2747,7 +2780,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    } else if (cc.matSrc == GX_SRC_REG) {
      matSrc = fmt::format("ubuf.cc{0}{1}_mat", i, alpha ? "a"sv : ""sv);
    }
-@@ -814,276 +653,182 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8
+@@ -814,276 +654,182 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8
    if (cc.attnFn == GX_AF_NONE) {
      lightAttnFn = "attn = 1.0;"s;
    } else if (cc.attnFn == GX_AF_SPOT) {
@@ -3167,7 +3200,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    std::array<bool, MaxTevRegs> colorNormalized{};
    std::array<bool, MaxTevRegs> alphaNormalized{};
    for (u32 idx = 0; idx < config.tevStageCount; ++idx) {
-@@ -1100,7 +845,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1100,7 +846,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
        std::string op = tev_color_op(stage.colorOp.op, tev_bias(stage.colorOp.bias), tev_scale(stage.colorOp.scale),
                                      stage.colorOp.clamp, color_arg(stage.colorPass.a), color_arg(stage.colorPass.b),
                                      color_arg(stage.colorPass.c), color_arg_reg(stage.colorPass.d, idx, config, stage));
@@ -3176,7 +3209,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
        colorNormalized[stage.colorOp.outReg] = stage.colorOp.clamp;
      }
      {
-@@ -1115,199 +860,156 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1115,199 +861,156 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
        std::string op = tev_alpha_op(stage.alphaOp.op, tev_bias(stage.alphaOp.bias), tev_scale(stage.alphaOp.scale),
                                      stage.alphaOp.clamp, alpha_arg(stage.alphaPass.a), alpha_arg(stage.alphaPass.b),
                                      alpha_arg(stage.alphaPass.c), alpha_arg_reg(stage.alphaPass.d, idx, config, stage));
@@ -3442,7 +3475,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    const auto ind_scale = [](const GXIndTexScale s) -> std::string_view {
      switch (s) {
      case GX_ITS_1:
-@@ -1339,20 +1041,16 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1339,20 +1042,16 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
      const auto& indStage = config.indStages[i];
      const u32 texCoordId = underlying(indStage.texCoordId);
      const u32 texMapId = underlying(indStage.texMapId);
@@ -3467,7 +3500,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    }
    for (int i = 0; i < config.tevStageCount; ++i) {
      const auto& stage = config.tevStages[i];
-@@ -1369,9 +1067,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1369,9 +1068,7 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
      const bool hasBaseCoord = hasBaseTexCoord && hasBaseTexture;
      std::string uvIn;
      if (needsTevTexCoord) {
@@ -3478,7 +3511,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
        std::string indirectOffsetTexel;
        if (needsIndirectCoord && hasIndirectStage) {
          std::string_view fmtShift;
-@@ -1391,12 +1087,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1391,12 +1088,11 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
            FATAL("unhandled indirect format {}", underlying(stage.indTexFormat));
          }
          if (fmtShift.empty()) {
@@ -3494,7 +3527,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
          if (stage.indTexBiasSel != GX_ITB_NONE) {
            auto bias = stage.indTexFormat == GX_ITF_8 ? "-128.0"sv : "1.0"sv;
            auto biasS = "0.0"sv, biasT = "0.0"sv, biasU = "0.0"sv;
-@@ -1412,25 +1107,22 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1412,25 +1108,22 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                stage.indTexBiasSel == GX_ITB_STU) {
              biasU = "1.0"sv;
            }
@@ -3528,7 +3561,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
            u32 mtxIdx = stage.indTexMtxId - GX_ITM_S0;
            u32 regTexCoord = underlying(stage.texCoordId);
            indirectOffsetTexel = fmt::format(
-@@ -1438,7 +1130,6 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1438,7 +1131,6 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                " * ubuf.ind_mtx[{2}][1][2] / 256.0",
                i, regTexCoord, mtxIdx);
          } else if (stage.indTexMtxId >= GX_ITM_T0 && stage.indTexMtxId <= GX_ITM_T2 && hasBaseCoord) {
@@ -3536,7 +3569,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
            u32 mtxIdx = stage.indTexMtxId - GX_ITM_T0;
            u32 regTexCoord = underlying(stage.texCoordId);
            indirectOffsetTexel = fmt::format(
-@@ -1447,25 +1138,22 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1447,25 +1139,22 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
                i, regTexCoord, mtxIdx);
          }
        }
@@ -3568,7 +3601,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
          case GX_ITW_0:
            return "0.0";
          default:
-@@ -1478,17 +1166,15 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1478,17 +1167,15 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
          if (useSimpleCoords) {
            baseCoordExpr = fmt::format("tex{}_uv", texCoordId);
          } else {
@@ -3588,7 +3621,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
        std::string finalCoord;
        if (!wrappedExpr.empty() && !indirectOffsetTexel.empty()) {
          finalCoord = fmt::format("{} + ({})", wrappedExpr, indirectOffsetTexel);
-@@ -1497,20 +1183,18 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1497,20 +1184,18 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
        } else {
          finalCoord = indirectOffsetTexel;
        }
@@ -3613,7 +3646,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
            }
            uvIn = fmt::format("ind{0}_uv", i);
          }
-@@ -1519,93 +1203,99 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1519,93 +1204,99 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
      if (!needsTextureSample) {
        continue;
      }
@@ -3756,7 +3789,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
    }
    if (config.alphaCompare) {
      const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
-@@ -1628,482 +1318,128 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+@@ -1628,482 +1319,129 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
      }
      const auto discard = alpha_compare_not(pass);
      if (discard.constant == 1) {
@@ -4325,6 +4358,7 @@ index 7c39f26026afef1eaf8f346877618e0136235812..4788557dcc4ead16e84832de492891b2
 +  const auto label = fmt::format("GX shader {:x}", hash);
 +  const auto gl_program = gl::compile_program(program.vertex.c_str(), program.fragment.c_str(), label.c_str());
 +  if (gl_program == 0) {
++    gl::trace::bump(gl::trace::ShaderFailures);
 +    return 0;
 +  }
 +  gl::configure_gx_program(gl_program, info.uniformSize);

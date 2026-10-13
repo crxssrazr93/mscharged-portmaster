@@ -907,15 +907,18 @@ index 0000000000000000000000000000000000000000..5256a067121885c04f32601a87b7a0ac
 +} // namespace aurora::gl::census
 diff --git a/lib/gl/context.cpp b/lib/gl/context.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7aff849862a63cc9877d2b144f24f74cf71bfd15
+index 0000000000000000000000000000000000000000..997902bd1ff4e94b0ef2b0836b19fea1ff05735b
 --- /dev/null
 +++ b/lib/gl/context.cpp
-@@ -0,0 +1,237 @@
+@@ -0,0 +1,271 @@
 +#include "context.hpp"
 +
 +#include "../internal.hpp"
 +
 +#include <SDL3/SDL_video.h>
++
++#include <cstdio>
++#include <cstdlib>
 +
 +namespace aurora::gl {
 +namespace {
@@ -945,6 +948,30 @@ index 0000000000000000000000000000000000000000..7aff849862a63cc9877d2b144f24f74c
 +// void*(const char*) loader signature.
 +void* desktop_get_proc(const char* name) { return reinterpret_cast<void*>(SDL_GL_GetProcAddress(name)); }
 +
++// AURORA_GL_DEBUG=1 turns on a KHR_debug context and logs every driver message (development aid).
++bool gl_debug_requested() {
++  static const bool requested = [] {
++    const char* value = std::getenv("AURORA_GL_DEBUG");
++    return value != nullptr && *value != '\0' && *value != '0';
++  }();
++  return requested;
++}
++
++void gl_debug_message(unsigned source, unsigned type, unsigned id, unsigned severity, int length, const char* message,
++                      const void*) {
++  (void)length;
++  std::fprintf(stderr, "[gl-debug] source=%#x type=%#x id=%u severity=%#x: %s\n", source, type, id, severity, message);
++}
++
++void install_debug_callback() {
++  if (!gl_debug_requested() || gl.DebugMessageCallback == nullptr) {
++    return;
++  }
++  gl.DebugMessageCallback(reinterpret_cast<void*>(&gl_debug_message), nullptr);
++  gl.Enable(GL_DEBUG_OUTPUT);
++  gl.Enable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
++}
++
 +bool create_desktop(const ContextConfig& cfg) {
 +  g_window = static_cast<SDL_Window*>(cfg.sdlWindow);
 +  if (g_window == nullptr) {
@@ -959,6 +986,9 @@ index 0000000000000000000000000000000000000000..7aff849862a63cc9877d2b144f24f74c
 +  SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
 +  SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
 +  SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
++  if (gl_debug_requested()) {
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
++  }
 +
 +  g_renderCtx = SDL_GL_CreateContext(g_window);
 +  if (g_renderCtx == nullptr) {
@@ -1081,7 +1111,11 @@ index 0000000000000000000000000000000000000000..7aff849862a63cc9877d2b144f24f74c
 +
 +bool make_render_current() {
 +  if (g_mode == ContextMode::Desktop) {
-+    return SDL_GL_MakeCurrent(g_window, g_renderCtx);
++    const bool ok = SDL_GL_MakeCurrent(g_window, g_renderCtx);
++    if (ok) {
++      install_debug_callback();
++    }
++    return ok;
 +  }
 +  return gl.eglMakeCurrent(g_eglDisplay, g_eglRenderSurface, g_eglRenderSurface, g_eglRenderCtx) == EGL_TRUE;
 +}
@@ -4239,6 +4273,101 @@ index 0000000000000000000000000000000000000000..cf3412b7bd9587e29703c2e7af82bbae
 +void destroy_sampler(Sampler& sampler) noexcept;
 +
 +} // namespace aurora::gl
+diff --git a/lib/gl/trace.cpp b/lib/gl/trace.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e8c2b0e4cccbbac7d6e93c8ae6688f89e370622
+--- /dev/null
++++ b/lib/gl/trace.cpp
+@@ -0,0 +1,36 @@
++#include "trace.hpp"
++
++#include "../internal.hpp"
++
++#include <atomic>
++#include <cstdio>
++#include <chrono>
++
++namespace aurora::gl::trace {
++
++bool report_due() noexcept {
++  if (!enabled()) {
++    return false;
++  }
++  static std::atomic<int64_t> last{0};
++  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
++                          std::chrono::steady_clock::now().time_since_epoch()).count();
++  int64_t previous = last.load();
++  return now - previous >= 1000 && last.compare_exchange_strong(previous, now);
++}
++
++void report() {
++  // stderr, not the buffered log file, so the counters survive a killed process.
++  std::fprintf(stderr,
++               "[gl-trace] draws executed=%llu skipped(no pipeline)=%llu passes=%llu passes with draws=%llu "
++               "xfb encodes=%llu efb resolves=%llu shader failures=%llu hardware submits=%llu\n",
++               static_cast<unsigned long long>(counter(DrawsExecuted).load()),
++               static_cast<unsigned long long>(counter(DrawsSkippedNoPipeline).load()),
++               static_cast<unsigned long long>(counter(Passes).load()),
++               static_cast<unsigned long long>(counter(PassesWithDraws).load()),
++               static_cast<unsigned long long>(counter(XfbEncodes).load()),
++               static_cast<unsigned long long>(counter(EfbResolves).load()),
++               static_cast<unsigned long long>(counter(ShaderFailures).load()),
++               static_cast<unsigned long long>(counter(HardwareSubmits).load()));
++}
++} // namespace aurora::gl::trace
+diff --git a/lib/gl/trace.hpp b/lib/gl/trace.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c83bd5f386f44f366b44099ee4e8248143e9642a
+--- /dev/null
++++ b/lib/gl/trace.hpp
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++
++namespace aurora::gl::trace {
++// AURORA_GL_TRACE=1 collects a few renderer counters and logs them about once a second from the render
++// worker (development aid, off by default).
++enum Counter : uint32_t {
++  DrawsExecuted,
++  DrawsSkippedNoPipeline,
++  Passes,
++  PassesWithDraws,
++  XfbEncodes,
++  EfbResolves,
++  ShaderFailures,
++  HardwareSubmits,
++  CounterCount,
++};
++
++inline bool enabled() noexcept {
++  static const bool value = [] {
++    const char* env = std::getenv("AURORA_GL_TRACE");
++    return env != nullptr && *env != '\0' && *env != '0';
++  }();
++  return value;
++}
++
++inline std::atomic<uint64_t>& counter(Counter c) noexcept {
++  static std::atomic<uint64_t> counters[CounterCount];
++  return counters[c];
++}
++
++// Logs and returns true when at least a second passed since the last report.
++bool report_due() noexcept;
++void report();
++
++inline void bump(Counter c) noexcept {
++  if (enabled()) {
++    counter(c).fetch_add(1, std::memory_order_relaxed);
++    if (report_due()) {
++      report();
++    }
++  }
++}
++} // namespace aurora::gl::trace
 diff --git a/lib/webgpu/gpu.hpp b/lib/webgpu/gpu.hpp
 index 4b3cac2427759b2aa1f1fc88c41ffac2ef995d3d..982a4b544b4196a34161a5c29009daacad03beae 100644
 --- a/lib/webgpu/gpu.hpp
