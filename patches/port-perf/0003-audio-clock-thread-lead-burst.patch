@@ -1,0 +1,545 @@
+diff --git a/cmake/NativeAI.cmake b/cmake/NativeAI.cmake
+index 30319d8d..d8288689 100644
+--- a/cmake/NativeAI.cmake
++++ b/cmake/NativeAI.cmake
+@@ -21,24 +21,24 @@ if(BUILD_TESTING)
+     target_link_libraries(native_ai_observation_tests PRIVATE charged_native_ai SDL3::SDL3)
+     add_test(NAME native_ai_observations COMMAND native_ai_observation_tests)
+     set_tests_properties(native_ai_observations PROPERTIES TIMEOUT 15
+-        ENVIRONMENT "SDL_AUDIO_DRIVER=dummy" LABELS "Platform")
++        ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;MSCHARGED_AUDIO_BUFFER_MS=0;MSCHARGED_AUDIO_THREAD=0" LABELS "Platform")
+     add_executable(native_ai_gain_tests tests/native_ai_gain.cpp)
+     target_link_libraries(native_ai_gain_tests PRIVATE charged_native_ai SDL3::SDL3)
+     add_test(NAME native_ai_gain COMMAND native_ai_gain_tests)
+     set_tests_properties(native_ai_gain PROPERTIES TIMEOUT 15
+-        ENVIRONMENT "SDL_AUDIO_DRIVER=dummy" LABELS "Platform")
++        ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;MSCHARGED_AUDIO_BUFFER_MS=0;MSCHARGED_AUDIO_THREAD=0" LABELS "Platform")
+     add_executable(native_ai_output_tests tests/native_ai_output.cpp)
+     target_link_libraries(native_ai_output_tests PRIVATE charged_native_ai SDL3::SDL3)
+     add_test(NAME native_ai_output COMMAND native_ai_output_tests)
+     set_tests_properties(native_ai_output PROPERTIES TIMEOUT 15
+-        ENVIRONMENT "SDL_AUDIO_DRIVER=dummy" LABELS "Platform")
++        ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;MSCHARGED_AUDIO_BUFFER_MS=0;MSCHARGED_AUDIO_THREAD=0" LABELS "Platform")
+     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+         add_executable(native_ai_timing_tests tests/native_ai_timing.cpp)
+         target_link_libraries(native_ai_timing_tests PRIVATE charged_native_ai SDL3::SDL3)
+         target_link_options(native_ai_timing_tests PRIVATE -Wl,--wrap=SDL_PutAudioStreamDataNoCopy)
+         add_test(NAME native_ai_timing COMMAND native_ai_timing_tests)
+         set_tests_properties(native_ai_timing PROPERTIES TIMEOUT 15
+-            ENVIRONMENT "SDL_AUDIO_DRIVER=dummy" LABELS "Platform")
++            ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;MSCHARGED_AUDIO_BUFFER_MS=0;MSCHARGED_AUDIO_THREAD=0" LABELS "Platform")
+         # Late owner delivery: no replay of unprogrammed registers, bounded
+         # catch-up. SDL opens this 32 kHz stream on a 44.1 kHz dummy device.
+         # Its wait is truncated to whole milliseconds, so 441 frames gives an
+@@ -49,12 +49,12 @@ if(BUILD_TESTING)
+         target_link_options(native_ai_delivery_tests PRIVATE -Wl,--wrap=SDL_PutAudioStreamDataNoCopy)
+         add_test(NAME native_ai_delivery COMMAND native_ai_delivery_tests)
+         set_tests_properties(native_ai_delivery PROPERTIES TIMEOUT 15 LABELS "Platform"
+-            ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;SDL_AUDIO_DEVICE_SAMPLE_FRAMES=441")
++            ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;SDL_AUDIO_DEVICE_SAMPLE_FRAMES=441;MSCHARGED_AUDIO_BUFFER_MS=0;MSCHARGED_AUDIO_THREAD=0")
+         # Prepared SDL keeps a read's channel map valid when the head track ends.
+         add_executable(sdl_audio_queue_channel_map_tests tests/sdl_audio_queue_channel_map.cpp)
+         target_link_libraries(sdl_audio_queue_channel_map_tests PRIVATE SDL3::SDL3)
+         add_test(NAME sdl_audio_queue_channel_map COMMAND sdl_audio_queue_channel_map_tests)
+         set_tests_properties(sdl_audio_queue_channel_map PROPERTIES TIMEOUT 15 LABELS "Platform"
+-            ENVIRONMENT "SDL_AUDIO_DRIVER=dummy")
++            ENVIRONMENT "SDL_AUDIO_DRIVER=dummy;MSCHARGED_AUDIO_BUFFER_MS=0;MSCHARGED_AUDIO_THREAD=0")
+     endif()
+ endif()
+diff --git a/src/platform/ai.cpp b/src/platform/ai.cpp
+index 40739a72..17452645 100644
+--- a/src/platform/ai.cpp
++++ b/src/platform/ai.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -78,6 +80,21 @@ struct AIState {
+     } win;
+     std::uint64_t prev_block_hash{};
+     std::uint64_t stats_window_start_ns{};
++    // Delivery lead (MSCHARGED_AUDIO_BUFFER_MS): the DMA clock runs lead_credit cells ahead of real time, so the SDL
++    // queue holds that much audio beyond the minimum and a late owner is absorbed. Only for the AX callback (the first
++    // registered one); other callbacks (movie audio) keep the hardware clock exactly.
++    bool lead_active{};
++    std::uint64_t lead_credit{};
++    AIDCallback base_callback{};
++    // Serializes Transfer between the owner, the SDL device thread and the audio clock thread (packets must reach the
++    // SDL queue in DMA order). Non owner threads only try the lock.
++    std::mutex transfer_mutex;
++    // Audio clock thread (MSCHARGED_AUDIO_THREAD, default on): advances the DMA clock on its own 2 ms timer.
++    std::thread clock;
++    std::thread::id clock_id{};
++    std::atomic_bool clock_stop{};
++    std::mutex clock_mutex;
++    std::condition_variable clock_cv;
+     char error[256]{};
+ };
+ 
+@@ -98,6 +115,29 @@ int Frequency(u32 rate) { return rate == AI_SAMPLERATE_32KHZ ? 32000 : 48000; }
+ // device pull and one DMA block so a short owner delay is not audible. It also
+ // bounds DMA catch-up after a longer host stall.
+ constexpr std::uint64_t kDeliveryAllowanceNs = 12000000;
++
++struct Config {
++    std::uint64_t lead_ns;   // MSCHARGED_AUDIO_BUFFER_MS, 0 keeps the hardware clock exactly (default 120)
++    bool clock_thread;       // MSCHARGED_AUDIO_THREAD=0 disables the clock thread
++    std::uint64_t burst_ns;  // MSCHARGED_AUDIO_BURST_MS: owner time per service call spent delivering late AI periods
++};
++const Config& Cfg() {
++    static const Config config = [] {
++        auto number = [](const char* name, long fallback, long low, long high) {
++            const char* v = std::getenv(name);
++            long n = (v && *v) ? std::atol(v) : fallback;
++            return std::clamp(n, low, high);
++        };
++        Config c;
++        c.lead_ns = std::uint64_t(number("MSCHARGED_AUDIO_BUFFER_MS", 120, 0, 500)) * 1000000ull;
++        const char* t = std::getenv("MSCHARGED_AUDIO_THREAD");
++        c.clock_thread = !(t && *t == '0');
++        c.burst_ns = std::uint64_t(number("MSCHARGED_AUDIO_BURST_MS", 16, 0, 50)) * 1000000ull;
++        return c;
++    }();
++    return config;
++}
++std::uint64_t LeadCells(int frequency) { return Cfg().lead_ns * std::uint64_t(frequency) / 1000000000ull / 8; }
+ std::uint64_t AllowanceCells(int frequency) {
+     return (kDeliveryAllowanceNs * std::uint64_t(frequency) / 1000000000ull + 7) / 8;
+ }
+@@ -146,7 +186,8 @@ void Latch(AIState& state) {
+ // Nominal DMA clock time of the current transferred-cell position.
+ std::uint64_t ClockTime(const AIState& state) {
+     const auto frequency = std::uint64_t(Frequency(state.rate));
+-    const auto frames = state.epoch_cells * 8;
++    // The lead is time the DMA clock is deliberately ahead of the wall clock; a cause is on time at its shifted time.
++    const auto frames = state.epoch_cells * 8 - std::min(state.epoch_cells, state.lead_credit) * 8;
+     return state.clock_epoch + frames / frequency * 1000000000ull +
+            frames % frequency * 1000000000ull / frequency;
+ }
+@@ -190,6 +231,30 @@ void ClassifyBlock(AIState& state, const u8* bytes, std::size_t size) {
+     }
+ }
+ 
++// Lead on (the AX callback is the registered one) or off (movie audio, no callback): the DMA clock restarts at the
++// current time, with or without the lead, so there is neither a pause nor a burst of the old kind. Mutex held.
++void SetLead(AIState& state, bool on) {
++    on = on && Cfg().lead_ns;
++    if (on == state.lead_active) return;
++    state.lead_active = on;
++    if (state.running) {
++        state.clock_epoch = state.last_service = SDL_GetTicksNS();
++        state.epoch_cells = 0;
++    }
++    state.lead_credit = on ? LeadCells(Frequency(state.rate)) : 0;
++}
++
++// Test aid (MSCHARGED_AUDIO_HASHLOG=<file>): one "<block number> <hash of the 96 frame block>" line per DMA block.
++std::FILE* HashLog() {
++    static std::FILE* log = [] {
++        const char* path = std::getenv("MSCHARGED_AUDIO_HASHLOG");
++        std::FILE* file = path && *path ? std::fopen(path, "w") : nullptr;
++        if (file) std::setvbuf(file, nullptr, _IOLBF, 0);
++        return file;
++    }();
++    return log;
++}
++
+ bool Queue(AIState& state, SDL_AudioStream* stream, Packet* packet) noexcept {
+     if (!SDL_PutAudioStreamDataNoCopy(stream, packet->Data(), packet->size, Completed, packet)) {
+         std::lock_guard lock(state.mutex);
+@@ -207,7 +272,8 @@ void StartOutputIfReady(AIState& state, SDL_AudioStream* stream) noexcept {
+     u32 dma_frames;
+     {
+         std::lock_guard lock(state.mutex);
+-        if (!state.running || state.output_started || state.owner != std::this_thread::get_id()) return;
++        if (!state.running || state.output_started ||
++            (state.owner != std::this_thread::get_id() && state.clock_id != std::this_thread::get_id())) return;
+         dma_frames = state.active_length / 4;
+     }
+     // SDL availability is in its current destination format. In particular,
+@@ -251,7 +317,10 @@ void StartOutputIfReady(AIState& state, SDL_AudioStream* stream) noexcept {
+     state.output.device_start_ns = SDL_GetTicksNS();
+ }
+ 
+-std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nullptr) noexcept {
++std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nullptr, bool block = false) noexcept {
++    std::unique_lock<std::mutex> serial(state.transfer_mutex, std::defer_lock);
++    if (block) serial.lock();
++    else if (!serial.try_lock()) return 0;
+     // This same exclusion protects source DMA writes/stop/free. SDL workers
+     // only try the lock; they never wait for source code while holding SDL's
+     // stream lock. A source critical section defers this native safe point.
+@@ -267,7 +336,7 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+         const auto elapsed = now - state.clock_epoch;
+         const auto frames = (elapsed / 1000000000ull) * Frequency(state.rate) +
+                             (elapsed % 1000000000ull) * Frequency(state.rate) / 1000000000ull;
+-        const auto due = frames / 8;
++        const auto due = frames / 8 + state.lead_credit;
+         // Latching the initial device cause does not read game memory and is
+         // independent of the CPU mask. Source delivery remains masked below.
+         if (state.first_edge && due) { Edge(state); state.first_edge = false; }
+@@ -289,7 +358,7 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+             if (state.held && !(state.pending && deliverable)) {
+                 // Bounded catch-up: the output lead or device silence already
+                 // covered a longer stall; more backlog would only add latency.
+-                const auto limit = AllowanceCells(Frequency(state.rate)) + state.active_length / 32;
++                const auto limit = AllowanceCells(Frequency(state.rate)) + state.active_length / 32 + state.lead_credit;
+                 if (due > state.epoch_cells + limit) {
+                     const auto skip = due - state.epoch_cells - limit;
+                     state.epoch_cells += skip;
+@@ -319,6 +388,8 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+                 catch (...) { std::free(packet); throw; }
+                 state.last_hash = Hash(packet->Data(), state.fifo.size());
+                 ++state.win.blocks;
++                if (HashLog()) std::fprintf(HashLog(), "%llu %016llx\n", (unsigned long long)state.submitted,
++                                            (unsigned long long)state.last_hash);
+                 // A block equal to the one before it (and not silence) is a replayed, stale source buffer.
+                 if (state.last_hash == state.prev_block_hash) {
+                     bool silent = true;
+@@ -362,6 +433,7 @@ void StatsTick(AIState& state, SDL_AudioStream* stream) {
+     std::uint64_t dt;
+     int rate;
+     bool running;
++    std::uint64_t lead_cells;
+     {
+         std::lock_guard lock(state.mutex);
+         if (!state.stats_window_start_ns) { state.stats_window_start_ns = now; return; }
+@@ -372,6 +444,7 @@ void StatsTick(AIState& state, SDL_AudioStream* stream) {
+         state.win = {};
+         rate = Frequency(state.rate);
+         running = state.running;
++        lead_cells = state.lead_credit;
+     }
+     const int queued_now = SDL_GetAudioStreamQueued(stream);
+     const double bytes_per_ms = double(rate) * 4.0 / 1000.0;
+@@ -381,20 +454,60 @@ void StatsTick(AIState& state, SDL_AudioStream* stream) {
+     const auto ax_comp = g_audio_stats.ax_compute_max_ns.exchange(0, std::memory_order_relaxed);
+     const auto ax_dsum = g_audio_stats.ax_commit_delay_sum_ns.exchange(0, std::memory_order_relaxed);
+     const auto ax_dmax = g_audio_stats.ax_commit_delay_max_ns.exchange(0, std::memory_order_relaxed);
++    const auto svc_calls = g_audio_stats.svc_calls.exchange(0, std::memory_order_relaxed);
++    const auto svc_periods = g_audio_stats.svc_periods.exchange(0, std::memory_order_relaxed);
++    const auto svc_bursts = g_audio_stats.svc_bursts.exchange(0, std::memory_order_relaxed);
++    const auto svc_timeouts = g_audio_stats.svc_pace_timeouts.exchange(0, std::memory_order_relaxed);
+     std::fprintf(stderr,
+-        "[audiostats] dt=%.2fs run=%d queue_ms min=%.1f avg=%.1f now=%.1f pulls=%llu underruns=%llu silence_ms=%.1f "
++        "[audiostats] dt=%.2fs run=%d lead_ms=%.0f queue_ms min=%.1f avg=%.1f now=%.1f pulls=%llu underruns=%llu silence_ms=%.1f "
+         "blocks=%llu held=%llu held_ms_max=%.1f late_blocks=%llu cb_lat_ms avg=%.1f max=%.1f skipped_blocks=%.1f "
+-        "replayed=%llu dup=%llu nosrc=%llu ax_jobs=%llu ax_compute_ms_max=%.2f ax_commit_delay_ms avg=%.2f max=%.2f\n",
+-        double(dt) / 1e9, running ? 1 : 0, qmin, qavg, double(queued_now) / bytes_per_ms,
++        "replayed=%llu dup=%llu nosrc=%llu ax_jobs=%llu ax_compute_ms_max=%.2f ax_commit_delay_ms avg=%.2f max=%.2f svc_calls=%llu svc_periods=%llu svc_bursts=%llu pace_timeouts=%llu\n",
++        double(dt) / 1e9, running ? 1 : 0, double(lead_cells) * 8000.0 / rate, qmin, qavg, double(queued_now) / bytes_per_ms,
+         (unsigned long long)w.pulls, (unsigned long long)w.short_pulls, double(w.short_bytes) / bytes_per_ms,
+         (unsigned long long)w.blocks, (unsigned long long)w.held, double(w.held_max_ns) / 1e6,
+         (unsigned long long)w.late_cb, w.dispatched ? double(w.lat_sum_ns) / double(w.dispatched) / 1e6 : 0.0,
+         double(w.lat_max_ns) / 1e6, double(w.skipped_cells) / 12.0, (unsigned long long)w.replayed,
+         (unsigned long long)w.dup, (unsigned long long)w.nosrc, (unsigned long long)ax_jobs, double(ax_comp) / 1e6,
+-        ax_jobs ? double(ax_dsum) / double(ax_jobs) / 1e6 : 0.0, double(ax_dmax) / 1e6);
++        ax_jobs ? double(ax_dsum) / double(ax_jobs) / 1e6 : 0.0, double(ax_dmax) / 1e6,
++        (unsigned long long)svc_calls, (unsigned long long)svc_periods, (unsigned long long)svc_bursts,
++        (unsigned long long)svc_timeouts);
+     std::fflush(stderr);
+ }
+ 
++// The audio clock: the hardware side of the AI DMA on its own thread and timer. It moves the DMA position with the
++// nominal sample clock and the lead, copies each completed 96 frame block into the SDL queue, latches the next
++// registers as soon as the owner has programmed them (AIInitDMA wakes it) and raises the AID cause. The owner takes the
++// cause at its next safe point and runs the original callback there; a slow or blocked game thread therefore only
++// delays the callbacks, never the transfer of what is already programmed or the SDL queue.
++void ClockMain(AIState* sp) {
++    auto& state = *sp;
++    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
++    std::unique_lock lock(state.clock_mutex);
++    while (!state.clock_stop.load()) {
++        state.clock_cv.wait_for(lock, std::chrono::milliseconds(2));
++        if (state.clock_stop.load()) break;
++        lock.unlock();
++        SDL_AudioStream* stream;
++        bool active;
++        {
++            std::lock_guard guard(state.mutex);
++            stream = state.stream;
++            active = state.initialized && state.running;
++        }
++        if (stream && active) Transfer(state, stream);
++        if (stream) StatsTick(state, stream);
++        lock.lock();
++    }
++}
++
++void StopClock(AIState& state) {
++    if (!state.clock.joinable()) return;
++    { std::lock_guard lock(state.clock_mutex); state.clock_stop.store(true); }
++    state.clock_cv.notify_all();
++    state.clock.join();
++    state.clock_id = {};
++}
++
+ void SDLCALL Feed(void* userdata, SDL_AudioStream* stream, int additional, int total) noexcept {
+     auto& state = *static_cast<AIState*>(userdata);
+     if (state.observing.load(std::memory_order_relaxed)) {
+@@ -490,6 +603,8 @@ extern "C" AIDCallback AIRegisterDMACallback(AIDCallback callback) {
+     std::lock_guard lock(state.mutex);
+     const auto previous = state.callback;
+     state.callback = callback;
++    if (!previous) state.base_callback = callback;
++    SetLead(state, callback != nullptr);
+     return previous;
+ }
+ 
+@@ -532,7 +647,17 @@ extern "C" void AIInit(u8*) {
+     state.pending = false;
+     state.rate = AI_SAMPLERATE_32KHZ;
+     state.callback = nullptr; // Original AIInit resets the callback on first init.
++    state.base_callback = nullptr;
++    state.lead_active = false;
++    state.lead_credit = 0;
+     state.error[0] = 0;
++    if (Cfg().clock_thread && !state.clock.joinable()) {
++        static const int registered = std::atexit([] { StopClock(State()); });
++        (void)registered;
++        state.clock_stop.store(false);
++        state.clock = std::thread(ClockMain, &state);
++        state.clock_id = state.clock.get_id();
++    }
+ }
+ 
+ extern "C" BOOL AICheckInit() {
+@@ -589,6 +714,7 @@ extern "C" void AIStartDMA() {
+         state.output.dma_start_ns = state.clock_epoch;
+         state.output_start_cells = state.transferred_cells;
+         state.epoch_cells = 0;
++        state.lead_credit = state.lead_active ? LeadCells(Frequency(state.rate)) : 0;
+         state.first_edge = true;
+         state.error[0] = 0;
+         state.pending = false;
+@@ -639,7 +765,7 @@ extern "C" void AISetDSPSampleRate(u32 rate) {
+         stream = state.stream;
+     }
+     if (stream) {
+-        Transfer(state, stream);
++        Transfer(state, stream, nullptr, true);
+         const SDL_AudioSpec input{SDL_AUDIO_S16, 2, Frequency(selected)};
+         if (!SDL_SetAudioStreamFormat(stream, &input, nullptr)) throw SDLError("AI DSP rate selection failed");
+     }
+@@ -647,6 +773,7 @@ extern "C" void AISetDSPSampleRate(u32 rate) {
+     state.rate = selected;
+     state.clock_epoch = state.last_service = SDL_GetTicksNS();
+     state.epoch_cells = 0;
++    state.lead_credit = 0; // the SDL queue keeps what the lead already put into it
+ }
+ 
+ extern "C" void AIReset() { mscharged::platform::ShutdownNativeAI(); }
+@@ -662,7 +789,7 @@ bool ServiceNativeAI() {
+             throw std::logic_error("AI interrupts must be serviced on the initialization/game thread");
+         stream = state.stream;
+     }
+-    Transfer(state, stream);
++    Transfer(state, stream, nullptr, true);
+     StatsTick(state, stream);
+     {
+         std::lock_guard lock(state.mutex);
+@@ -733,23 +860,29 @@ bool ServiceNativeAI() {
+                 }
+                 throw;
+             }
+-            std::lock_guard lock(call.state.mutex);
+-            call.state.callback_active = false;
+-            if (observation_start) {
+-                auto& observed = call.state.observations;
+-                const auto duration = SDL_GetTicksNS() - observation_start;
+-                ++observed.callbacks_completed;
+-                observed.total_callback_duration_ns += duration;
+-                observed.maximum_callback_duration_ns = std::max(observed.maximum_callback_duration_ns, duration);
++            {
++                std::lock_guard lock(call.state.mutex);
++                call.state.callback_active = false;
++                if (observation_start) {
++                    auto& observed = call.state.observations;
++                    const auto duration = SDL_GetTicksNS() - observation_start;
++                    ++observed.callbacks_completed;
++                    observed.total_callback_duration_ns += duration;
++                    observed.maximum_callback_duration_ns = std::max(observed.maximum_callback_duration_ns, duration);
++                }
++                ++call.state.dispatched;
++                call.invoked = true;
+             }
+-            ++call.state.dispatched;
+-            call.invoked = true;
++            // The callback has programmed the next registers: the clock thread latches them now, not at its next tick.
++            call.state.clock_cv.notify_one();
+         }
+     } call{state, invoked};
+     DispatchNativeInterrupt(Call::Run, &call);
+     return invoked;
+ }
+ 
++std::uint64_t NativeAIBurstNs() { return Cfg().lead_ns ? Cfg().burst_ns : 0; }
++
+ NativeAIStatus GetNativeAIStatus() {
+     NativeInterruptGuard scope;
+     auto& state = State();
+@@ -880,6 +1013,7 @@ void ShutdownNativeAI() {
+     std::exception_ptr stop_error;
+     try { Stop(state); }
+     catch (...) { stop_error = std::current_exception(); }
++    StopClock(state);
+     if (stream) {
+         SDL_SetAudioStreamGetCallback(stream, nullptr, nullptr);
+         // Pinned SDL_DestroyAudioStream does not release its custom channel
+@@ -902,6 +1036,9 @@ void ShutdownNativeAI() {
+         state.length = 0;
+         state.rate = AI_SAMPLERATE_32KHZ;
+         state.fifo.clear();
++        state.lead_active = false;
++        state.lead_credit = 0;
++        state.base_callback = nullptr;
+         state.active_address = 0;
+         state.active_length = state.active_offset = 0;
+         state.first_edge = false;
+diff --git a/src/platform/ai.h b/src/platform/ai.h
+index 22b6a6c7..4128f406 100644
+--- a/src/platform/ai.h
++++ b/src/platform/ai.h
+@@ -34,6 +34,9 @@ struct NativeAIStatus {
+ // delivery before latching the next registers, as prompt Wii interrupts would;
+ // an owner inside a masked section still gets the hardware's register replay.
+ bool ServiceNativeAI();
++// Owner time per hardware service call that may go on delivering further AI periods that are already due (a late
++// owner catching up after a stall). 0: one period per call, the hardware pace.
++std::uint64_t NativeAIBurstNs();
+ NativeAIStatus GetNativeAIStatus();
+ void ShutdownNativeAI();
+ 
+diff --git a/src/platform/audio_stats.h b/src/platform/audio_stats.h
+index c7cd0afa..720c1f5f 100644
+--- a/src/platform/audio_stats.h
++++ b/src/platform/audio_stats.h
+@@ -10,8 +10,14 @@ namespace mscharged::platform {
+ struct AudioStatCounters {
+     // AX frame jobs: count, longest compute on the worker, total owner commit delay (job done until the owner commits).
+     std::atomic<std::uint64_t> ax_jobs{}, ax_compute_max_ns{}, ax_commit_delay_sum_ns{}, ax_commit_delay_max_ns{};
++    // Owner side: hardware service calls, AI periods delivered by them, calls that delivered several in a row and the
++    // times the DSP pacing ran out of its time budget.
++    std::atomic<std::uint64_t> svc_calls{}, svc_periods{}, svc_bursts{}, svc_pace_timeouts{};
+ };
+ inline AudioStatCounters g_audio_stats;
++// True while an AX frame is between the start of its job and the source's CONTINUE (the DSP is "busy"). Written by the
++// AX bootstrap device on every owner service, read by the hardware owner to pace late AI periods.
++inline std::atomic<bool> g_ax_frame_busy{};
+ inline const bool g_audio_stats_on = [] {
+     const char* v = std::getenv("MSCHARGED_AUDIOSTATS");
+     return v && *v && *v != '0';
+diff --git a/src/platform/ax_bootstrap_device.cpp b/src/platform/ax_bootstrap_device.cpp
+index 6fd22a5d..100e4cb5 100644
+--- a/src/platform/ax_bootstrap_device.cpp
++++ b/src/platform/ax_bootstrap_device.cpp
+@@ -1,5 +1,6 @@
+ #include "platform/ax_bootstrap_device.h"
+ #include "platform/ax_perf.h"
++#include "platform/audio_stats.h"
+ #include "platform/ax_command_service.h"
+ #include "platform/dsp_instruction_core.h"
+ #include "platform/dsp_control_abi.h"
+@@ -312,6 +313,14 @@ struct NativeAXBootstrapDevice::State {
+     void Poll() {
+         AXPerfAdd(g_ax_perf.poll_calls);
+         RequireOwner();
++        struct PublishBusy {
++            State& s;
++            ~PublishBusy() {
++                g_ax_frame_busy.store(s.processing||s.frames.phase==NativeAXFramePhase::Processing||
++                    s.frames.phase==NativeAXFramePhase::WaitingSyncAcknowledgment||
++                    s.frames.phase==NativeAXFramePhase::WaitingContinue,std::memory_order_relaxed);
++            }
++        } publish_busy{*this};
+         if(processing) {
+             try {FinishProcessing(false);}
+             catch(...) {processing=false;phase=NativeAXBootstrapPhase::Faulted;frames.phase=NativeAXFramePhase::Faulted;throw;}
+diff --git a/tests/diagnostics/credits_movie_hardware.cpp b/tests/diagnostics/credits_movie_hardware.cpp
+index e3434a98..9092d83b 100644
+--- a/tests/diagnostics/credits_movie_hardware.cpp
++++ b/tests/diagnostics/credits_movie_hardware.cpp
+@@ -1,10 +1,13 @@
+ #include "credits_movie_hardware.h"
+ #include "platform/ai.h"
+ #include "platform/interrupts.h"
++#include "platform/audio_stats.h"
+ 
+ #include <aurora/hardware.h>
+ #include <dolphin/ai.h>
+ 
++#include <chrono>
++#include <cstdlib>
+ #include <mutex>
+ #include <stdexcept>
+ #include <thread>
+@@ -43,12 +46,62 @@ void ServiceCreditsMovieHardware() {
+         Owner& owner;
+         ~Finish() { std::lock_guard lock(owner.mutex); owner.active = false; }
+     } finish{owner};
++    // Test aid (MSCHARGED_AUDIO_STALL=<period ms>,<stall ms>): the owner stays away from the hardware for a while every
++    // period, like a game thread busy with a long frame. Off unless set.
++    static struct Stall {
++        long period_ms{}, stall_ms{};
++        std::chrono::steady_clock::time_point next{};
++        Stall() {
++            if (const char* v = std::getenv("MSCHARGED_AUDIO_STALL")) {
++                char* end = nullptr;
++                period_ms = std::strtol(v, &end, 10);
++                if (end && *end == ',') stall_ms = std::strtol(end + 1, nullptr, 10);
++            }
++        }
++    } stall_config;
++    if (stall_config.period_ms > 0 && stall_config.stall_ms > 0) {
++        const auto at = std::chrono::steady_clock::now();
++        if (stall_config.next == std::chrono::steady_clock::time_point{}) stall_config.next = at + std::chrono::seconds(20);
++        if (at >= stall_config.next) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(stall_config.stall_ms));
++            stall_config.next = std::chrono::steady_clock::now() + std::chrono::milliseconds(stall_config.period_ms);
++        }
++    }
+     // Progress acknowledged DSP work before AI and the real requests issued
+     // by its source callback afterwards. This delivers actual pending causes;
+     // it never calls an AX/THP source callback or modifies source flags.
+     if (service_device) service_device(device_context);
+-    platform::ServiceNativeAI();
+-    if (service_device) service_device(device_context);
++    // Periods that are already due (the owner was away) follow one another within a small time budget, each with its
++    // DSP progress between, instead of one period per call.
++    const auto budget = platform::NativeAIBurstNs();
++    const auto begin = std::chrono::steady_clock::now();
++    const auto spent = [&] {
++        return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now() - begin).count());
++    };
++    unsigned periods = 0;
++    for (unsigned n = 0; n < 64; ++n) {
++        const bool delivered = platform::ServiceNativeAI();
++        periods += delivered;
++        if (service_device) service_device(device_context);
++        if (!delivered || !budget || !service_device) break;
++        // The DSP frame this period started must be done (and the source's SYNC and YIELD handlers have run) before the
++        // next period, as it is on the console where the DSP always finishes within the 3 ms. Otherwise the source
++        // replays an old output buffer.
++        while (platform::g_ax_frame_busy.load(std::memory_order_relaxed) && spent() < budget) {
++            std::this_thread::yield();
++            service_device(device_context);
++        }
++        if (spent() >= budget) {
++            if (platform::g_audio_stats_on) platform::g_audio_stats.svc_pace_timeouts.fetch_add(1, std::memory_order_relaxed);
++            break;
++        }
++    }
++    if (platform::g_audio_stats_on) {
++        platform::g_audio_stats.svc_calls.fetch_add(1, std::memory_order_relaxed);
++        platform::g_audio_stats.svc_periods.fetch_add(periods, std::memory_order_relaxed);
++        if (periods > 1) platform::g_audio_stats.svc_bursts.fetch_add(1, std::memory_order_relaxed);
++    }
+     // One exact owner, never a replacement SDK registration. VI remains
+     // serviced by the SDK after this endpoint returns.
+     if (service_input) service_input();
