@@ -109,8 +109,8 @@ index daebe0b..875b6e1 100644
  }
  
 @@ -206,4 +233,10 @@ OSTime OSCalendarTimeToTicks(OSCalendarTime* td) {
-   return OSMicrosecondsToTicks(chrono::duration_cast<chrono::microseconds>(sys - kGcnEpochUnix).count());
- }
+ 
+ #endif // AURORA_OSTIME_C_CALENDAR
  
 -OSTime OSGetSystemTime() { return duration_to_ticks(aurora::time::wall_clock::now() - kGcnEpochUnix); }
 +OSTime OSGetSystemTime() {

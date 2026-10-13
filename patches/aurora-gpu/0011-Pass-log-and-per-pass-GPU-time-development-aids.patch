@@ -1,0 +1,96 @@
+diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
+--- a/lib/gfx/encoding.cpp	2026-10-13 21:27:14.397136748 +0530
++++ b/lib/gfx/encoding.cpp	2026-10-13 21:26:46.608344861 +0530
+@@ -1,5 +1,9 @@
+ #include "../gl/census.hpp"
+ #include "encoding.hpp"
++#include <cstdio>
++#include <map>
++#include <chrono>
++#include <cstdlib>
+ #include "xfb.hpp"
+ 
+ #include "frame.hpp"
+@@ -284,6 +288,23 @@
+   }};
+   render_pass(pass, frame, passInfo);
+   pass.End();
++  static const bool passLog = [] {
++    const char* env = std::getenv("AURORA_GL_PASSLOG");
++    return env != nullptr && env[0] == '1';
++  }();
++  if (passLog) {
++    size_t draws = 0;
++    for (const auto& cmd : passInfo.commands) {
++      draws += cmd.type == CommandType::Draw || cmd.type == CommandType::CustomDraw;
++    }
++    std::fprintf(stderr, "[passlog] target %ux%u draws=%zu cmds=%zu clearC=%d clearD=%d depth=%d resolve=%s %ux%u fmt=%d rect=%dx%d@%d,%d\n",
++                 passInfo.targetSize.width, passInfo.targetSize.height, draws, passInfo.commands.size(), clearColor,
++                 clearDepth, hasDepthAttachment, passInfo.resolveTarget ? "yes" : "no",
++                 passInfo.resolveTarget ? passInfo.resolveTarget->size.width : 0,
++                 passInfo.resolveTarget ? passInfo.resolveTarget->size.height : 0,
++                 static_cast<int>(passInfo.resolveFormat), passInfo.resolveRect.width, passInfo.resolveRect.height,
++                 passInfo.resolveRect.x, passInfo.resolveRect.y);
++  }
+   gl::trace::bump(gl::trace::Passes);
+   if (passInfo.hasDraws) {
+     gl::trace::bump(gl::trace::PassesWithDraws);
+@@ -431,7 +452,45 @@
+   switch (op.type) {
+   case FrameOpType::RenderPass:
+     if (op.renderPass != nullptr) {
++      static const bool passTime = [] {
++        const char* env = std::getenv("AURORA_GL_PASSTIME");
++        return env != nullptr && env[0] == '1';
++      }();
++      if (!passTime) {
++        render(frame, *op.renderPass, op.index);
++        break;
++      }
++      // Development aid: glFinish after every pass and add up the wall time per kind of pass, printed every 5 s.
++      using Clock = std::chrono::steady_clock;
++      static std::map<std::string, std::pair<double, int>> totals;
++      static Clock::time_point lastPrint = Clock::now();
++      const auto& pi = *op.renderPass;
++      const auto start = Clock::now();
+       render(frame, *op.renderPass, op.index);
++      gl::gl.Finish();
++      const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
++      char key[160];
++      std::snprintf(key, sizeof(key), "%s target %ux%u clearC=%d resolve %ux%u f%d rect %dx%d",
++                    pi.hasDraws ? "draws" : "empty", pi.targetSize.width, pi.targetSize.height, pi.clearColor,
++                    pi.resolveTarget ? pi.resolveTarget->size.width : 0u,
++                    pi.resolveTarget ? pi.resolveTarget->size.height : 0u, static_cast<int>(pi.resolveFormat),
++                    pi.resolveRect.width, pi.resolveRect.height);
++      auto& entry = totals[key];
++      entry.first += ms;
++      ++entry.second;
++      if (Clock::now() - lastPrint > std::chrono::seconds(5)) {
++        lastPrint = Clock::now();
++        std::vector<std::pair<std::string, std::pair<double, int>>> sorted(totals.begin(), totals.end());
++        std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
++        double sum = 0;
++        for (auto& e : sorted) sum += e.second.first;
++        std::fprintf(stderr, "[passtime] total %.0f ms in %zu kinds over 5 s\n", sum, sorted.size());
++        for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
++          std::fprintf(stderr, "[passtime]   %7.1f ms %5d x %.2f ms  %s\n", sorted[i].second.first, sorted[i].second.second,
++                       sorted[i].second.first / sorted[i].second.second, sorted[i].first.c_str());
++        }
++        totals.clear();
++      }
+     }
+     break;
+   case FrameOpType::TextureCopy:
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+--- a/lib/gfx/frame.cpp	2026-10-13 21:27:14.397136748 +0530
++++ b/lib/gfx/frame.cpp	2026-10-13 21:13:43.110835598 +0530
+@@ -779,6 +779,9 @@
+ void submit_hardware_frame_and_wait() {
+   gx::texture::advance_frame();
+   gl::trace::bump(gl::trace::HardwareSubmits);
++  if (const char* pl = std::getenv("AURORA_GL_PASSLOG"); pl != nullptr && pl[0] == '1') {
++    std::fprintf(stderr, "[passlog] ---- hardware submit\n");
++  }
+   if (gl::trace::report_due()) {
+     gl::trace::report();
+   }
