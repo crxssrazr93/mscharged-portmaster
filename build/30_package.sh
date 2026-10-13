@@ -3,7 +3,8 @@
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
 B="$SRC/build/pm-aarch64"
-P="$W/port/mscharged"
+P="${PORT_DIR:-$W/port/mscharged}"   # override PORT_DIR to stage elsewhere (copy of port/mscharged)
+ZIP="${ZIP_NAME:-mscharged.zip}"
 mkdir -p "$P/libs.aarch64" "$P/libs.native" "$P/licenses" "$W/dist"
 in_container "
 set -euo pipefail
@@ -23,13 +24,13 @@ cp "$W/port/cover.png" "$P/cover.png"
 # Release layout: metadata inside the port folder, README renamed (like PortMaster's own build). The zip's launcher
 # carries the "# PORTMASTER:" line, the launcher in port/ stays without it.
 stage=$(mktemp -d); trap 'rm -rf "$stage"' EXIT
-{ head -n 1 "$W/port/Mario Strikers Charged.sh"; echo "# PORTMASTER: mscharged.zip, Mario Strikers Charged.sh"; tail -n +2 "$W/port/Mario Strikers Charged.sh"; } > "$stage/Mario Strikers Charged.sh"
+{ head -n 1 "$W/port/Mario Strikers Charged.sh"; echo "# PORTMASTER: $ZIP, Mario Strikers Charged.sh"; tail -n +2 "$W/port/Mario Strikers Charged.sh"; } > "$stage/Mario Strikers Charged.sh"
 chmod 755 "$stage/Mario Strikers Charged.sh"
 cp -r "$P" "$stage/"
 rm -rf "$stage/mscharged/log.txt" "$stage/mscharged/logs" "$stage/mscharged/original-main-credits-data" "$stage/mscharged/mscharged.ini"
 cp "$W/port/port.json" "$W/port/gameinfo.xml" "$W/port/screenshot.png" "$W/port/cover.png" "$stage/mscharged/"
 cp "$W/port/README.md" "$stage/mscharged/mscharged.md"
 chmod 755 "$stage/mscharged/mscharged.aarch64"
-rm -f "$W/dist/mscharged.zip"
-(cd "$stage" && zip -9 -r -q -X "$W/dist/mscharged.zip" .)
-ls -l "$W/dist/mscharged.zip"; unzip -l "$W/dist/mscharged.zip"
+rm -f "$W/dist/$ZIP"
+(cd "$stage" && zip -9 -r -q -X "$W/dist/$ZIP" .)
+ls -l "$W/dist/$ZIP"; unzip -l "$W/dist/$ZIP"

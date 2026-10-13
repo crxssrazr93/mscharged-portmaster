@@ -1,8 +1,8 @@
 # Shared settings for the aarch64 PortMaster build scripts (source this file).
 W="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE=mscharged-pm-build
-SRC="$W/work/xbuild-src"          # the port at the pinned commit, with our patches (never ./upstream)
-OUT="$W/work/xbuild-out"          # build products
+SRC="${XSRC:-$W/work/xbuild-src}"          # (override: XSRC) the port at the pinned commit, with our patches (never ./upstream)
+OUT="${XOUT:-$W/work/xbuild-out}"          # (override: XOUT) build products
 SHIM_SRC="$W/work/sdl-shim"       # bmdhacks/SDL branch sdl2-backend at the pinned commit
 PORT_REPO=https://github.com/yannicksuter/mscharged-port.git
 PORT_COMMIT=d7cdfc47              # commit the GLES patches were made against
