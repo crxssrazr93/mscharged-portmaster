@@ -1,0 +1,534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 17:32:14 +0530
+Subject: [PATCH] Render timings in the census, no spin in wait_draw_done,
+ glFinish only when needed, configurable and growing rings, streaming gap in
+ wall time
+
+---
+ lib/gfx/encoding.cpp       |   3 ++
+ lib/gfx/frame.cpp          | 103 ++++++++++++++++++++++++++++++++++---
+ lib/gfx/frame_packet.hpp   |   6 +--
+ lib/gfx/pipeline_cache.cpp |   2 +
+ lib/gfx/recording.cpp      |  10 ++--
+ lib/gfx/render_worker.cpp  |   2 +
+ lib/gfx/resources.hpp      |  21 ++++++--
+ lib/gl/census.cpp          |  27 ++++++++++
+ lib/gl/census.hpp          |  18 +++++++
+ lib/gx/fifo.cpp            |  16 +++++-
+ lib/gx/texture.cpp         |  13 ++++-
+ 11 files changed, 198 insertions(+), 23 deletions(-)
+
+diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
+index fe584ed..5f7d483 100644
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -1,3 +1,4 @@
++#include "../gl/census.hpp"
+ #include "encoding.hpp"
+ #include "xfb.hpp"
+ 
+@@ -368,6 +369,7 @@ void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
+ // WebGPU staging-buffer + CopyBuffer path is gone). Incremental: only the bytes/uploads added since
+ // the previous op's high-water are pushed, tracked in frame.copied.
+ void upload_op_data(FramePacket& frame, const FrameOp& op) {
++  gl::census::ScopedTimer uploadTimer{gl::census::TmUpload};
+   const auto& hw = op.highWater;
+   auto& done = frame.copied;
+   const auto upload_range = [](const gl::Buffer& buffer, const ByteBuffer& src, uint32_t from, uint32_t to) {
+@@ -424,6 +426,7 @@ void apply_scissor(gl::PassEncoder& pass, const ClipRect& sc, const gl::Extent3D
+ }
+ 
+ void encode_op(FramePacket& frame, const FrameOp& op) {
++  gl::census::ScopedTimer opTimer{gl::census::TmOps};
+   upload_op_data(frame, op);
+   switch (op.type) {
+   case FrameOpType::RenderPass:
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index e873986..04ffcb8 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -30,6 +30,8 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <deque>
+ #include <memory>
+@@ -114,8 +116,60 @@ void wait_frame_buffer_fence(size_t slot) {
+ // Persistent caches for CPU-expanded native-fetch geometry. Separate from the per-frame staging rings
+ // so cached ranges can never be clobbered by ring uploads. Filled once per unique mesh (by content
+ // hash) and referenced every subsequent frame.
+-constexpr uint64_t NativeGeomVertexCacheSize = 24ull * 1024 * 1024;
+-constexpr uint64_t NativeGeomIndexCacheSize = 4ull * 1024 * 1024;
++// Sized from the measured peaks (menus and a match use under 4 MB of vertices); a full cache is recycled at the next
++// frame boundary, so a too small cache only costs re-uploads. AURORA_NATIVE_VERTEX_CACHE_MB / _INDEX_CACHE_MB override.
++uint64_t env_mb(const char* name, uint64_t defaultMb) {
++  const char* env = std::getenv(name);
++  const long v = env != nullptr ? std::atol(env) : 0;
++  return (v > 0 ? static_cast<uint64_t>(v) : defaultMb) * 1024ull * 1024ull;
++}
++const uint64_t NativeGeomVertexCacheSize = env_mb("AURORA_NATIVE_VERTEX_CACHE_MB", 12);
++const uint64_t NativeGeomIndexCacheSize = env_mb("AURORA_NATIVE_INDEX_CACHE_MB", 2);
++
++std::atomic<uint64_t> g_vertexRing{env_mb("AURORA_VERTEX_RING_MB", 8)};
++std::atomic<uint64_t> g_uniformRing{env_mb("AURORA_UNIFORM_RING_MB", 6)};
++std::atomic<uint64_t> g_indexRing{env_mb("AURORA_INDEX_RING_MB", 2)};
++
++std::atomic<uint64_t> g_ringGrowTo[4]; // by RingKind: bytes the ring should have from the next frame on (0 = none)
++
++// Rings that a recorded frame overran (ring_note_overflow) are larger from the next frame on. Recording thread.
++void apply_ring_growth() {
++  struct Ring { std::atomic<uint64_t>* size; RingKind kind; uint64_t reserve; const char* name; };
++  const Ring rings[] = {{&g_vertexRing, RingKind::Vertex, VertexBufferReserve, "vertex"},
++                        {&g_uniformRing, RingKind::Uniform, UniformBufferReserve, "uniform"},
++                        {&g_indexRing, RingKind::Index, IndexBufferReserve, "index"}};
++  for (const auto& r : rings) {
++    const uint64_t want = std::min(g_ringGrowTo[static_cast<size_t>(r.kind)].exchange(0), r.reserve);
++    if (want > r.size->load()) {
++      Log.warn("[gl] {} ring grows {} -> {} MiB after an overrun", r.name, r.size->load() >> 20, want >> 20);
++      r.size->store(want);
++    }
++  }
++}
++
++// Worker: recreate this slot's GL ring buffers when the ring sizes changed (after the slot's fence, so the GPU is
++// done with them; deleting a buffer is deferred by the driver anyway).
++void ensure_slot_buffers(size_t slot) {
++  auto& set = g_frameBufferSets[slot];
++  bool changed = false;
++  const auto redo = [&](gl::Buffer& buf, gl::GLenum target, uint64_t size) {
++    if (buf.id != 0 && buf.size == size) {
++      return;
++    }
++    gl::Buffer fresh = gl::create_buffer(target, size, true, /*persistent=*/true);
++    gl::destroy_buffer(buf);
++    buf = fresh;
++    changed = true;
++  };
++  redo(set.vertex, gl::GL_ARRAY_BUFFER, vertex_ring_bytes());
++  redo(set.uniform, gl::GL_UNIFORM_BUFFER, uniform_ring_bytes());
++  redo(set.index, gl::GL_ELEMENT_ARRAY_BUFFER, index_ring_bytes());
++  if (changed) {
++    gl::reset_state_cache();
++  }
++}
++
++
+ // Bump-allocator cursors; on exhaustion the whole cache is reset (deferred to a frame boundary). The
+ // generation counter bumps on each reset so CPU-side content maps can drop entries that point at
+ // now-recycled ranges. Recording thread only.
+@@ -245,9 +299,21 @@ size_t acquire_frame_slot() {
+   }
+ }
+ 
++// glFinish at every draw done / hardware submit makes the recording side wait for the whole GPU frame. Nothing needs it
++// unless after-submit callbacks promise completed GPU work (XFB snapshots): ring reuse is covered by the per slot
++// fences, uploads are copied at record time, depth peek is a stub. AURORA_GL_FINISH=1 restores it.
++bool gl_finish_always() {
++  static const bool always = [] {
++    const char* env = std::getenv("AURORA_GL_FINISH");
++    return env != nullptr && env[0] == '1';
++  }();
++  return always;
++}
++
+ // Block the calling (worker) thread until every GL command issued so far has completed on the GPU.
+ void wait_gpu_complete() {
+   ZoneScopedN("GPU complete");
++  gl::census::ScopedTimer finishTimer{gl::census::TmFinish};
+   if (gl::gl.Finish != nullptr) {
+     gl::gl.Finish();
+   }
+@@ -419,9 +485,9 @@ void initialize() {
+     // Per-frame ring: one persistent-mapped set per frame slot (double-buffered, fenced on reuse; see
+     // FrameBufferSet). The active aliases are pointed at a slot by the begin-frame work item.
+     for (auto& set : g_frameBufferSets) {
+-      set.vertex = gl::create_buffer(gl::GL_ARRAY_BUFFER, VertexBufferSize, true, /*persistent=*/true);
+-      set.uniform = gl::create_buffer(gl::GL_UNIFORM_BUFFER, UniformBufferSize, true, /*persistent=*/true);
+-      set.index = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, IndexBufferSize, true, /*persistent=*/true);
++      set.vertex = gl::create_buffer(gl::GL_ARRAY_BUFFER, vertex_ring_bytes(), true, /*persistent=*/true);
++      set.uniform = gl::create_buffer(gl::GL_UNIFORM_BUFFER, uniform_ring_bytes(), true, /*persistent=*/true);
++      set.index = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, index_ring_bytes(), true, /*persistent=*/true);
+     }
+     select_frame_buffers(0);
+     // The storage-fetch path is dead (native vertex fetch only); no g_storageBuffer. The native geom
+@@ -527,11 +593,13 @@ static bool begin_frame_impl(bool preserveEfb) {
+     begin_recording(frame, frameSlot);
+   }
+   begin_pipeline_frame();
++  apply_ring_growth();
+   render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
+     // Reusing this slot's persistent ring buffers: wait until the GPU finished the frame that last
+     // used them before the worker starts memcpy'ing new data into the coherent mapping (immutable
+     // storage has no implicit orphaning). Then make this slot's set the active ring for the frame.
+     wait_frame_buffer_fence(frameSlot);
++    ensure_slot_buffers(frameSlot);
+     select_frame_buffers(frameSlot);
+     webgpu::gpu_prof::frame_begin();
+   });
+@@ -582,6 +650,10 @@ static void end_frame_impl(EndFrameCallback callback, bool presenting, bool hard
+   }
+   const auto recorded = end_recording();
+   auto& frame = *recorded.packet;
++  ring_note_overflow(frame.verts.size() > vertex_ring_bytes() ? RingKind::Vertex : RingKind::None, frame.verts.size());
++  ring_note_overflow(frame.uniforms.size() > uniform_ring_bytes() ? RingKind::Uniform : RingKind::None,
++                     frame.uniforms.size());
++  ring_note_overflow(frame.indices.size() > index_ring_bytes() ? RingKind::Index : RingKind::None, frame.indices.size());
+   gl::census::ring_sample(gl::census::RingVerts, static_cast<int64_t>(frame.verts.size()));
+   gl::census::ring_sample(gl::census::RingUniforms, static_cast<int64_t>(frame.uniforms.size()));
+   gl::census::ring_sample(gl::census::RingIndices, static_cast<int64_t>(frame.indices.size()));
+@@ -628,7 +700,7 @@ static void end_frame_impl(EndFrameCallback callback, bool presenting, bool hard
+     // After-submit callbacks promise the GPU work recorded before them has completed (XFB snapshots
+     // become scanout-visible, completion latches fire). glFinish is the portable GL equivalent of
+     // Queue::OnSubmittedWorkDone; it is only paid for frames that need it.
+-    const bool needFinish = hardware || !afterSubmitCallbacks.empty();
++    const bool needFinish = (hardware && gl_finish_always()) || !afterSubmitCallbacks.empty();
+     if (needFinish) {
+       wait_gpu_complete();
+       for (auto& afterSubmit : afterSubmitCallbacks) {
+@@ -666,6 +738,21 @@ void end_frame(EndFrameCallback callback) {
+ 
+ uint32_t current_frame() noexcept { return g_frameIndex; }
+ 
++uint64_t vertex_ring_bytes() noexcept { return g_vertexRing.load(std::memory_order_relaxed); }
++uint64_t uniform_ring_bytes() noexcept { return g_uniformRing.load(std::memory_order_relaxed); }
++uint64_t index_ring_bytes() noexcept { return g_indexRing.load(std::memory_order_relaxed); }
++
++void ring_note_overflow(RingKind kind, uint64_t neededBytes) noexcept {
++  if (kind == RingKind::None) {
++    return;
++  }
++  const uint64_t target = ((neededBytes * 3 / 2) + (1u << 20) - 1) & ~uint64_t{(1u << 20) - 1};
++  auto& slot = g_ringGrowTo[static_cast<size_t>(kind)];
++  uint64_t prev = slot.load(std::memory_order_relaxed);
++  while (target > prev && !slot.compare_exchange_weak(prev, target, std::memory_order_relaxed)) {
++  }
++}
++
+ void after_submit() noexcept { depth_peek::after_submit(); }
+ 
+ void gpu_synchronize() {
+@@ -705,7 +792,9 @@ void submit_draw_done_and_wait() {
+   render_worker::enqueue_work([callbacks = std::move(callbacks)]() mutable {
+     // A parser acknowledgement or render-worker drain is never this fence: glFinish runs strictly
+     // after every GL command of the sealed prefix.
+-    wait_gpu_complete();
++    if (gl_finish_always() || !callbacks.empty()) {
++      wait_gpu_complete();
++    }
+     for (auto& callback : callbacks) {
+       if (callback) {
+         callback();
+diff --git a/lib/gfx/frame_packet.hpp b/lib/gfx/frame_packet.hpp
+index 872c845..a66566b 100644
+--- a/lib/gfx/frame_packet.hpp
++++ b/lib/gfx/frame_packet.hpp
+@@ -197,9 +197,9 @@ struct FramePacket {
+     indices.clear();
+     storage.clear();
+     textureUpload.clear();
+-    verts.reserve_extra(VertexBufferSize);
+-    uniforms.reserve_extra(UniformBufferSize);
+-    indices.reserve_extra(IndexBufferSize);
++    verts.reserve_extra(VertexBufferReserve);
++    uniforms.reserve_extra(UniformBufferReserve);
++    indices.reserve_extra(IndexBufferReserve);
+     textureUpload.reserve_extra(TextureUploadSize);
+     afterSubmitCallbacks.clear();
+     copied = {};
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index 5e08faf..a5740d9 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -1,3 +1,4 @@
++#include "../gl/census.hpp"
+ #include "pipeline_cache.hpp"
+ 
+ #include "clear.hpp"
+@@ -572,6 +573,7 @@ static PipelineRef find_pipeline_impl(PipelineRef runtimeKey, NewPipelineCallbac
+     // screen (game loop parked before its first [clock] line). If the build doesn't land in
+     // time, name the culprit and return; bind_pipeline() skips draws whose pipeline isn't
+     // ready, so the cost of bailing is a missing UI element for a few frames, not a hang.
++    gl::census::ScopedTimer pipelineTimer{gl::census::TmPipeline};
+     std::unique_lock lock{g_pipelineMutex};
+     if (g_gaveUpPipelines.contains(runtimeKey)) {
+       return runtimeKey; // already gave up on this one: it builds in the background, its draws are skipped meanwhile
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index b41c6a7..3f33995 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -223,7 +223,8 @@ void seal_pass(FramePacket& frame, uint32_t passIndex) {
+   pass.sealed = true;
+ }
+ 
+-Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment, uint64_t ceiling = 0) {
++Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment, uint64_t ceiling = 0,
++           RingKind kind = RingKind::None) {
+   if (alignment != 0) {
+     const size_t begin = target.size();
+     const size_t alignedBegin = AURORA_ALIGN(begin, alignment);
+@@ -236,6 +237,7 @@ Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignm
+     // The per-frame ring ceilings are reserved up front so recording never reallocs under the render
+     // worker's concurrent reads; growing past one reallocs and also overruns the GL ring buffer.
+     gl::census::ring_overflow();
++    ring_note_overflow(kind, begin + length);
+     Log.warn("Per-frame buffer overflow: {} + {} bytes exceeds the {} byte ring", begin, length, ceiling);
+   }
+   if (length > 0) {
+@@ -1213,7 +1215,7 @@ Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+   if (!check_recording("push_verts")) {
+     return {};
+   }
+-  return push(current_frame_packet().verts, data, length, alignment, VertexBufferSize);
++  return push(current_frame_packet().verts, data, length, alignment, vertex_ring_bytes(), RingKind::Vertex);
+ }
+ 
+ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+@@ -1221,7 +1223,7 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
+   if (!check_recording("push_indices")) {
+     return {};
+   }
+-  return push(current_frame_packet().indices, data, length, alignment, IndexBufferSize);
++  return push(current_frame_packet().indices, data, length, alignment, index_ring_bytes(), RingKind::Index);
+ }
+ 
+ Range push_uniform(const uint8_t* data, size_t length) {
+@@ -1229,7 +1231,7 @@ Range push_uniform(const uint8_t* data, size_t length) {
+   if (!check_recording("push_uniform")) {
+     return {};
+   }
+-  return push(current_frame_packet().uniforms, data, length, uniform_alignment(), UniformBufferSize);
++  return push(current_frame_packet().uniforms, data, length, uniform_alignment(), uniform_ring_bytes(), RingKind::Uniform);
+ }
+ 
+ Range push_storage(const uint8_t* data, size_t length) {
+diff --git a/lib/gfx/render_worker.cpp b/lib/gfx/render_worker.cpp
+index 5b53f47..7cbfac4 100644
+--- a/lib/gfx/render_worker.cpp
++++ b/lib/gfx/render_worker.cpp
+@@ -1,3 +1,4 @@
++#include "../gl/census.hpp"
+ #include "render_worker.hpp"
+ #include <aurora/hardware.h>
+ 
+@@ -258,6 +259,7 @@ void synchronize() {
+   }
+ 
+   ZoneScoped;
++  gl::census::ScopedTimer syncTimer{gl::census::TmSyncWait};
+   auto sync = std::make_shared<SyncState>();
+   enqueue({
+       .type = ItemType::Sync,
+diff --git a/lib/gfx/resources.hpp b/lib/gfx/resources.hpp
+index 4cd5f2a..ee10e87 100644
+--- a/lib/gfx/resources.hpp
++++ b/lib/gfx/resources.hpp
+@@ -4,11 +4,22 @@
+ 
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = true;
+-inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
+-inline constexpr uint64_t VertexBufferSize = 5242880;   // 5 MiB
+-inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
+-inline constexpr uint64_t StorageBufferSize = 8388608;  // 8 MiB (storage-fetch path is gone; CPU-side only)
+-inline constexpr uint64_t TextureUploadSize = 25165824; // 24 MiB
++// Per frame rings. The GL buffers of the two frame slots are pinned GPU memory on the handhelds, so they are sized
++// from measured peaks (AURORA_VERTEX_RING_MB / AURORA_UNIFORM_RING_MB / AURORA_INDEX_RING_MB override the defaults)
++// and grow at the next frame start when a frame overran one (see ring_note_overflow). The CPU side packets reserve
++// the large *Reserve sizes instead, which only costs address space until touched, so an overrunning frame still
++// records valid data (its GPU copy is clamped for that one frame).
++uint64_t vertex_ring_bytes() noexcept;
++uint64_t uniform_ring_bytes() noexcept;
++uint64_t index_ring_bytes() noexcept;
++enum class RingKind : uint8_t { None, Vertex, Uniform, Index };
++void ring_note_overflow(RingKind kind, uint64_t neededBytes) noexcept; // any thread
++
++inline constexpr uint64_t UniformBufferReserve = 25165824; // 24 MiB
++inline constexpr uint64_t VertexBufferReserve = 16777216;  // 16 MiB
++inline constexpr uint64_t IndexBufferReserve = 6291456;    // 6 MiB
++inline constexpr uint64_t StorageBufferSize = 8388608;     // 8 MiB (storage-fetch path is gone; CPU-side only)
++inline constexpr uint64_t TextureUploadSize = 8388608;     // 8 MiB, more spills into separate allocations
+ 
+ // g_stats, the g_*Buffer ring aliases and detail::resources() are declared in types.hpp so that every
+ // file that includes the gfx types sees them (the Dawn-era common.hpp provided them to everyone).
+diff --git a/lib/gl/census.cpp b/lib/gl/census.cpp
+index 3d69bbb..3b6b6ae 100644
+--- a/lib/gl/census.cpp
++++ b/lib/gl/census.cpp
+@@ -31,6 +31,12 @@ std::atomic<int64_t> s_progSourceUs{0};
+ std::atomic<int64_t> s_progBinaryUs{0};
+ std::atomic<int64_t> s_progMaxUs{0};
+ 
++std::atomic<int64_t> s_timers[TmCount];
++int64_t s_timersPrev[TmCount];
++int64_t steady_ns() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
+ std::atomic<int64_t> s_ringPeak[RingCount];
+ std::atomic<int64_t> s_ringOverflows{0};
+ std::atomic<int64_t> s_nativeResets{0};
+@@ -146,6 +152,12 @@ void texture_removed(uint8_t tag, int64_t bytes, int64_t equivBytes) noexcept {
+   s_tags[tag].equiv.fetch_sub(equivBytes, std::memory_order_relaxed);
+ }
+ 
++void time_add(Timer timer, int64_t nanoseconds) noexcept {
++  s_timers[timer].fetch_add(nanoseconds, std::memory_order_relaxed);
++}
++ScopedTimer::ScopedTimer(Timer t) noexcept : timer(t), start(steady_ns()) {}
++ScopedTimer::~ScopedTimer() { time_add(timer, steady_ns() - start); }
++
+ void ring_sample(Ring ring, int64_t bytesUsed) noexcept {
+   int64_t prev = s_ringPeak[ring].load(std::memory_order_relaxed);
+   while (bytesUsed > prev && !s_ringPeak[ring].compare_exchange_weak(prev, bytesUsed, std::memory_order_relaxed)) {
+@@ -209,6 +221,21 @@ void log_tick() noexcept {
+                       mb(s_ringPeak[RingVerts]), mb(s_ringPeak[RingUniforms]), mb(s_ringPeak[RingIndices]),
+                       mb(s_ringPeak[RingTexUpload]), mb(s_ringPeak[RingNativeVerts]), mb(s_ringPeak[RingNativeIndices]),
+                       s_ringOverflows.load(), s_nativeResets.load());
++  static std::chrono::steady_clock::time_point s_timeMark{};
++  if (s_timeMark.time_since_epoch().count() != 0) {
++    const double secs = std::chrono::duration<double>(now - s_timeMark).count();
++    double ms[TmCount];
++    for (int i = 0; i < TmCount; ++i) {
++      const int64_t cur = s_timers[i].load(std::memory_order_relaxed);
++      ms[i] = static_cast<double>(cur - s_timersPrev[i]) / 1.0e6 / secs;
++      s_timersPrev[i] = cur;
++    }
++    head += fmt::format("\n[gl-time] ms per second: ops {:.0f} (upload {:.0f}) finish {:.0f} sync-wait {:.0f} "
++                        "drawdone-wait {:.0f} parse {:.0f} pipeline-wait {:.0f}",
++                        ms[TmOps], ms[TmUpload], ms[TmFinish], ms[TmSyncWait], ms[TmDrawDone], ms[TmParse],
++                        ms[TmPipeline]);
++  }
++  s_timeMark = now;
+   const auto emit = [&](const std::string& m) { detailed > 0 ? Log.warn("{}", m) : Log.info("{}", m); };
+   emit(head);
+   if (detailed > 0) {
+diff --git a/lib/gl/census.hpp b/lib/gl/census.hpp
+index 00ee43b..94bc489 100644
+--- a/lib/gl/census.hpp
++++ b/lib/gl/census.hpp
+@@ -72,6 +72,24 @@ void ring_sample(Ring ring, int64_t bytesUsed) noexcept;
+ void ring_overflow() noexcept;      // a per frame ring ran past its ceiling
+ void native_cache_reset() noexcept; // a native geometry cache ran full and was recycled
+ 
++// Wall time spent in the stages that decide the frame rate, summed over threads (see the [gl-time] line, shown in
++// ms per second of wall time):
++//   ops        render worker executing recorded ops (uploads and draws, includes `upload`)
++//   upload     render worker texture and buffer uploads
++//   finish     render worker blocked in glFinish
++//   sync-wait  recording thread blocked until the render worker has executed everything (render_worker::synchronize)
++//   drawdone   GX owner thread blocked in GXWaitDrawDone
++//   parse      GX FIFO worker processing commands (includes the sync wait of a draw-done)
++//   pipeline   recording thread blocked on a shader compile
++enum Timer : uint8_t { TmOps, TmUpload, TmFinish, TmSyncWait, TmDrawDone, TmParse, TmPipeline, TmCount };
++void time_add(Timer timer, int64_t nanoseconds) noexcept;
++struct ScopedTimer {
++  Timer timer;
++  int64_t start;
++  explicit ScopedTimer(Timer t) noexcept;
++  ~ScopedTimer();
++};
++
+ // Rate-limited summary line (one [gl-census] INFO log every ~10 s, every AURORA_CENSUS seconds when
+ // set). Called once per frame from the end-of-frame path on the render worker; cheap when not due.
+ void log_tick() noexcept;
+diff --git a/lib/gx/fifo.cpp b/lib/gx/fifo.cpp
+index c6dc4ea..564e992 100644
+--- a/lib/gx/fifo.cpp
++++ b/lib/gx/fifo.cpp
+@@ -1,3 +1,4 @@
++#include "../gl/census.hpp"
+ #include "fifo.hpp"
+ #include <aurora/hardware.h>
+ 
+@@ -103,6 +104,8 @@ void latch_gpu_draw_done() {
+   }
+   sGpuFinishPending.store(true, std::memory_order_release);
+   sDrawDoneLatches.fetch_add(1, std::memory_order_release);
++  { std::lock_guard progress{sProcessProgressMutex}; } // pairs with the owner's blocking wait in wait_draw_done
++  sProcessProgress.notify_all();
+ }
+ 
+ void wake_worker() noexcept {
+@@ -125,7 +128,10 @@ void process_to(uint64_t target, std::memory_order order) noexcept {
+         AURORA_ASSERT(gfx::begin_hardware_frame(), "Original GX hardware staging/recorder failed to begin");
+         sHardwareFrameActive = true;
+       }
+-      result = process(detail::sBufferData + start, size);
++      {
++        gl::census::ScopedTimer parseTimer{gl::census::TmParse};
++        result = process(detail::sBufferData + start, size);
++      }
+     }
+     AURORA_ASSERT(result.bytesProcessed > 0 && result.bytesProcessed <= target - processed,
+                   "FIFO processor made invalid progress: processed {} of {} remaining bytes", result.bytesProcessed,
+@@ -422,6 +428,7 @@ void wait_draw_done() {
+   const BOOL enabled = OSDisableInterrupts();
+   struct Mask { BOOL enabled; ~Mask() { OSRestoreInterrupts(enabled); } } mask{enabled};
+   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
++  gl::census::ScopedTimer drawDoneTimer{gl::census::TmDrawDone};
+   while (!sDrawDone) {
+     // Native equivalent of source OSSleepThread: allow the genuine latched
+     // interrupt while the source owner sleeps, then reenter its critical section.
+@@ -429,7 +436,12 @@ void wait_draw_done() {
+     // Sleep on the genuine finish IRQ; native desktop presentation is separate.
+     aurora_service_hardware_interrupts();
+     service_draw_done();
+-    std::this_thread::yield();
++    {
++      // Blocking wait instead of sched_yield: the owner used to spin a core here for the whole GPU frame.
++      std::unique_lock progress{sProcessProgressMutex};
++      sProcessProgress.wait_for(progress, std::chrono::microseconds{500},
++                                [] { return sGpuFinishPending.load(std::memory_order_acquire); });
++    }
+     OSDisableInterrupts();
+     AURORA_ASSERT(sDrawDone || std::chrono::steady_clock::now() < deadline,
+                   "GXWaitDrawDone timed out without a genuine GPU finish interrupt");
+diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
+index 9ef12a1..47e84dd 100644
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -623,14 +624,20 @@ struct StreamKey {
+ struct StreamSlot {
+   gfx::TextureHandle handle; // set once streaming
+   uint64_t lastChangeFrame = 0;
++  int64_t lastChangeMs = 0; // wall clock of the last miss (a video frame is far apart in game frames when the game runs many draw-dones per picture)
+   uint64_t lastUsedFrame = 0;
+   uint32_t streak = 0;
+ };
++
++int64_t now_ms() {
++  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
+ absl::flat_hash_map<StreamKey, StreamSlot> s_streamSlots;
+ 
+ void sweep_stream_slots() {
+   for (auto it = s_streamSlots.begin(); it != s_streamSlots.end();) {
+-    if (s_frameCount > it->second.lastUsedFrame && s_frameCount - it->second.lastUsedFrame > 120) {
++    if (now_ms() - it->second.lastChangeMs > 3000 && s_frameCount > it->second.lastUsedFrame + 120) {
+       s_streamSlots.erase(it++);
+     } else {
+       ++it;
+@@ -651,7 +658,9 @@ gfx::TextureHandle try_streaming_update(const GXTexObj_& obj) {
+       slot.streak = 0; // the same buffer holding several textures within one frame: not video
+       return {};
+     }
+-    slot.streak = (!inserted && s_frameCount - slot.lastChangeFrame <= 4) ? slot.streak + 1 : 1;
++    const int64_t nowMs = now_ms();
++    slot.streak = (!inserted && nowMs - slot.lastChangeMs <= 500) ? slot.streak + 1 : 1;
++    slot.lastChangeMs = nowMs;
+     slot.lastChangeFrame = s_frameCount;
+     if (slot.streak < 3) {
+       return {};

@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sajid Ahamed <crxssrazr93@gmail.com>
+Date: Tue, 13 Oct 2026 17:33:20 +0530
+Subject: [PATCH] include state.hpp
+
+---
+ lib/gfx/frame.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index 04ffcb8..c23f8b1 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -17,6 +17,7 @@
+ #include "../gl/census.hpp"
+ #include "../gl/context.hpp"
+ #include "../gl/gl_core.hpp"
++#include "../gl/state.hpp"
+ #include "../gx/gx.hpp"
+ #include "../gx/texture.hpp"
+ #ifdef AURORA_ENABLE_RMLUI
