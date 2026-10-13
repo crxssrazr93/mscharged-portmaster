@@ -6,7 +6,8 @@ source "$(dirname "$0")/common.sh"
 B="$SRC/build/pm-aarch64"   # the preparer requires an ignored build directory inside the checkout
 # Aurora patch series: our GLES series followed by the PortMaster compatibility patches (patches/aurora-pm).
 SERIES="$OUT/aurora-series"; rm -rf "$SERIES"; mkdir -p "$SERIES"
-cp "$W"/patches/aurora-gles/*.patch "$SERIES/"; cp "$W/patches/aurora-gles/series" "$SERIES/series"
+GLES_DIR="${AURORA_GLES_DIR:-$W/patches/aurora-gles}"   # override to build from another copy of the GLES series
+cp "$GLES_DIR"/*.patch "$SERIES/"; cp "$GLES_DIR/series" "$SERIES/series"
 for p in "$W"/patches/aurora-pm/*.patch; do [ -e "$p" ] || continue; cp "$p" "$SERIES/"; basename "$p" >> "$SERIES/series"; done
 # Cache variables of the gles-release preset (resolved through its inheritance), so the build matches the PC one.
 PRESET_ARGS=$(python3 - "$SRC/CMakePresets.json" <<'PY'
