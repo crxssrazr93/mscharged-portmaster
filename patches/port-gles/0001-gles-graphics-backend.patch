@@ -1,0 +1,904 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c42c3fb527ea3734a3819acdd2d2589246ba29c3..9fae339dde373125671bb04458f16fd4c68aedd5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -25,6 +25,37 @@ endif()
+ find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+ find_package(Git REQUIRED)
+ include(CTest)
++# Graphics backend: "vulkan" (Dawn/WebGPU, the default and unchanged) or "gles"
++# (Aurora rebuilt on OpenGL ES 3 from the extra patch series; no Dawn).
++set(MSCHARGED_GRAPHICS_BACKEND "vulkan" CACHE STRING "Graphics backend: vulkan or gles")
++set_property(CACHE MSCHARGED_GRAPHICS_BACKEND PROPERTY STRINGS vulkan gles)
++if(NOT MSCHARGED_GRAPHICS_BACKEND MATCHES "^(vulkan|gles)$")
++    message(FATAL_ERROR "MSCHARGED_GRAPHICS_BACKEND must be vulkan or gles")
++endif()
++set(MSCHARGED_GLES OFF)
++if(MSCHARGED_GRAPHICS_BACKEND STREQUAL "gles")
++    if(APPLE)
++        message(FATAL_ERROR "The GLES graphics backend is not supported on macOS (use vulkan, which selects Metal)")
++    endif()
++    set(MSCHARGED_GLES ON)
++    # Extra Aurora patch series applied after patches/aurora (the GLES Aurora).
++    # Defaults to patches/aurora-gles in this checkout, else the one next to it.
++    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/aurora-gles")
++        set(MSCHARGED_AURORA_EXTRA_PATCH_DIR_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/patches/aurora-gles")
++    else()
++        set(MSCHARGED_AURORA_EXTRA_PATCH_DIR_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../patches/aurora-gles")
++    endif()
++    set(MSCHARGED_AURORA_EXTRA_PATCH_DIR "${MSCHARGED_AURORA_EXTRA_PATCH_DIR_DEFAULT}" CACHE PATH
++        "Directory with the extra Aurora patch series (series file) applied after patches/aurora")
++    if(NOT EXISTS "${MSCHARGED_AURORA_EXTRA_PATCH_DIR}/series")
++        message(FATAL_ERROR "GLES graphics backend: ${MSCHARGED_AURORA_EXTRA_PATCH_DIR}/series not found. "
++            "Set MSCHARGED_AURORA_EXTRA_PATCH_DIR to the GLES Aurora patch series.")
++    endif()
++    # Selects the OpenGLES AuroraBackend (src/platform/graphics_backend.h) and
++    # compiles the GL readback paths instead of the WebGPU ones.
++    add_compile_definitions(MSCHARGED_GRAPHICS_GLES=1)
++    message(STATUS "Graphics backend: GLES (Aurora extra patches: ${MSCHARGED_AURORA_EXTRA_PATCH_DIR})")
++endif()
+ option(MSCHARGED_BUILD_LAUNCHER "Build the graphical launcher" ON)
+ option(MSCHARGED_BUILD_AURORA_HOST "Build the Aurora core initialization check (no GX rendering)" OFF)
+ option(MSCHARGED_BUILD_GAME_STARTUP "Build the experimental original-game startup path (not playable)" OFF)
+@@ -71,6 +102,15 @@ if(MSCHARGED_BUILD_GAME_STARTUP)
+ endif()
+ 
+ set(MSCHARGED_PREPARER "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_sources.py")
++set(MSCHARGED_PREPARER_EXTRA_ARGS)
++if(MSCHARGED_GLES)
++    # The wrapper adds the extra Aurora series; prepare_sources.py is unchanged.
++    set(MSCHARGED_PREPARER "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_gles_sources.py")
++    set(MSCHARGED_PREPARER_EXTRA_ARGS --aurora-extra-patch-dir "${MSCHARGED_AURORA_EXTRA_PATCH_DIR}")
++    file(GLOB_RECURSE gles_patch_inputs CONFIGURE_DEPENDS "${MSCHARGED_AURORA_EXTRA_PATCH_DIR}/*")
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
++        "${CMAKE_CURRENT_SOURCE_DIR}/tools/prepare_sources.py" ${gles_patch_inputs})
++endif()
+ set(MSCHARGED_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/mscharged-decomp")
+ file(GLOB_RECURSE patch_inputs CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/patches/*")
+ execute_process(
+@@ -150,7 +190,7 @@ function(mscharged_prepare_dependency name output)
+     endif()
+     execute_process(
+         COMMAND "${Python3_EXECUTABLE}" -B "${MSCHARGED_PREPARER}"
+-                --build-dir "${CMAKE_BINARY_DIR}" --dependency "${name}" ${prepare_args}
++                --build-dir "${CMAKE_BINARY_DIR}" --dependency "${name}" ${MSCHARGED_PREPARER_EXTRA_ARGS} ${prepare_args}
+         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+         OUTPUT_VARIABLE prepared OUTPUT_STRIP_TRAILING_WHITESPACE
+         COMMAND_ERROR_IS_FATAL ANY
+@@ -159,7 +199,7 @@ function(mscharged_prepare_dependency name output)
+     set("${output}" "${prepared}" PARENT_SCOPE)
+     add_custom_target("verify_${name}"
+         COMMAND "${Python3_EXECUTABLE}" -B "${MSCHARGED_PREPARER}"
+-                --build-dir "${CMAKE_BINARY_DIR}" --dependency "${name}" ${prepare_args} --check
++                --build-dir "${CMAKE_BINARY_DIR}" --dependency "${name}" ${MSCHARGED_PREPARER_EXTRA_ARGS} ${prepare_args} --check
+         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+         COMMENT "Verify pinned, unmodified ${name} and prepared sources"
+         VERBATIM
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 81021f2e34219637ae829c0ba25bc6ab04f8c02c..96cd8e1607fbfd6739903f37e935c4cb51df57d6 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -95,6 +95,15 @@
+       "inherits": "frontend-runtime",
+       "displayName": "Original frontend runtime (Release, incomplete game)"
+     },
++    {
++      "name": "gles-release",
++      "inherits": "release",
++      "displayName": "Original frontend runtime on the GLES graphics backend (Release, OpenGL ES 3, no Dawn)",
++      "binaryDir": "${sourceDir}/build/gles-release",
++      "cacheVariables": {
++        "MSCHARGED_GRAPHICS_BACKEND": "gles"
++      }
++    },
+     {
+       "name": "launcher",
+       "inherits": "optimized",
+@@ -160,6 +169,13 @@
+         "mscharged"
+       ]
+     },
++    {
++      "name": "gles-release",
++      "configurePreset": "gles-release",
++      "targets": [
++        "mscharged"
++      ]
++    },
+     {
+       "name": "launcher",
+       "configurePreset": "launcher"
+@@ -287,6 +303,19 @@
+         }
+       ]
+     },
++    {
++      "name": "gles-release",
++      "steps": [
++        {
++          "type": "configure",
++          "name": "gles-release"
++        },
++        {
++          "type": "build",
++          "name": "gles-release"
++        }
++      ]
++    },
+     {
+       "name": "launcher",
+       "steps": [
+diff --git a/cmake/AuroraHost.cmake b/cmake/AuroraHost.cmake
+index 394fbf07c6539ee30ce9ed37a05f0863d9f7ec6d..55ecd06df547776afca010a4321d18a0a931239b 100644
+--- a/cmake/AuroraHost.cmake
++++ b/cmake/AuroraHost.cmake
+@@ -1,10 +1,14 @@
+ # Bring up real Aurora host services independently of the incomplete game.
+ mscharged_prepare_dependency(aurora MSCHARGED_AURORA_PREPARED)
+-if(MSCHARGED_BUILD_GX_CHECK)
++if(MSCHARGED_BUILD_GX_CHECK AND NOT MSCHARGED_GLES)
+     include(cmake/Dawn.cmake)
+     include(cmake/GraphicsProviders.cmake)
+ else()
++    # The GLES Aurora has no Dawn, which otherwise supplies Abseil's pin.
+     mscharged_prepare_dependency(abseil-cpp MSCHARGED_ABSEIL_PREPARED)
++    if(MSCHARGED_BUILD_GX_CHECK)
++        include(cmake/GraphicsProviders.cmake)
++    endif()
+ endif()
+ mscharged_prepare_dependency(fmt MSCHARGED_FMT_PREPARED)
+ mscharged_prepare_dependency(xxhash MSCHARGED_XXHASH_PREPARED)
+@@ -34,7 +38,7 @@ function(mscharged_add_aurora_host)
+     set(XXHASH_BUILD_XXHSUM OFF)
+     set(TRACY_ENABLE OFF)
+     set(TRACY_STATIC ON)
+-    if(MSCHARGED_BUILD_GX_CHECK)
++    if(MSCHARGED_BUILD_GX_CHECK AND NOT MSCHARGED_GLES)
+         mscharged_add_dawn()
+     endif()
+     if(NOT TARGET absl::btree)
+@@ -49,8 +53,11 @@ function(mscharged_add_aurora_host)
+     set(AURORA_SDL3_PROVIDER vendor)
+     set(AURORA_SDL3_LINKAGE static)
+     set(AURORA_ENABLE_GX ${MSCHARGED_BUILD_GX_CHECK})
+-    set(AURORA_DAWN_PROVIDER vendor)
+-    set(AURORA_DAWN_LINKAGE static)
++    if(NOT MSCHARGED_GLES)
++        # The GLES Aurora renders through OpenGL ES 3 and has no Dawn provider.
++        set(AURORA_DAWN_PROVIDER vendor)
++        set(AURORA_DAWN_LINKAGE static)
++    endif()
+     if(MSCHARGED_BUILD_GAME_STARTUP OR MSCHARGED_BUILD_SCENE_PREVIEW
+             OR MSCHARGED_BUILD_ORIGINAL_CREDITS_DIAGNOSTIC)
+         set(AURORA_ENABLE_DVD ON)
+@@ -91,6 +98,11 @@ if(TARGET aurora_gx)
+     # GX and core reference one another. Declare the reverse static dependency
+     # so even consumers of core alone get the required archive rescans.
+     target_link_libraries(aurora_core PUBLIC aurora_gx)
++    if(MSCHARGED_GLES)
++        # The GL device layer lives in aurora_core and is only referenced from aurora_gx objects.
++        # Pull the whole archive so those members are linked regardless of order.
++        target_link_libraries(aurora_gx PUBLIC "$<LINK_LIBRARY:WHOLE_ARCHIVE,aurora_core>")
++    endif()
+     include(cmake/NativeWiiLighting.cmake)
+ endif()
+ if(TARGET aurora_dvd)
+@@ -101,7 +113,11 @@ foreach(directory IN ITEMS "${MSCHARGED_FMT_PREPARED}"
+     mscharged_verify_targets("${directory}")
+ endforeach()
+ if(MSCHARGED_BUILD_GX_CHECK)
+-    mscharged_verify_targets("${MSCHARGED_DAWN_PREPARED}")
++    if(MSCHARGED_GLES)
++        mscharged_verify_targets("${MSCHARGED_ABSEIL_PREPARED}")
++    else()
++        mscharged_verify_targets("${MSCHARGED_DAWN_PREPARED}")
++    endif()
+     foreach(directory IN ITEMS "${MSCHARGED_zlib_ng_PREPARED}" "${MSCHARGED_libpng_PREPARED}"
+             "${MSCHARGED_freetype_PREPARED}" "${MSCHARGED_zstd_PREPARED}/build/cmake")
+         mscharged_verify_targets("${directory}")
+diff --git a/cmake/GraphicsCheck.cmake b/cmake/GraphicsCheck.cmake
+index 3be2aeaba2cf52235f9f2d67bc51797e8926fc77..3bfe1af14cc85557bd1527f77083db136e237de2 100644
+--- a/cmake/GraphicsCheck.cmake
++++ b/cmake/GraphicsCheck.cmake
+@@ -7,6 +7,7 @@ target_link_libraries(mscharged-gx-check PRIVATE aurora::gx aurora::mtx aurora::
+ # Real GPU tests require a desktop and driver. Keep the portable tests runnable
+ # without a GPU; register this explicit gate only when requested.
+ option(MSCHARGED_TEST_VULKAN "Run the GX diagnostic through a real Vulkan device in CTest" OFF)
++option(MSCHARGED_TEST_GLES "Run the GX diagnostic through a real OpenGL ES device in CTest (GLES graphics backend)" OFF)
+ if(BUILD_TESTING)
+     add_test(NAME sqlite_preparation
+         COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prepare_sqlite.py")
+@@ -14,7 +15,13 @@ endif()
+ if(MSCHARGED_TEST_VULKAN AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+     message(FATAL_ERROR "MSCHARGED_TEST_VULKAN requires Linux/Vulkan; run mscharged-gx-check directly for Metal qualification")
+ endif()
+-if(BUILD_TESTING AND MSCHARGED_TEST_VULKAN)
++if(BUILD_TESTING AND MSCHARGED_TEST_GLES AND MSCHARGED_GLES)
++    # gx_completion_tests and the Vulkan layer gates use WebGPU and stay Vulkan only.
++    add_test(NAME gx_gles COMMAND mscharged-gx-check --frames 180 --resize-test)
++    set_tests_properties(gx_gles PROPERTIES TIMEOUT 45 LABELS "gpu;gles" RESOURCE_LOCK gx_check
++        FAIL_REGULAR_EXPRESSION "Error:|GX check failed")
++endif()
++if(BUILD_TESTING AND MSCHARGED_TEST_VULKAN AND NOT MSCHARGED_GLES)
+     add_executable(gx_completion_tests tests/gx_completion.cpp)
+     target_include_directories(gx_completion_tests PRIVATE src "${MSCHARGED_AURORA_PREPARED}")
+     target_compile_features(gx_completion_tests PRIVATE cxx_std_20)
+diff --git a/cmake/GraphicsProviders.cmake b/cmake/GraphicsProviders.cmake
+index 9497e413ffe2160892a325f80fb02a0dd909ddba..31201ff7af111ef083c388611b6f4b21dff6faee 100644
+--- a/cmake/GraphicsProviders.cmake
++++ b/cmake/GraphicsProviders.cmake
+@@ -70,13 +70,30 @@ function(mscharged_add_graphics_providers)
+     target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE)
+     target_compile_features(imgui PRIVATE cxx_std_20)
+     target_link_libraries(imgui PRIVATE Freetype::Freetype)
+-    add_library(imgui_backends STATIC
+-        "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_wgpu.cpp")
+-    target_compile_features(imgui_backends PRIVATE cxx_std_20)
+-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+-    target_link_libraries(imgui_backends PRIVATE imgui SDL3::SDL3 dawn::webgpu_dawn)
++    if(MSCHARGED_GLES)
++        # Aurora's GLES renderer draws ImGui through imgui_impl_opengl3 on its
++        # OpenGL ES 3 context (core ES3 entry points from libGLESv2, no desktop
++        # GL loader). sdlrenderer3 stays for the launcher and the headless path.
++        add_library(imgui_backends STATIC
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_opengl3.cpp")
++        target_compile_features(imgui_backends PRIVATE cxx_std_20)
++        target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
++        find_library(MSCHARGED_GLESV2_LIBRARY GLESv2)
++        if(NOT MSCHARGED_GLESV2_LIBRARY)
++            set(MSCHARGED_GLESV2_LIBRARY GLESv2)  # the linker's own -lGLESv2 search
++        endif()
++        target_link_libraries(imgui_backends PRIVATE imgui SDL3::SDL3 "${MSCHARGED_GLESV2_LIBRARY}")
++    else()
++        add_library(imgui_backends STATIC
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_wgpu.cpp")
++        target_compile_features(imgui_backends PRIVATE cxx_std_20)
++        target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
++        target_link_libraries(imgui_backends PRIVATE imgui SDL3::SDL3 dawn::webgpu_dawn)
++    endif()
+     target_link_libraries(imgui PUBLIC imgui_backends)
+ endfunction()
+ 
+diff --git a/cmake/NativeVIDisplayGPU.cmake b/cmake/NativeVIDisplayGPU.cmake
+index b4ca88ec4f228e923429f92cb8ff4fbc069c7357..189c0989acbcfe990279ae7537b7a0a69c00fcb0 100644
+--- a/cmake/NativeVIDisplayGPU.cmake
++++ b/cmake/NativeVIDisplayGPU.cmake
+@@ -2,6 +2,11 @@ include_guard(GLOBAL)
+ if(NOT BUILD_TESTING OR NOT TARGET aurora_gx)
+     return()
+ endif()
++if(MSCHARGED_GLES)
++    # tests/native_vi_display_gpu.cpp reads the VI signal texture through WebGPU.
++    message(STATUS "GLES graphics backend: native_vi_display_gpu tests not built")
++    return()
++endif()
+ include(cmake/NativeVideoOutput.cmake)
+ 
+ # Use one target-local native VI provider, like the actual original main host.
+diff --git a/cmake/OriginalCreditsDiagnostic.cmake b/cmake/OriginalCreditsDiagnostic.cmake
+index c45c41771673319a141cd691ac601af75a2f64f7..ae4d7d93e04331f4af8e2439639c93d88fd32c96 100644
+--- a/cmake/OriginalCreditsDiagnostic.cmake
++++ b/cmake/OriginalCreditsDiagnostic.cmake
+@@ -241,56 +241,61 @@ else()
+ endif()
+ target_link_libraries(mscharged_original_credits_module PRIVATE mscharged_original_credits_focus)
+ 
+-# Target-local actual SDK VI provides original retrace callbacks/movie clocks.
+-# Its complete object resolves VI before the ordinary SDK archive; never whole
+-# link that archive here, which would add a second VI implementation.
+-add_library(mscharged_original_credits_vi OBJECT
+-    "${MSCHARGED_AURORA_PREPARED}/lib/dolphin/vi/vi.cpp")
+-add_dependencies(mscharged_original_credits_vi verify_prepared)
+-target_compile_features(mscharged_original_credits_vi PRIVATE cxx_std_20)
+-target_compile_definitions(mscharged_original_credits_vi PRIVATE
+-    AURORA_NATIVE_VIDEO=1 AURORA_WII_CLOCK=1 TARGET_PC=1)
+-target_compile_options(mscharged_original_credits_vi PRIVATE -ffunction-sections -fdata-sections)
+-target_link_libraries(mscharged_original_credits_vi PRIVATE aurora::vi)
++# tests/diagnostics/credits_window.cpp reads the EFB through WebGPU, so this
++# standalone check is not built with the GLES graphics backend.
++if(NOT MSCHARGED_GLES)
++    # Target-local actual SDK VI provides original retrace callbacks/movie clocks.
++    # Its complete object resolves VI before the ordinary SDK archive; never whole
++    # link that archive here, which would add a second VI implementation.
++    add_library(mscharged_original_credits_vi OBJECT
++        "${MSCHARGED_AURORA_PREPARED}/lib/dolphin/vi/vi.cpp")
++    add_dependencies(mscharged_original_credits_vi verify_prepared)
++    target_compile_features(mscharged_original_credits_vi PRIVATE cxx_std_20)
++    target_compile_definitions(mscharged_original_credits_vi PRIVATE
++        AURORA_NATIVE_VIDEO=1 AURORA_WII_CLOCK=1 TARGET_PC=1)
++    target_compile_options(mscharged_original_credits_vi PRIVATE -ffunction-sections -fdata-sections)
++    target_link_libraries(mscharged_original_credits_vi PRIVATE aurora::vi)
+ 
+-# One genuine SDK instance lives in the host. Export its actual hardware and
+-# metadata symbols to the hidden module, leaving host STL on the host allocator.
+-add_executable(mscharged-original-credits-check
+-    tests/diagnostics/credits_window.cpp
+-    src/platform/os.cpp
+-    src/platform/host_metadata.cpp
+-    src/platform/string_format.cpp
+-    src/platform/report.cpp
+-    src/platform/thread.cpp)
+-add_dependencies(mscharged-original-credits-check mscharged_original_credits_module)
+-target_compile_features(mscharged-original-credits-check PRIVATE cxx_std_20)
+-target_include_directories(mscharged-original-credits-check PRIVATE
+-    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${MSCHARGED_PREPARED}/include"
+-    "${MSCHARGED_PREPARED}/libs/RVL_SDK/include")
+-target_compile_definitions(mscharged-original-credits-check PRIVATE
+-    MSCHARGED_NATIVE=1 TARGET_PC=1 AURORA_WII_CLOCK=1
+-    MSCHARGED_CREDITS_MODULE_FILENAME="$<TARGET_FILE_NAME:mscharged_original_credits_module>")
+-target_compile_options(mscharged-original-credits-check PRIVATE
+-    -O2 -fno-inline -ffunction-sections -fdata-sections -fno-strict-aliasing -ffp-contract=off)
+-target_link_options(mscharged-original-credits-check PRIVATE -Wl,--gc-sections -Wl,--export-dynamic)
+-set_property(TARGET mscharged-original-credits-check PROPERTY LINK_LIBRARY_OVERRIDE
+-    "WHOLE_ARCHIVE,aurora_gx,aurora_mtx,aurora_os")
+-target_link_libraries(mscharged-original-credits-check PRIVATE
+-    mscharged_original_credits_vi
+-    "$<LINK_LIBRARY:WHOLE_ARCHIVE,aurora::gx,aurora::mtx,aurora::os>"
+-    aurora::core aurora::dvd charged_wii_string_format
+-    charged_native_system_settings charged_native_video_device charged_credits_movie_hardware
+-    Threads::Threads ${CMAKE_DL_LIBS})
++    # One genuine SDK instance lives in the host. Export its actual hardware and
++    # metadata symbols to the hidden module, leaving host STL on the host allocator.
++    add_executable(mscharged-original-credits-check
++        tests/diagnostics/credits_window.cpp
++        src/platform/os.cpp
++        src/platform/host_metadata.cpp
++        src/platform/string_format.cpp
++        src/platform/report.cpp
++        src/platform/thread.cpp)
++    add_dependencies(mscharged-original-credits-check mscharged_original_credits_module)
++    target_compile_features(mscharged-original-credits-check PRIVATE cxx_std_20)
++    target_include_directories(mscharged-original-credits-check PRIVATE
++        "${CMAKE_CURRENT_SOURCE_DIR}/src" "${MSCHARGED_PREPARED}/include"
++        "${MSCHARGED_PREPARED}/libs/RVL_SDK/include")
++    target_compile_definitions(mscharged-original-credits-check PRIVATE
++        MSCHARGED_NATIVE=1 TARGET_PC=1 AURORA_WII_CLOCK=1
++        MSCHARGED_CREDITS_MODULE_FILENAME="$<TARGET_FILE_NAME:mscharged_original_credits_module>")
++    target_compile_options(mscharged-original-credits-check PRIVATE
++        -O2 -fno-inline -ffunction-sections -fdata-sections -fno-strict-aliasing -ffp-contract=off)
++    target_link_options(mscharged-original-credits-check PRIVATE -Wl,--gc-sections -Wl,--export-dynamic)
++    set_property(TARGET mscharged-original-credits-check PROPERTY LINK_LIBRARY_OVERRIDE
++        "WHOLE_ARCHIVE,aurora_gx,aurora_mtx,aurora_os")
++    target_link_libraries(mscharged-original-credits-check PRIVATE
++        mscharged_original_credits_vi
++        "$<LINK_LIBRARY:WHOLE_ARCHIVE,aurora::gx,aurora::mtx,aurora::os>"
++        aurora::core aurora::dvd charged_wii_string_format
++        charged_native_system_settings charged_native_video_device charged_credits_movie_hardware
++        Threads::Threads ${CMAKE_DL_LIBS})
++
++    # An owned image and desktop GPU are explicit inputs, never part of portable CI.
++    set(MSCHARGED_CREDITS_TEST_DISC "" CACHE FILEPATH "Owned ISO/RVZ for the opt-in original Credits Vulkan test")
++    if(BUILD_TESTING AND MSCHARGED_TEST_VULKAN AND MSCHARGED_CREDITS_TEST_DISC)
++        add_test(NAME original_credits_vulkan COMMAND mscharged-original-credits-check
++            --disc "${MSCHARGED_CREDITS_TEST_DISC}")
++        set_tests_properties(original_credits_vulkan PROPERTIES
++            TIMEOUT 70 LABELS "gpu;vulkan;owned-data" RESOURCE_LOCK gx_check
++            ENVIRONMENT "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
++            FAIL_REGULAR_EXPRESSION "VUID-|Validation Error|Original Credits gate:")
++    endif()
+ 
+-# An owned image and desktop GPU are explicit inputs, never part of portable CI.
+-set(MSCHARGED_CREDITS_TEST_DISC "" CACHE FILEPATH "Owned ISO/RVZ for the opt-in original Credits Vulkan test")
+-if(BUILD_TESTING AND MSCHARGED_TEST_VULKAN AND MSCHARGED_CREDITS_TEST_DISC)
+-    add_test(NAME original_credits_vulkan COMMAND mscharged-original-credits-check
+-        --disc "${MSCHARGED_CREDITS_TEST_DISC}")
+-    set_tests_properties(original_credits_vulkan PROPERTIES
+-        TIMEOUT 70 LABELS "gpu;vulkan;owned-data" RESOURCE_LOCK gx_check
+-        ENVIRONMENT "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation"
+-        FAIL_REGULAR_EXPRESSION "VUID-|Validation Error|Original Credits gate:")
+ endif()
+ 
+ # Same initialized source state, entered through original main.
+diff --git a/cmake/OriginalLoadingDiagnostic.cmake b/cmake/OriginalLoadingDiagnostic.cmake
+index 59e40968f33b689ed8aa61d1b4712bc3b8fe961a..a4c8138e84b2ac94982cdb5cb5097157cadb1d59 100644
+--- a/cmake/OriginalLoadingDiagnostic.cmake
++++ b/cmake/OriginalLoadingDiagnostic.cmake
+@@ -7,6 +7,11 @@ option(MSCHARGED_BUILD_ORIGINAL_LOADING_DIAGNOSTIC "Build the original loading s
+ if(NOT MSCHARGED_BUILD_ORIGINAL_LOADING_DIAGNOSTIC)
+     return()
+ endif()
++if(MSCHARGED_GLES)
++    # tests/diagnostics/original_loading_window.cpp reads the EFB through WebGPU.
++    message(STATUS "GLES graphics backend: original loading diagnostic not built")
++    return()
++endif()
+ if(NOT TARGET mscharged_original_main_credits_module)
+     message(FATAL_ERROR "The original loading diagnostic requires the original-main source graph")
+ endif()
+diff --git a/src/platform/graphics_backend.h b/src/platform/graphics_backend.h
+index d13fe40e22f4807d9a323bb9b651d1d977b42cf9..6e5f65801674976cc99c80c88c77857bfa9b95a8 100644
+--- a/src/platform/graphics_backend.h
++++ b/src/platform/graphics_backend.h
+@@ -3,7 +3,12 @@
+ 
+ namespace mscharged::platform
+ {
+-#if defined(__APPLE__)
++#if defined(MSCHARGED_GRAPHICS_GLES)
++// GLES graphics backend (CMake MSCHARGED_GRAPHICS_BACKEND=gles): Aurora renders
++// through OpenGL ES 3 and has no Dawn/WebGPU device.
++inline constexpr AuroraBackend NativeGraphicsBackend = BACKEND_OPENGLES;
++inline constexpr const char* NativeGraphicsBackendName = "OpenGL ES";
++#elif defined(__APPLE__)
+ inline constexpr AuroraBackend NativeGraphicsBackend = BACKEND_METAL;
+ inline constexpr const char* NativeGraphicsBackendName = "Metal";
+ #else
+diff --git a/src/runtime/frame_aurora.cpp b/src/runtime/frame_aurora.cpp
+index 1080458428b46cc8ee14ebb37a88abb47aa44849..0f9ebf8db7cf94da88379722e0fd63ac400668c4 100644
+--- a/src/runtime/frame_aurora.cpp
++++ b/src/runtime/frame_aurora.cpp
+@@ -2,6 +2,9 @@
+ #include "runtime/views.h"
+ #include <aurora/aurora.h>
+ #include <aurora/gfx.hpp>
++#if defined(MSCHARGED_GRAPHICS_GLES)
++#include <aurora/gl.hpp>
++#endif
+ #include <dolphin/gx.h>
+ #include <dolphin/gx/GXAurora.h>
+ #include <SDL3/SDL.h>
+@@ -40,6 +43,10 @@ void AuroraFrames::WaitIdle()
+ {
+     if (open_) throw std::logic_error("GPU completion requires closing the current host frame first");
+     Drain();
++#if defined(MSCHARGED_GRAPHICS_GLES)
++    // GLES: the render worker has drained (Drain); glFinish on it completes the GPU side.
++    aurora::gl_public::finish_gpu();
++#else
+     auto done = std::make_shared<std::atomic_int>(0);
+     aurora::gfx::queue().OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+         [done](wgpu::QueueWorkDoneStatus status, wgpu::StringView) {
+@@ -52,6 +59,7 @@ void AuroraFrames::WaitIdle()
+         SDL_Delay(1);
+     }
+     if (*done != 1) throw std::runtime_error("Graphics queue completion failed or timed out");
++#endif
+ }
+ void AuroraFrames::Cancel() noexcept
+ {
+diff --git a/src/runtime/gpu_readback.cpp b/src/runtime/gpu_readback.cpp
+index d016195f4763951f9957dec04e7f15d7289e4125..580baabdefd5cd1e31095f3c7939a6de55537721 100644
+--- a/src/runtime/gpu_readback.cpp
++++ b/src/runtime/gpu_readback.cpp
+@@ -1,6 +1,9 @@
+ #include "runtime/gpu_readback.h"
+ #include <aurora/aurora.h>
+ #include <aurora/gfx.hpp>
++#if defined(MSCHARGED_GRAPHICS_GLES)
++#include <aurora/gl.hpp>
++#endif
+ #include <SDL3/SDL.h>
+ #include <algorithm>
+ #include <atomic>
+@@ -8,6 +11,59 @@
+ #include <memory>
+ #include <stdexcept>
+ 
++#if defined(MSCHARGED_GRAPHICS_GLES)
++namespace mscharged
++{
++namespace
++{
++constexpr unsigned samples = 9;
++struct Readback
++{
++    aurora::gfx::ResolvedTargets target;
++    ColourSamples colours{};
++    std::atomic_int done = 0;
++    // Runs on the render worker between passes, while the resolved EFB snapshot
++    // (valid for the current frame only) is still alive: glReadPixels per sample.
++    static void Copy(const aurora::gfx::EncoderTaskContext &, const void *, std::size_t, void *data)
++    {
++        auto &read = *static_cast<Readback *>(data);
++        for (unsigned i = 0; i < samples; ++i)
++        {
++            if (!aurora::gl_public::read_texture_rgba8(read.target.color, read.target.height,
++                                                       read.target.width * (i % 3 + 1) / 4,
++                                                       read.target.height * (i / 3 + 1) / 4, 1, 1,
++                                                       read.colours[i].data(), 4))
++            {
++                read.done = -1;
++                return;
++            }
++        }
++        read.done = 1;
++    }
++};
++} // namespace
++ColourSamples EndFrameAndReadColours(const std::function<void()>& end_frame)
++{
++    // The task writes into this object; it has finished once synchronize() returns.
++    auto read = std::make_shared<Readback>();
++    if (!aurora::gfx::resolve_pass({}, read->target) || !read->target.color)
++        throw std::runtime_error("Cannot snapshot diagnostic EFB");
++    // GLES targets are RGBA8; read_texture_rgba8 returns RGBA order.
++    const aurora::gfx::EncoderTaskDescriptor descriptor{"Diagnostic colour readback", Readback::Copy, read.get()};
++    const auto task = aurora::gfx::register_encoder_task_type(descriptor);
++    const bool queued = aurora::gfx::push_encoder_task(task, nullptr, 0);
++    if (end_frame) end_frame();
++    else aurora_end_frame();
++    aurora::gfx::synchronize();
++    aurora::gfx::unregister_encoder_task_type(task);
++    if (!queued)
++        throw std::runtime_error("Cannot enqueue diagnostic colour readback");
++    if (read->done != 1)
++        throw std::runtime_error("Diagnostic colour readback failed or timed out");
++    return read->colours;
++}
++} // namespace mscharged
++#else
+ namespace mscharged
+ {
+ namespace
+@@ -94,3 +150,4 @@ ColourSamples EndFrameAndReadColours(const std::function<void()>& end_frame)
+     return read->colours;
+ }
+ } // namespace mscharged
++#endif
+diff --git a/src/runtime/gx_check.cpp b/src/runtime/gx_check.cpp
+index a69944405bbe2af9b23575e93dac91d403eab4a9..5c7192f325717ce6a6d3c6438bca513a7e109cfa 100644
+--- a/src/runtime/gx_check.cpp
++++ b/src/runtime/gx_check.cpp
+@@ -12,7 +12,7 @@
+ #include <dolphin/vi.h>
+ #include <SDL3/SDL.h>
+ #include <SDL3/SDL_main.h>
+-#ifdef WEBGPU_DAWN
++#if defined(WEBGPU_DAWN) && !defined(MSCHARGED_GRAPHICS_GLES)
+ #include <dawn/native/DawnNative.h>
+ #include <webgpu/gpu.hpp>
+ #endif
+@@ -162,7 +162,7 @@ int main(int argc, char** argv)
+         if (!info.window || info.backend != mscharged::platform::NativeGraphicsBackend)
+             throw std::runtime_error(std::string("Requested ") + mscharged::platform::NativeGraphicsBackendName
+                 + " is unavailable; the diagnostic cannot pass on a fallback backend");
+-#ifdef WEBGPU_DAWN
++#if defined(WEBGPU_DAWN) && !defined(MSCHARGED_GRAPHICS_GLES)
+         // Exercise the actual requested device in both debug-layer modes.
+         // Disabling backend debug layers must retain WebGPU validation and
+         // robust buffer/shader access in Release as well as Debug builds.
+@@ -212,7 +212,15 @@ int main(int argc, char** argv)
+         aurora_shutdown();
+         session.live = false;
+         constexpr std::uint32_t expected_depth = static_cast<std::uint32_t>(0.3*GX_MAX_Z24+0.5);
+-        if (errors || !draws || depth < expected_depth-32 || depth > expected_depth+32 || (!interactive && rendered < frames)
++#if defined(MSCHARGED_GRAPHICS_GLES)
++        // GLES limitation: the GL Aurora has no depth peek (GXPeekZ reads nothing),
++        // so the geometry depth is not verified in this mode.
++        constexpr bool depth_peek = false;
++#else
++        constexpr bool depth_peek = true;
++#endif
++        if (errors || !draws || (depth_peek && (depth < expected_depth-32 || depth > expected_depth+32))
++            || (!interactive && rendered < frames)
+             || (resize && (!resize_events || !resized)))
+             throw std::runtime_error("GX check incomplete: frames=" + std::to_string(rendered)
+                 + ", draws=" + std::to_string(draws) + ", depth=" + std::to_string(depth)
+diff --git a/src/runtime/original_main_credits.cpp b/src/runtime/original_main_credits.cpp
+index 72bc012d949311aacd976a03e310a572dd4d033e..c1cfb251b68dffa4c458a4276acdd3e254b9bb3c 100644
+--- a/src/runtime/original_main_credits.cpp
++++ b/src/runtime/original_main_credits.cpp
+@@ -30,6 +30,9 @@
+ #include <dolphin/os.h>
+ #include <dolphin/vi.h>
+ #include "webgpu/gpu.hpp"
++#if defined(MSCHARGED_GRAPHICS_GLES)
++#include <aurora/gl.hpp>
++#endif
+ #include "platform/stm_device.h"
+ #include "platform/ios_device.h"
+ #include "platform/hardware_owner.h"
+@@ -78,6 +81,27 @@ namespace {
+ // hands bytes to the worker. Bound that backlog between source frames.
+ constexpr std::uint32_t kFifoDrainBytes=64u<<20;
+ void Check(bool value, const char* reason) { if (!value) throw std::runtime_error(reason); }
++#if defined(MSCHARGED_GRAPHICS_GLES)
++// GLES: the EFB snapshot is read with glReadPixels on the render worker, from an
++// encoder task that runs while the resolved (current frame only) texture lives.
++struct Snapshot {
++    aurora::gfx::ResolvedTargets target;
++    std::atomic_int done{0};
++    std::vector<unsigned char> rgb;
++    static void Copy(const aurora::gfx::EncoderTaskContext&,const void*,std::size_t,void* p) {
++        auto& self=*static_cast<Snapshot*>(p);
++        std::vector<std::uint8_t> rgba(std::size_t(self.target.width)*self.target.height*4);
++        if(!aurora::gl_public::read_texture_rgba8(self.target.color,self.target.height,0,0,self.target.width,
++                                                  self.target.height,rgba.data(),rgba.size())) {
++            self.done=-1;return;
++        }
++        for(std::size_t i=0;i<std::size_t(self.target.width)*self.target.height;++i) {
++            self.rgb[3*i]=rgba[4*i];self.rgb[3*i+1]=rgba[4*i+1];self.rgb[3*i+2]=rgba[4*i+2];
++        }
++        self.done=1;
++    }
++};
++#else
+ struct Snapshot : std::enable_shared_from_this<Snapshot> {
+     aurora::gfx::ResolvedTargets target;
+     wgpu::Buffer buffer;
+@@ -108,6 +132,7 @@ struct Snapshot : std::enable_shared_from_this<Snapshot> {
+         });
+     }
+ };
++#endif
+ // Counters for the opt-in frame timing log. Aurora's render worker updates the
+ // statistics; aligned relaxed loads suffice for this diagnostic.
+ mscharged::runtime::FrameTimingCounters ReadFrameTimingCounters() {
+@@ -144,9 +169,23 @@ void ReadSelectedXFB(const AuroraVIPresentedState& presented,
+           "Selected original XFB has no completed source GX copy");
+     Check(copy->width==640 && copy->height==448 && copy->stride==1280,
+           "Native selected XFB copy does not preserve original source geometry");
++#if defined(MSCHARGED_GRAPHICS_GLES)
++    Check(copy->packedYuyv && copy->packedYuyv->format==aurora::gl::TextureFormat::RGBA8Unorm &&
++#else
+     Check(copy->packedYuyv && copy->packedYuyv->format==wgpu::TextureFormat::RGBA8Unorm &&
++#endif
+           copy->packedYuyv->size.width==copy->width/2 && copy->packedYuyv->size.height==copy->height,
+           "Selected XFB does not retain packed source YUYV output");
++#if defined(MSCHARGED_GRAPHICS_GLES)
++    // The packed YUYV snapshot is a persistent RGBA8 texture of width/2 by height. The read
++    // marshals to the render worker (pumping hardware interrupts while it waits).
++    const unsigned pitch=(copy->width/2)*4;
++    std::vector<unsigned char> packedBytes(std::size_t(pitch)*copy->height);
++    Check(aurora::gl_public::read_texture_rgba8(copy->packedYuyv->texture.id,copy->height,0,0,copy->width/2,
++              copy->height,packedBytes.data(),packedBytes.size()),
++          "Selected source XFB GPU readback failed");
++    const auto* bytes=packedBytes.data();
++#else
+     const unsigned pitch=(copy->stride+255)&~255u;
+     auto device=aurora::gfx::device();
+     const wgpu::BufferDescriptor desc{.usage=wgpu::BufferUsage::MapRead|wgpu::BufferUsage::CopyDst,
+@@ -169,6 +208,7 @@ void ReadSelectedXFB(const AuroraVIPresentedState& presented,
+     }
+     Check(result->done.load(std::memory_order_acquire)==1, "Selected source XFB GPU readback failed");
+     const auto* bytes=static_cast<const unsigned char*>(buffer.GetConstMappedRange(0,desc.size));
++#endif
+     std::vector<unsigned char> rgb(std::size_t(copy->width)*copy->height*3);
+     auto channel=[](int value) { return static_cast<unsigned char>(std::clamp(value,0,255)); };
+     unsigned lit=0;
+@@ -186,7 +226,9 @@ void ReadSelectedXFB(const AuroraVIPresentedState& presented,
+     }
+     aurora_service_hardware_interrupts();
+     // Original fades and transitions can legitimately present an all-black frame.
++#if !defined(MSCHARGED_GRAPHICS_GLES)
+     buffer.Unmap();
++#endif
+ #if defined(_WIN32)
+     auto* file=_wfopen(output.c_str(),L"wb");
+ #else
+@@ -211,6 +253,17 @@ void ReadSelectedXFB(const AuroraVIPresentedState& presented,
+ void EndWithSnapshot(const std::filesystem::path& output) {
+     auto s=std::make_shared<Snapshot>();
+     Check(aurora::gfx::resolve_pass({},s->target),"Cannot resolve actual original Credits EFB");
++#if defined(MSCHARGED_GRAPHICS_GLES)
++    Check(s->target.color,"Unsupported snapshot color target");
++    s->rgb.resize(std::size_t(s->target.width)*s->target.height*3);
++    const aurora::gfx::EncoderTaskDescriptor d{"Original Credits diagnostic snapshot",Snapshot::Copy,s.get()};
++    const auto task=aurora::gfx::register_encoder_task_type(d);
++    const bool queued=aurora::gfx::push_encoder_task(task,nullptr,0);
++    aurora_end_frame();aurora::gfx::synchronize();aurora::gfx::unregister_encoder_task_type(task);
++    Check(queued,"Actual EFB snapshot task rejected");
++    // The encoder task ran on the render worker before synchronize returned.
++    Check(s->done==1,"Original Credits GPU readback did not complete");
++#else
+     Check(s->target.colorFormat==wgpu::TextureFormat::BGRA8Unorm || s->target.colorFormat==wgpu::TextureFormat::RGBA8Unorm,"Unsupported snapshot color format");
+     s->stride=(s->target.width*4+255)&~255u;
+     s->rgb.resize(std::size_t(s->target.width)*s->target.height*3);
+@@ -222,6 +275,7 @@ void EndWithSnapshot(const std::filesystem::path& output) {
+     const auto end=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+     while(!s->done && std::chrono::steady_clock::now()<end){aurora::gfx::device().Tick();std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+     Check(s->done==1,"Original Credits GPU readback did not complete");
++#endif
+ #if defined(_WIN32)
+     auto* f=_wfopen(output.c_str(),L"wb");
+ #else
+@@ -712,7 +766,11 @@ int mscharged::RunOriginalMainCredits(int argc, char** argv,
+         mscharged::runtime::FrameRateTitle frameRateTitle(windowTitle);
+         // Opt-in MSCHARGED_FRAME_LOG: per-frame timing for performance reports.
+         const auto frameTiming=mscharged::runtime::FrameTimingLog::FromEnvironment();
++#if defined(MSCHARGED_GRAPHICS_GLES)
++        std::uint32_t retainedEFB=0;
++#else
+         wgpu::Texture retainedEFB;
++#endif
+         Check(!resizeCheck || nativeSend, "Resize qualification requires source-native send");
+         while(!exit && (interactive || !snapshot)) {
+             for(const auto* event=aurora_update();event->type!=AURORA_NONE;++event) {
+@@ -810,9 +868,15 @@ int mscharged::RunOriginalMainCredits(int argc, char** argv,
+                           efbHeight>=448 && efb.size.width==efbWidth && efb.size.height==efbHeight),
+                           "Window resize changed original source EFB geometry");
+                     if(resizeCheck && efbScale>0.0f) {
++#if defined(MSCHARGED_GRAPHICS_GLES)
++                        if(retainedEFB) Check(efb.texture.id==retainedEFB,
++                                             "Output resize replaced the original source EFB texture");
++                        else retainedEFB=efb.texture.id;
++#else
+                         if(retainedEFB) Check(efb.texture.Get()==retainedEFB.Get(),
+                                              "Output resize replaced the original source EFB texture");
+                         else retainedEFB=efb.texture;
++#endif
+                     }
+                     const auto viewport=aurora::webgpu::calculate_present_viewport(
+                         size.native_fb_width,size.native_fb_height,aspectWidth,aspectHeight);
+diff --git a/src/runtime/scene.cpp b/src/runtime/scene.cpp
+index ad46303f83cb008dcd8179a7edb34d78590913fa..5de6064f39f9e5d89bd35ec0c0601c203d08af19 100644
+--- a/src/runtime/scene.cpp
++++ b/src/runtime/scene.cpp
+@@ -482,14 +482,22 @@ int RunScenePreview(int argc, char** argv, const std::filesystem::path& config_p
+             : options.frontend_options ? "Mario Strikers Charged | Options"
+             : options.frontend_main ? "Mario Strikers Charged | Main Menu" : "Mario Strikers Charged | Static asset preview";
+         config.userPath = config.cachePath = data_path.c_str(); config.resourcesPath = base;
+-        config.desiredBackend = BACKEND_VULKAN; config.enableBackendValidation = true;
++#if defined(MSCHARGED_GRAPHICS_GLES)
++        constexpr AuroraBackend kPreviewBackend = BACKEND_OPENGLES;
++        constexpr const char* kPreviewBackendName = "OpenGL ES";
++#else
++        constexpr AuroraBackend kPreviewBackend = BACKEND_VULKAN;
++        constexpr const char* kPreviewBackendName = "Vulkan";
++#endif
++        config.desiredBackend = kPreviewBackend; config.enableBackendValidation = true;
+         config.windowWidth = settings.width; config.windowHeight = settings.height; config.windowPosX = config.windowPosY = -1;
+         config.vsync = true; config.logLevel = LOG_WARNING; config.logCallback = BackendLog;
+         config.mem1Size = MEM1_DEFAULT_SIZE; config.mem2Size = 64 * 1024 * 1024;
+         backend_errors = 0;
+         Session session;
+         const auto info = aurora_initialize(argc, argv, &config); session.live = true;
+-        if (!info.window || info.backend != BACKEND_VULKAN) throw std::runtime_error("Static preview requires the actual Vulkan backend");
++        if (!info.window || info.backend != kPreviewBackend)
++            throw std::runtime_error(std::string("Static preview requires the actual ") + kPreviewBackendName + " backend");
+         if (!SDL_SetWindowFullscreen(info.window, settings.fullscreen))
+             throw std::runtime_error(std::string("Cannot apply launch window mode: ") + SDL_GetError());
+         ImGui::GetIO().IniFilename = nullptr; ImGui::GetIO().LogFilename = nullptr;
+diff --git a/tools/prepare_gles_sources.py b/tools/prepare_gles_sources.py
+new file mode 100755
+index 0000000000000000000000000000000000000000..cd46d6635134c53934e879711e12796782069ea7
+--- /dev/null
++++ b/tools/prepare_gles_sources.py
+@@ -0,0 +1,89 @@
++#!/usr/bin/env python3
++"""prepare_sources.py plus an extra Aurora patch series for the GLES graphics backend.
++
++Takes the same arguments as prepare_sources.py and one more,
++--aurora-extra-patch-dir DIR (or the AURORA_EXTRA_PATCH_DIR environment variable).
++The series in DIR (a `series` file listing patches, one per line; an optional `base`
++file must match the pinned Aurora commit) is applied after patches/aurora and its
++optional tweaks series. Other dependencies are prepared exactly as before.
++prepare_sources.py itself is not modified."""
++from __future__ import annotations
++
++import os
++from pathlib import Path
++import sys
++
++import prepare_sources as base
++
++
++def extract_extra_dir(argv: list[str]) -> tuple[list[str], Path | None]:
++    rest, directory, index = [], os.environ.get("AURORA_EXTRA_PATCH_DIR"), 0
++    while index < len(argv):
++        argument = argv[index]
++        if argument == "--aurora-extra-patch-dir":
++            if index + 1 >= len(argv):
++                raise SystemExit("--aurora-extra-patch-dir requires a directory")
++            directory = argv[index + 1]
++            index += 2
++        elif argument.startswith("--aurora-extra-patch-dir="):
++            directory = argument.split("=", 1)[1]
++            index += 1
++        else:
++            rest.append(argument)
++            index += 1
++    return rest, Path(directory).resolve() if directory else None
++
++
++def extra_series(directory: Path, commit: str):
++    if not (directory / "series").is_file():
++        raise base.PreparationError(f"No series file in the extra Aurora patch directory: {directory}")
++    base_file = directory / "base"
++    if base_file.is_file():
++        # The GLES series sits on the Charged patches, so its base is the same pin.
++        recorded = base_file.read_text().strip()
++        if recorded != commit:
++            raise base.PreparationError(
++                f"Patch base for {directory.name} is {recorded}; selected pin is {commit}. Refresh the series explicitly.")
++        patches, series_sha = base.series_inputs(directory, directory.name, commit, prefix=f"{directory.name}/")
++    else:
++        # series_inputs insists on a base file; without one the series is taken to sit on the pin.
++        series = (directory / "series").read_bytes()
++        patches = []
++        for line in series.decode().splitlines():
++            name = line.strip()
++            if not name or name.startswith("#"):
++                continue
++            path = base.safe_child(directory, name)
++            full = f"{directory.name}/{name}"
++            if any(p["name"] == full for p in patches):
++                raise base.PreparationError(f"Duplicate patch in series: {name}")
++            patches.append({"name": full, "sha256": base.sha(path.read_bytes()), "file": path})
++        series_sha = base.sha(series)
++    return patches, series_sha
++
++
++def install(directory: Path) -> None:
++    original = base.patch_inputs
++
++    def patch_inputs(root: Path, name: str, commit: str):
++        patches, series_sha = original(root, name, commit)
++        if name != "aurora":
++            return patches, series_sha
++        extra, extra_sha = extra_series(directory, commit)
++        return patches + extra, base.sha(base.encoded([series_sha, extra_sha]))
++
++    base.patch_inputs = patch_inputs
++
++
++def main() -> None:
++    argv, directory = extract_extra_dir(sys.argv[1:])
++    if directory is not None:
++        install(directory)
++    sys.argv = [sys.argv[0], *argv]
++    base.main()
++
++
++if __name__ == "__main__":
++    if sys.version_info < (3, 10):
++        raise SystemExit("Source preparation requires Python 3.10 or newer")
++    main()
+diff --git a/tools/setup_dependencies.py b/tools/setup_dependencies.py
+index 4a50d5aecf4c02e6c9506055b02b8ac6b3baf3df..a0dda826e6391b7c0c235852aa47ec81baddecf0 100644
+--- a/tools/setup_dependencies.py
++++ b/tools/setup_dependencies.py
+@@ -44,9 +44,17 @@ def git(repo: Path, *args: str) -> str:
+     return result.stdout
+ 
+ 
+-def plan(launcher: bool, system: str):
++def plan(launcher: bool, system: str, graphics_backend: str = "vulkan"):
+     if launcher:
+         return LAUNCHER, ()
++    if graphics_backend == "gles":
++        # GLES Aurora: no Dawn. Abseil comes from its own pin instead of Dawn's.
++        if system != "Linux":
++            raise SetupError("The GLES graphics backend is currently built on Linux only.")
++        direct = tuple(path for path in RUNTIME if path != "extern/dawn") + ("extern/abseil-cpp",)
++        return direct, (("extern/freetype", ("subprojects/dlg",)),)
++    if graphics_backend != "vulkan":
++        raise SetupError(f"Unknown graphics backend: {graphics_backend}")
+     if system not in ("Linux", "Darwin"):
+         raise SetupError("The current game runtime selects Linux/Vulkan or macOS/Metal. "
+                          "Use --launcher for the smaller launcher build.")
+@@ -116,11 +124,11 @@ def verify(repo: Path, expected: dict[str, str]) -> None:
+ 
+ 
+ def setup(repo: Path, *, launcher: bool = False, system: str | None = None,
+-          dry_run: bool = False) -> None:
++          dry_run: bool = False, graphics_backend: str = "vulkan") -> None:
+     repo = repo.resolve()
+     if Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve() != repo:
+         raise SetupError("Run the helper from a Git checkout of mscharged-port")
+-    direct, nested = plan(launcher, system or platform.system())
++    direct, nested = plan(launcher, system or platform.system(), graphics_backend)
+     expected = pins(repo, direct)
+     check_gitmodules(repo, direct)
+     # Inspect every already initialized selected checkout before changing any.
+@@ -150,10 +158,13 @@ def setup(repo: Path, *, launcher: bool = False, system: str | None = None,
+ def main() -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--launcher", action="store_true", help="Initialize only the smaller launcher build's dependencies")
++    parser.add_argument("--graphics-backend", choices=("vulkan", "gles"), default="vulkan",
++                        help="Select the dependencies of the graphics backend (gles skips Dawn and adds Abseil)")
+     parser.add_argument("--dry-run", action="store_true", help="Check existing tracked edits and print the selected Git commands")
+     args = parser.parse_args()
+     try:
+-        setup(Path(__file__).resolve().parents[1], launcher=args.launcher, dry_run=args.dry_run)
++        setup(Path(__file__).resolve().parents[1], launcher=args.launcher, dry_run=args.dry_run,
++              graphics_backend=args.graphics_backend)
+     except (SetupError, OSError) as error:
+         print(f"Dependency setup failed: {error}", file=sys.stderr)
+         return 1

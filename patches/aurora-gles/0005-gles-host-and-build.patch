@@ -1,0 +1,3948 @@
+diff --git a/cmake/AuroraDependencyVersions.cmake b/cmake/AuroraDependencyVersions.cmake
+index 50d2c14b0f2e527efd845bbd6041a55c71a8acae..eb189106be3ab3e664f8efb03a4e2275ecd514ad 100644
+--- a/cmake/AuroraDependencyVersions.cmake
++++ b/cmake/AuroraDependencyVersions.cmake
+@@ -13,10 +13,6 @@ macro(_aurora_dependency_version name value doc)
+ endmacro()
+ 
+ # Dependency versions
+-_aurora_dependency_version(AURORA_DAWN_VERSION "v20260807.225922" "Dawn prebuilt version tag (https://github.com/encounter/dawn/releases)"
+-        "v20260523.201736" "v20260603.191052" "v20260618.032059") # Previous versions
+-_aurora_dependency_version(AURORA_DAWN_REF "1155e0ed531126f33a1279afa029349651ca1c93" "Dawn commit ref (https://github.com/encounter/dawn)"
+-        "9aa45f938d4b36626722bbfdc2f18447179337e6" "13abc3bc8ea2d3c2050f9e77a12d012108ceee24" "266c1cf8de969a364afa4fa49311631fc99a881e") # Previous versions
+ _aurora_dependency_version(AURORA_SDL3_VERSION "3.4.10" "SDL3 prebuilt version tag (https://github.com/libsdl-org/SDL/releases)")
+ _aurora_dependency_version(AURORA_SDL3_REF "refs/tags/release-3.4.10" "SDL3 commit ref (https://github.com/libsdl-org/SDL)")
+ _aurora_dependency_version(AURORA_NOD_VERSION "v2.0.0-alpha.12" "nod version tag (https://github.com/encounter/nod/releases)"
+diff --git a/cmake/aurora_core.cmake b/cmake/aurora_core.cmake
+index 4534e60fa6e6a3775b4564a65643c838c140f7b3..1ca7b4c7f6cb8938e35ce2b8dc934da5a3d5250c 100644
+--- a/cmake/aurora_core.cmake
++++ b/cmake/aurora_core.cmake
+@@ -87,43 +87,26 @@ if (AURORA_ENABLE_RMLUI)
+ endif ()
+ 
+ if (AURORA_ENABLE_GX)
+-    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX WEBGPU_DAWN)
++    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX)
++    # Hand-rolled GLES backend. Dawn (lib/dawn/, lib/webgpu/gpu*.cpp) is gone; the
++    # GL device layer (lib/gl/device.cpp) implements the historical aurora::webgpu
++    # interface directly against OpenGLES. gpu_prof/sdl2shim_present keep their
++    # files (Tracy stub / device EFB present) with the Dawn touchpoints removed.
+     target_sources(aurora_core PRIVATE
+-            lib/webgpu/gpu.cpp
+-            lib/webgpu/gpu_cache.cpp
+             lib/webgpu/gpu_prof.cpp
+-            lib/dawn/BackendBinding.cpp
+-            lib/dawn/TracyPlatform.cpp
++            lib/webgpu/sdl2shim_present.cpp
++            lib/gl/device.cpp
++            lib/gl/gl_loader.cpp
++            lib/gl/context.cpp
++            lib/gl/backend.cpp
++            lib/gl/pass.cpp
++            lib/gl/program.cpp
++            lib/gl/binary_cache.cpp
++            lib/gl/census.cpp
++            lib/gl/textures.cpp
++            lib/gl/buffers.cpp
++            lib/gl/fbo_cache.cpp
++            lib/gl/state.cpp
++            lib/gl/public_api.cpp
+     )
+-    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
+-        set_source_files_properties(lib/dawn/TracyPlatform.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
+-    endif ()
+-    target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)
+-    if (DAWN_ENABLE_VULKAN)
+-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_VULKAN)
+-    endif ()
+-    if (DAWN_ENABLE_METAL)
+-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_METAL)
+-        target_sources(aurora_core PRIVATE lib/dawn/MetalBinding.mm)
+-        set_source_files_properties(lib/dawn/MetalBinding.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+-        target_link_options(aurora_core PUBLIC "LINKER:-weak_framework,Metal")
+-    endif ()
+-    if (DAWN_ENABLE_D3D11)
+-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_D3D11)
+-    endif ()
+-    if (DAWN_ENABLE_D3D12)
+-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_D3D12)
+-    endif ()
+-    if (DAWN_ENABLE_DESKTOP_GL OR DAWN_ENABLE_OPENGLES)
+-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_OPENGL)
+-        if (DAWN_ENABLE_DESKTOP_GL)
+-            target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_DESKTOP_GL)
+-        endif ()
+-        if (DAWN_ENABLE_OPENGLES)
+-            target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_OPENGLES)
+-        endif ()
+-    endif ()
+-    if (DAWN_ENABLE_NULL)
+-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_NULL)
+-    endif ()
+ endif ()
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index 5194cfc6034ae51d22cf5ad48aee6b849e0ef98e..5434d38c9e5bbb8a1efcf04a1e99fa160fb183fe 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -9,7 +9,6 @@ add_library(aurora_gx STATIC
+         lib/gfx/recording.cpp
+         lib/gfx/render_worker.cpp
+         lib/gfx/resource_cache.cpp
+-        lib/gfx/dds_io.cpp
+         lib/gfx/tex_copy_conv.cpp
+         lib/gfx/tex_palette_conv.cpp
+         lib/gfx/texture.cpp
+@@ -53,9 +52,10 @@ add_library(aurora_gx STATIC
+ add_library(aurora::gx ALIAS aurora_gx)
+ set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
+ 
+-target_link_libraries(aurora_gx PUBLIC aurora::core dawn::webgpu_dawn xxHash::xxhash)
++target_link_libraries(aurora_gx PUBLIC aurora::core xxHash::xxhash)
+ target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient PNG::PNG)
+-target_compile_definitions(aurora_gx PRIVATE WEBGPU_DAWN)
++# aurora_core (GL device layer) and aurora_gx reference one another; let CMake repeat both on static link lines.
++set_property(TARGET aurora_core aurora_gx PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
+ if (AURORA_WII_LIGHTING)
+     target_compile_definitions(aurora_gx PRIVATE AURORA_WII_LIGHTING=1)
+ endif ()
+diff --git a/extern/CMakeLists.txt b/extern/CMakeLists.txt
+index ee06d59da2d64bf743a4c36a4cef45ca92a12f3d..f2f20fbf974f1720642d2e31383b0d4b5bca6d27 100644
+--- a/extern/CMakeLists.txt
++++ b/extern/CMakeLists.txt
+@@ -13,13 +13,12 @@ function(aurora_find_package_global)
+   find_package(${ARGV} GLOBAL)
+ endfunction()
+ 
+-if (AURORA_ENABLE_GX)
+-  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
+-  set(AURORA_DAWN_IS_SHARED "${AURORA_DAWN_IS_SHARED}" PARENT_SCOPE)
+-endif ()
++# Dawn removed: the hand-rolled GLES backend (lib/gl/) replaces it. The provider
++# (which fetched + built Dawn and vendored Abseil) is gone; Abseil is fetched
++# standalone below.
+ 
+-# Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
+-# Otherwise prefer a system package and only fetch it as a last resort.
++# Abseil is needed for core libraries. It normally came via Dawn's vendor build;
++# now prefer a system package and fetch it standalone as a fallback.
+ if (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree)
+   aurora_find_package_global(absl CONFIG QUIET GLOBAL)
+ endif ()
+@@ -243,13 +242,27 @@ if (AURORA_ENABLE_GX)
+     )
+     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
+ 
++    # The Dawn WebGPU imgui backend is gone; the GLES backend renders via
++    # imgui_impl_opengl3 ("#version 300 es"). imgui_impl_sdl3 is the platform backend
++    # (input/timing); imgui_impl_sdlrenderer3 stays for the headless/NULL backend.
+     add_library(imgui_backends STATIC
+       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
+-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
++      ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
+     )
+-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+-    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
++    # imgui_impl_opengl3 renders on our GLES 3.0 context. Without IMGUI_IMPL_OPENGL_ES3 it
++    # compiles the desktop-GL path, whose embedded gl3w loader dlopen()s libGL.so -- absent on
++    # Mali/PowerVR (loader init fails -> "Failed to initialize OpenGL loader!" -> NewFrame
++    # null-derefs, the device crash). ES3 makes it #include <GLES3/gl3.h> and call GLES entry
++    # points directly (only core ES3 calls; the desktop-only glPolygonMode/DrawElementsBaseVertex/
++    # ClipControl are #if-gated out), resolved from libGLESv2 -- libmali on device, Mesa on the
++    # dev box. Linking libGLESv2 is exactly what every normal SDL+GLES app does (Normalcy rule 7).
++    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
++    find_library(AURORA_GLESV2_LIB GLESv2)
++    if (NOT AURORA_GLESV2_LIB)
++      set(AURORA_GLESV2_LIB GLESv2) # fall back to the linker's own -lGLESv2 search
++    endif ()
++    target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} ${AURORA_GLESV2_LIB})
+     target_link_libraries(imgui PUBLIC imgui_backends)
+ 
+     if (TARGET Freetype::Freetype)
+diff --git a/lib/aurora.cpp b/lib/aurora.cpp
+index 80a95ab488e8db5193ac8f02f54a6304090efd83..e8f262dd3bb283fd381f872fbd25c27501e5b15c 100644
+--- a/lib/aurora.cpp
++++ b/lib/aurora.cpp
+@@ -15,7 +15,10 @@
+ #include "imgui.hpp"
+ #include "webgpu/gpu.hpp"
+ #include "webgpu/gpu_prof.hpp"
+-#include <webgpu/webgpu_cpp.h>
++#include "webgpu/sdl2shim_present.hpp"
++#include "gl/pass.hpp"
++#include "gl/state.hpp"
++#include <optional>
+ #endif
+ 
+ #ifdef AURORA_ENABLE_RMLUI
+@@ -62,10 +65,6 @@ ConfigStrings g_configStrings;
+ 
+ #ifdef AURORA_ENABLE_GX
+ // GPU
+-using webgpu::g_device;
+-using webgpu::g_queue;
+-using webgpu::g_surface;
+-
+ std::mutex g_presentationMutex;
+ AuroraPresentation g_lastPresentation{};
+ 
+@@ -79,50 +78,14 @@ void reset_presentation() noexcept {
+   g_lastPresentation = {};
+ }
+ 
+-uint32_t clamp_scissor_coord(double value, uint32_t maximum) noexcept {
+-  if (!std::isfinite(value)) {
+-    return 0;
+-  }
+-  return static_cast<uint32_t>(std::clamp(value, 0.0, static_cast<double>(maximum)));
+-}
+-
+-void set_present_viewport(const wgpu::RenderPassEncoder& pass, const gfx::Viewport& viewport, uint32_t surfaceWidth,
+-                          uint32_t surfaceHeight) noexcept {
+-  pass.SetViewport(viewport.left, viewport.top, viewport.width, viewport.height, viewport.znear, viewport.zfar);
+-  const auto scissorX = clamp_scissor_coord(std::floor(viewport.left), surfaceWidth);
+-  const auto scissorY = clamp_scissor_coord(std::floor(viewport.top), surfaceHeight);
+-  const auto scissorRight = clamp_scissor_coord(std::ceil(viewport.left + viewport.width), surfaceWidth);
+-  const auto scissorBottom = clamp_scissor_coord(std::ceil(viewport.top + viewport.height), surfaceHeight);
+-  pass.SetScissorRect(scissorX, scissorY, scissorRight - scissorX, scissorBottom - scissorY);
+-}
+ #endif
+ 
+ #ifdef AURORA_ENABLE_GX
++// The hand-rolled backend serves OpenGLES; NULL is the SDL_Renderer fallback for
++// headless / imgui-only. The Dawn D3D/Metal/Vulkan/WebGPU options are gone.
+ constexpr std::array PreferredBackendOrder{
+-#ifdef ENABLE_BACKEND_WEBGPU
+-    BACKEND_WEBGPU,
+-#endif
+-#ifdef DAWN_ENABLE_BACKEND_D3D12
+-    BACKEND_D3D12,
+-#endif
+-#ifdef DAWN_ENABLE_BACKEND_METAL
+-    BACKEND_METAL,
+-#endif
+-#ifdef DAWN_ENABLE_BACKEND_VULKAN
+-    BACKEND_VULKAN,
+-#endif
+-#ifdef DAWN_ENABLE_BACKEND_D3D11
+-    BACKEND_D3D11,
+-#endif
+-// #ifdef DAWN_ENABLE_BACKEND_DESKTOP_GL
+-//     BACKEND_OPENGL,
+-// #endif
+-#ifdef DAWN_ENABLE_BACKEND_OPENGLES
+     BACKEND_OPENGLES,
+-#endif
+-#ifdef DAWN_ENABLE_BACKEND_NULL
+     BACKEND_NULL,
+-#endif
+ };
+ #else
+ constexpr std::array<AuroraBackend, 0> PreferredBackendOrder{};
+@@ -192,14 +155,14 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
+ 
+   AURORA_ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
+ 
+-  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
+-  if (webgpu::g_backendType == wgpu::BackendType::Null) {
++  // Initialize SDL_Renderer for ImGui when there is no GL backend (headless/NULL).
++  if (webgpu::g_backendType == BACKEND_NULL) {
+     AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+   }
+ #else
+   AuroraBackend selectedBackend = BACKEND_NULL;
+   AURORA_ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
+-  AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
++  AURORA_AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+ #endif
+ 
+   window::show_window();
+@@ -242,7 +205,8 @@ void shutdown() noexcept {
+   aurora_shutdown_video_hardware();
+ #ifdef AURORA_ENABLE_GX
+   gx::fifo::shutdown();
+-  gfx::render_worker::synchronize();
++  // gpu_synchronize (not render_worker::synchronize) so a worker parked on an EFB slot is released.
++  gfx::gpu_synchronize();
+   reset_presentation();
+ #ifdef AURORA_ENABLE_RMLUI
+   rmlui::shutdown();
+@@ -286,12 +250,9 @@ bool begin_frame() noexcept {
+     if (window::is_paused()) {
+       return false;
+     }
+-    if (!g_surface) {
+-      webgpu::refresh_surface(true);
+-      if (!g_surface) {
+-        return false;
+-      }
+-    }
++    // The GL backend has no wgpu::Surface: it renders offscreen and presents by
++    // swapping the window's default framebuffer (desktop) or handing an EFB slot to
++    // the main thread (device). Both are always ready once the context exists.
+   }
+ 
+   imgui::new_frame(window::get_window_size());
+@@ -314,8 +275,13 @@ void end_frame(bool present = true) noexcept {
+   auto imguiDrawData = imgui::freeze();
+ 
+   const auto& presentSource = webgpu::present_source();
+-  const auto viewport = webgpu::calculate_present_viewport(webgpu::g_graphicsConfig.surfaceConfiguration.width,
+-                                                           webgpu::g_graphicsConfig.surfaceConfiguration.height,
++  // Size the UI from the NATIVE present surface (window drawable), not surfaceConfiguration (the
++  // internalResolutionScale-downscaled EFB). Otherwise the UI would render at the game's internal
++  // resolution and get upscaled with the scene -- at 0.5x that made the UI huge and cramped. This
++  // is the same centered content rect composite_ui_overlay/present_frame blit into, so the UI
++  // target maps 1:1 and stays crisp and correctly-sized at any internal resolution scale.
++  const auto viewport = webgpu::calculate_present_viewport(webgpu::present_surface_width(),
++                                                           webgpu::present_surface_height(),
+                                                            presentSource.size.width, presentSource.size.height);
+   AuroraPresentation presentation{};
+   presentation.window_id = SDL_GetWindowID(window::get_sdl_window());
+@@ -329,175 +295,88 @@ void end_frame(bool present = true) noexcept {
+   presentation.width = viewport.width;
+   presentation.height = viewport.height;
+ 
+-  wgpu::BindGroup rmlBindGroup;
++  gl::Texture rmlTexture{};
++  gl::Sampler rmlSampler{};
+   bool rmlOverlay = false;
+ #if AURORA_ENABLE_RMLUI
+   if (rmlui::is_initialized()) {
+     auto rmlFrame = rmlui::record_frame(viewport);
+-    rmlBindGroup = std::move(rmlFrame.bindGroup);
++    rmlTexture = rmlFrame.texture;
++    rmlSampler = rmlFrame.sampler;
+     rmlOverlay = rmlFrame.overlay;
+   }
+ #endif
+ 
+-  gfx::end_frame([present, presentation, rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
+-                  imguiDrawData = std::move(imguiDrawData)](
+-                     wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) mutable {
+-    wgpu::Texture currentTexture;
+-    wgpu::TextureView currentView;
+-    auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
+-    {
+-      window::SurfaceLock surfaceLock;
+-      if (present && window::is_presentable() && g_surface) {
+-        ZoneScopedN("Acquire texture");
+-        wgpu::SurfaceTexture surfaceTexture;
+-        g_surface.GetCurrentTexture(&surfaceTexture);
+-        surfaceStatus = surfaceTexture.status;
+-        if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal) {
+-          currentTexture = std::move(surfaceTexture.texture);
+-          currentView = currentTexture.CreateView();
++  gfx::end_frame([present, presentation, rmlTexture, rmlSampler, rmlOverlay,
++                  imguiDrawData = std::move(imguiDrawData)]() mutable {
++    // Runs on the render worker (which owns the GL context). Composite the finished scene, the
++    // RmlUi overlay and the imgui overlay into the present target, then swap (desktop) or hand the
++    // EFB slot to the main thread (device).
++    if (!present) {
++      // Frame completed without presentation (finish only).
++    } else if (webgpu::sdl2shim_present::active()) {
++      // Device (SDL2-shim EFB path): acquire a slot, composite into its worker FBO, publish. The
++      // main thread scans it out via flush_present() and owns after_present(); the worker never
++      // swaps (Mali kmsdrm page flips are display-thread-bound -- a worker swap shows nothing).
++      auto frame = webgpu::sdl2shim_present::acquire();
++      if (frame) {
++        const uint32_t targetFbo = frame->fbo;
++        webgpu::present_frame(targetFbo);
++        if (rmlTexture.id != 0) {
++          webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay, targetFbo);
+         }
+-      }
+-    }
+-
+-    const bool canPresent = currentTexture && currentView;
+-    if (canPresent) {
+-      wgpu::BindGroup presentBindGroup;
+-      if (rmlBindGroup && !rmlOverlay) {
+-        presentBindGroup = rmlBindGroup;
++        {
++          gl::PassEncoder uiPass(gl::PassTarget{
++              .fbo = targetFbo,
++              .width = webgpu::present_surface_width(),
++              .height = webgpu::present_surface_height(),
++          });
++          imgui::render(uiPass, imguiDrawData);
++        }
++        // The present composite issued raw, out-of-band GL; drop the state-cache shadow so the next
++        // frame's first pass re-establishes everything (desktop does this inside present_swap()).
++        gl::reset_state_cache();
++        webgpu::sdl2shim_present::publish(frame->slot);
+       } else {
+-        const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
+-        presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
++        webgpu::sdl2shim_present::publish_empty();
+       }
+-      {
+-        const std::array attachments{
+-            wgpu::RenderPassColorAttachment{
+-                .view = currentView,
+-                .loadOp = wgpu::LoadOp::Clear,
+-                .storeOp = wgpu::StoreOp::Store,
+-            },
+-        };
+-        const wgpu::RenderPassDescriptor renderPassDescriptor{
+-            .label = "EFB copy render pass",
+-            .colorAttachmentCount = attachments.size(),
+-            .colorAttachments = attachments.data(),
+-            .timestampWrites = webgpu::gpu_prof::pass_writes("Present blit"),
+-        };
+-        const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
+-        // Copy EFB -> XFB (swapchain)
+-        pass.SetPipeline(webgpu::g_CopyPipeline);
+-        pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
+-        set_present_viewport(pass, viewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
+-                             webgpu::g_graphicsConfig.surfaceConfiguration.height);
+-
+-        pass.Draw(3);
+-        if (rmlBindGroup && rmlOverlay) {
+-          pass.SetPipeline(webgpu::g_CopyPremultipliedAlphaPipeline);
+-          pass.SetBindGroup(0, rmlBindGroup, 0, nullptr);
+-          pass.Draw(3);
+-        }
+-        pass.End();
++    } else {
++      // Desktop: composite into the window's default framebuffer and swap from the worker.
++      webgpu::present_frame();
++      if (rmlTexture.id != 0) {
++        webgpu::composite_ui_overlay(rmlTexture, rmlSampler, rmlOverlay);
+       }
+       {
+-        const std::array attachments{
+-            wgpu::RenderPassColorAttachment{
+-                .view = currentView,
+-                .loadOp = wgpu::LoadOp::Load,
+-                .storeOp = wgpu::StoreOp::Store,
+-            },
+-        };
+-        const wgpu::RenderPassDescriptor renderPassDescriptor{
+-            .label = "ImGui render pass",
+-            .colorAttachmentCount = attachments.size(),
+-            .colorAttachments = attachments.data(),
+-            .timestampWrites = webgpu::gpu_prof::pass_writes("ImGui"),
+-        };
+-        const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
+-        pass.SetViewport(0.f, 0.f, static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.width),
+-                         static_cast<float>(webgpu::g_graphicsConfig.surfaceConfiguration.height), 0.f, 1.f);
+-        imgui::render(pass, imguiDrawData);
+-        pass.End();
++        gl::PassEncoder uiPass(gl::PassTarget{
++            .fbo = 0,
++            .width = webgpu::g_graphicsConfig.surfaceConfiguration.width,
++            .height = webgpu::g_graphicsConfig.surfaceConfiguration.height,
++        });
++        imgui::render(uiPass, imguiDrawData);
+       }
+-    } else {
+-      Log.info("Skipping present; window not presentable");
+-    }
+-    webgpu::gpu_prof::frame_end(encoder);
+-    const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
+-    const auto buffer = encoder.Finish(&cmdBufDescriptor);
+-    {
+-      ZoneScopedN("Queue Submit");
+-      g_queue.Submit(1, &buffer);
+-    }
+-    webgpu::gpu_prof::after_submit();
+-    if (canPresent && g_surface) {
+-      ZoneScopedN("Present");
+-      wgpu::ConvertibleStatus status = wgpu::Status::Error;
++      webgpu::present_swap();
+       {
+-        window::SurfaceLock surfaceLock;
+-        if (window::is_presentable()) {
+-          status = g_surface.Present();
+-        }
+-      }
+-      if (status) {
+-        {
+-          const std::lock_guard lock{g_presentationMutex};
+-          presentation.sequence = g_lastPresentation.sequence + 1;
+-          g_lastPresentation = presentation;
+-        }
+-        gfx::after_present();
+-      } else {
+-        Log.warn("Surface present failed");
+-        webgpu::release_surface();
+-      }
+-    } else if (present && g_surface) {
+-      switch (surfaceStatus) {
+-      case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
+-        Log.warn("Surface texture acquisition timed out");
+-        break;
+-      case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal:
+-      case wgpu::SurfaceGetCurrentTextureStatus::Outdated:
+-        Log.info("Surface texture is {}, reconfiguring swapchain", magic_enum::enum_name(surfaceStatus));
+-        window::push_custom_event(window::CustomEvent::RefreshSurface);
+-        break;
+-      case wgpu::SurfaceGetCurrentTextureStatus::Lost:
+-        Log.warn("Surface texture is {}, releasing surface", magic_enum::enum_name(surfaceStatus));
+-        webgpu::release_surface();
+-        break;
+-      case wgpu::SurfaceGetCurrentTextureStatus::Error:
+-        Log.warn("Surface texture is {}, dropping surface", magic_enum::enum_name(surfaceStatus));
+-        g_surface = {};
+-        break;
+-      default:
+-        if (!window::is_presentable()) {
+-          webgpu::release_surface();
+-        } else {
+-          Log.error("Failed to get surface texture: {}", magic_enum::enum_name(surfaceStatus));
+-        }
+-        break;
+-      }
+-    }
+-    for (auto& callback : afterSubmitCallbacks) {
+-      if (callback) {
+-        callback();
++        const std::lock_guard lock{g_presentationMutex};
++        presentation.sequence = g_lastPresentation.sequence + 1;
++        g_lastPresentation = presentation;
+       }
++      gfx::after_present();
+     }
+     gfx::after_submit();
+ 
+     TracyPlotConfig("aurora: lastVertSize", tracy::PlotFormatType::Memory, false, true, 0);
+     TracyPlotConfig("aurora: lastUniformSize", tracy::PlotFormatType::Memory, false, true, 0);
+     TracyPlotConfig("aurora: lastIndexSize", tracy::PlotFormatType::Memory, false, true, 0);
+-    TracyPlotConfig("aurora: lastStorageSize", tracy::PlotFormatType::Memory, false, true, 0);
+     TracyPlotConfig("aurora: lastTextureUploadSize", tracy::PlotFormatType::Memory, false, true, 0);
+ 
+-    const auto& stats = gfx::detail::resources().stats;
+-    TracyPlot("aurora: queuedPipelines", static_cast<int64_t>(stats.queuedPipelines));
+-    TracyPlot("aurora: createdPipelines", static_cast<int64_t>(stats.createdPipelines));
+-    TracyPlot("aurora: drawCallCount", static_cast<int64_t>(stats.drawCallCount));
+-    TracyPlot("aurora: mergedDrawCallCount", static_cast<int64_t>(stats.mergedDrawCallCount));
+-    TracyPlot("aurora: lastVertSize", static_cast<int64_t>(stats.lastVertSize));
+-    TracyPlot("aurora: lastUniformSize", static_cast<int64_t>(stats.lastUniformSize));
+-    TracyPlot("aurora: lastIndexSize", static_cast<int64_t>(stats.lastIndexSize));
+-    TracyPlot("aurora: lastStorageSize", static_cast<int64_t>(stats.lastStorageSize));
+-    TracyPlot("aurora: lastTextureUploadSize", static_cast<int64_t>(stats.lastTextureUploadSize));
++    TracyPlot("aurora: queuedPipelines", static_cast<int64_t>(gfx::g_stats.queuedPipelines));
++    TracyPlot("aurora: createdPipelines", static_cast<int64_t>(gfx::g_stats.createdPipelines));
++    TracyPlot("aurora: drawCallCount", static_cast<int64_t>(gfx::g_stats.drawCallCount));
++    TracyPlot("aurora: mergedDrawCallCount", static_cast<int64_t>(gfx::g_stats.mergedDrawCallCount));
++    TracyPlot("aurora: lastVertSize", static_cast<int64_t>(gfx::g_stats.lastVertSize));
++    TracyPlot("aurora: lastUniformSize", static_cast<int64_t>(gfx::g_stats.lastUniformSize));
++    TracyPlot("aurora: lastIndexSize", static_cast<int64_t>(gfx::g_stats.lastIndexSize));
++    TracyPlot("aurora: lastTextureUploadSize", static_cast<int64_t>(gfx::g_stats.lastTextureUploadSize));
+   });
+ 
+ #endif
+diff --git a/lib/imgui.cpp b/lib/imgui.cpp
+index 77f65fdb7d7c4948e9eeec57e6d178ad38d8eeac..5d41ee270eef6ac28c54fda98d1eb1f1dd49d186 100644
+--- a/lib/imgui.cpp
++++ b/lib/imgui.cpp
+@@ -8,20 +8,26 @@
+ #include <utility>
+ #include <vector>
+ 
+-#include <webgpu/webgpu_cpp.h>
+ #include <SDL3/SDL_events.h>
+ #include <SDL3/SDL_render.h>
+ 
+ #include "internal.hpp"
+ #include "gfx/render_worker.hpp"
+ #include "input/router.hpp"
++#include "gl/gl_core.hpp"
++#include "gl/pass.hpp"
++#include "gl/state.hpp"
++#include "gl/textures.hpp"
+ #include "webgpu/gpu.hpp"
+ #include "window.hpp"
+ 
+-#define IMGUI_IMPL_WEBGPU_BACKEND_DAWN
++// The GLES imgui backend is imgui_impl_opengl3 driven with a "#version 300 es" init
++// string. Its GL objects live on the render worker's context, so init/shutdown/render
++// and user-texture uploads are all marshaled there. The SDL_Renderer path stays for the
++// headless/NULL backend (no GL context).
++#include "backends/imgui_impl_opengl3.h"
+ #include "backends/imgui_impl_sdl3.h"
+ #include "backends/imgui_impl_sdlrenderer3.h"
+-#include "backends/imgui_impl_wgpu.h"
+ #include "tracy/Tracy.hpp"
+ 
+ namespace aurora::imgui {
+@@ -31,49 +37,8 @@ std::string g_imguiSettings{};
+ std::string g_imguiLog{};
+ bool g_useSdlRenderer = false;
+ 
+-std::vector<SDL_Texture*> g_sdlTextures;
+-std::vector<wgpu::Texture> g_wgpuTextures;
+-
+-wgpu::Buffer create_texture_upload_buffer(uint32_t width, uint32_t height, const uint8_t* data,
+-                                          uint32_t copyBytesPerRow) {
+-  const uint32_t rowBytes = width * 4;
+-  const uint64_t uploadSize = static_cast<uint64_t>(copyBytesPerRow) * height;
+-  const wgpu::BufferDescriptor desc{
+-      .label = "imgui texture upload buffer",
+-      .usage = wgpu::BufferUsage::CopySrc,
+-      .size = uploadSize,
+-      .mappedAtCreation = true,
+-  };
+-  auto buffer = webgpu::g_device.CreateBuffer(&desc);
+-  auto* dst = static_cast<uint8_t*>(buffer.GetMappedRange(0, uploadSize));
+-  for (uint32_t row = 0; row < height; ++row) {
+-    std::memcpy(dst, data, rowBytes);
+-    dst += copyBytesPerRow;
+-    data += rowBytes;
+-  }
+-  return buffer;
+-}
+-
+-void enqueue_texture_upload(wgpu::Buffer buffer, wgpu::TexelCopyTextureInfo dst, wgpu::TexelCopyBufferLayout layout,
+-                            wgpu::Extent3D size) {
+-  gfx::render_worker::enqueue_work([buffer = std::move(buffer), dst = std::move(dst), layout, size] {
+-    buffer.Unmap();
+-    const wgpu::CommandEncoderDescriptor encoderDesc{
+-        .label = "imgui texture upload encoder",
+-    };
+-    auto encoder = webgpu::g_device.CreateCommandEncoder(&encoderDesc);
+-    const wgpu::TexelCopyBufferInfo src{
+-        .layout = layout,
+-        .buffer = buffer,
+-    };
+-    encoder.CopyBufferToTexture(&src, &dst, &size);
+-    constexpr wgpu::CommandBufferDescriptor commandBufferDesc{
+-        .label = "imgui texture upload command buffer",
+-    };
+-    auto commandBuffer = encoder.Finish(&commandBufferDesc);
+-    webgpu::g_queue.Submit(1, &commandBuffer);
+-  });
+-}
++static std::vector<SDL_Texture*> g_sdlTextures;
++static std::vector<gl::Texture> g_glTextures;
+ 
+ input::LayerId g_inputLayer = input::kInvalidLayerId;
+ bool g_cursorManaged = false;
+@@ -139,10 +104,15 @@ void initialize() noexcept {
+   if (g_useSdlRenderer) {
+     ImGui_ImplSDLRenderer3_Init(renderer);
+   } else {
+-    ImGui_ImplWGPU_InitInfo info;
+-    info.Device = webgpu::g_device.Get();
+-    info.RenderTargetFormat = static_cast<WGPUTextureFormat>(webgpu::g_graphicsConfig.surfaceConfiguration.format);
+-    ImGui_ImplWGPU_Init(&info);
++    // The imgui GL objects (shaders + font atlas texture) must be created on the render
++    // worker's context, so init there and force device-object creation (NewFrame lazily
++    // builds them) before the first real frame renders on the worker.
++    gfx::render_worker::enqueue_work([] {
++      ImGui_ImplOpenGL3_Init("#version 300 es");
++      ImGui_ImplOpenGL3_NewFrame();
++      gl::invalidate_texture_bindings();
++    });
++    gfx::render_worker::synchronize();
+   }
+   g_inputLayer = input::register_layer({
+       .label = "aurora.imgui",
+@@ -159,7 +129,8 @@ void shutdown() noexcept {
+   if (g_useSdlRenderer) {
+     ImGui_ImplSDLRenderer3_Shutdown();
+   } else {
+-    ImGui_ImplWGPU_Shutdown();
++    gfx::render_worker::enqueue_work([] { ImGui_ImplOpenGL3_Shutdown(); });
++    gfx::render_worker::synchronize();
+   }
+   ImGui_ImplSDL3_Shutdown();
+   ImGui::DestroyContext();
+@@ -167,7 +138,7 @@ void shutdown() noexcept {
+     SDL_DestroyTexture(texture);
+   }
+   g_sdlTextures.clear();
+-  g_wgpuTextures.clear();
++  g_glTextures.clear();
+ }
+ 
+ void set_cursor_managed(bool managed) noexcept {
+@@ -222,16 +193,24 @@ void new_frame(const AuroraWindowSize& size) noexcept {
+     ImGui_ImplSDLRenderer3_NewFrame();
+     g_scale = size.scale;
+   } else {
+-    if (g_scale != size.scale) {
+-      if (g_scale > 0.f) {
+-        ImGui_ImplWGPU_CreateDeviceObjects();
+-      }
+-      g_scale = size.scale;
++    // The game rebuilds the imgui font atlas whenever the UI scale changes
++    // (dusk::ImGuiEngine_Initialize -> io.Fonts->Clear() + re-add fonts, fired on window resize),
++    // which invalidates the atlas: Fonts->IsBuilt() goes false and the ImFont objects are recreated.
++    // The backend font texture must then be rebuilt, or the next ImGui::NewFrame dereferences a font
++    // whose ContainerAtlas is gone (ContainerAtlas == nullptr -> crash; hit on device when the window
++    // resizes 320x320 -> 304x224). The old Dawn path rebuilt here too. The rebuild issues GL, so it
++    // must run where the render context is current -- the render worker (the main thread has no GL
++    // context on desktop, and only the shim's present context on device), same as init above.
++    if ((g_scale > 0.f && g_scale != size.scale) || !ImGui::GetIO().Fonts->IsBuilt()) {
++      gfx::render_worker::enqueue_work([] {
++        ImGui_ImplOpenGL3_DestroyFontsTexture();
++        ImGui_ImplOpenGL3_CreateFontsTexture();
++        gl::invalidate_texture_bindings();
++      });
++      gfx::render_worker::synchronize();
+     }
+-    if (!ImGui::GetIO().Fonts->IsBuilt()) {
+-      ImGui_ImplWGPU_CreateDeviceObjects();
+-    }
+-    ImGui_ImplWGPU_NewFrame();
++    g_scale = size.scale;
++    ImGui_ImplOpenGL3_NewFrame();
+   }
+   ImGui_ImplSDL3_NewFrame();
+ 
+@@ -258,7 +237,7 @@ DrawData freeze() noexcept {
+   return DrawData{std::move(frozen)};
+ }
+ 
+-void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept {
++void render(gl::PassEncoder& pass, const DrawData& drawData) noexcept {
+   ZoneScoped;
+ 
+   if (!drawData.m_impl) {
+@@ -274,9 +253,13 @@ void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexc
+     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
+     SDL_RenderPresent(renderer);
+   } else {
+-    pass.PushDebugGroup("Aurora: Dear Imgui");
+-    ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
+-    pass.PopDebugGroup();
++    // Runs on the render worker (end-frame callback). Draw over the bound framebuffer (the
++    // window's default framebuffer, on top of the presented scene + RmlUi overlay).
++    // ImGui_ImplOpenGL3_RenderDrawData sets its own viewport/program/blend from the draw data.
++    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, pass.target().fbo);
++    ImGui_ImplOpenGL3_RenderDrawData(data);
++    // imgui restored raw GL it does not track; drop the state-cache shadow.
++    gl::reset_state_cache();
+   }
+ }
+ 
+@@ -288,43 +271,24 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
+     g_sdlTextures.push_back(texture);
+     return reinterpret_cast<ImTextureID>(texture);
+   }
+-  const wgpu::Extent3D size{
+-      .width = width,
+-      .height = height,
+-      .depthOrArrayLayers = 1,
+-  };
+-  const wgpu::TextureDescriptor textureDescriptor{
+-      .label = "imgui texture",
+-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+-      .dimension = wgpu::TextureDimension::e2D,
+-      .size = size,
+-      .format = wgpu::TextureFormat::RGBA8Unorm,
+-      .mipLevelCount = 1,
+-      .sampleCount = 1,
+-  };
+-  const wgpu::TextureViewDescriptor textureViewDescriptor{
+-      .label = "imgui texture view",
+-      .format = wgpu::TextureFormat::RGBA8Unorm,
+-      .dimension = wgpu::TextureViewDimension::e2D,
+-      .mipLevelCount = WGPU_MIP_LEVEL_COUNT_UNDEFINED,
+-      .arrayLayerCount = WGPU_ARRAY_LAYER_COUNT_UNDEFINED,
+-  };
+-  auto texture = webgpu::g_device.CreateTexture(&textureDescriptor);
+-  auto textureView = texture.CreateView(&textureViewDescriptor);
+-  {
+-    const wgpu::TexelCopyTextureInfo dstView{
+-        .texture = texture,
+-    };
+-    const uint32_t copyBytesPerRow = AURORA_ALIGN(width * 4, 256);
+-    const wgpu::TexelCopyBufferLayout dataLayout{
+-        .bytesPerRow = copyBytesPerRow,
+-        .rowsPerImage = height,
+-    };
+-    enqueue_texture_upload(create_texture_upload_buffer(width, height, data, copyBytesPerRow), dstView, dataLayout,
+-                           size);
+-  }
+-  g_wgpuTextures.push_back(texture);
+-  return reinterpret_cast<ImTextureID>(textureView.MoveToCHandle());
++  // Create + upload a GL texture on the render worker; imgui uses the GL texture name as the
++  // ImTextureID directly (ImGui_ImplOpenGL3 binds it with glBindTexture and sampler 0, so set
++  // linear filtering on the texture itself).
++  gl::Texture texture;
++  const gl::Extent3D size{width, height, 1};
++  gfx::render_worker::enqueue_work([&] {
++    texture = gl::create_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/false);
++    gl::gl.BindTexture(gl::GL_TEXTURE_2D, texture.id);
++    gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_LINEAR);
++    gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_LINEAR);
++    gl::gl.PixelStorei(gl::GL_UNPACK_ALIGNMENT, 4);
++    gl::gl.TexSubImage2D(gl::GL_TEXTURE_2D, 0, 0, 0, static_cast<gl::GLsizei>(width),
++                         static_cast<gl::GLsizei>(height), gl::GL_RGBA, gl::GL_UNSIGNED_BYTE, data);
++    gl::invalidate_texture_bindings();
++  });
++  gfx::render_worker::synchronize();
++  g_glTextures.push_back(texture);
++  return static_cast<ImTextureID>(texture.id);
+ }
+ } // namespace aurora::imgui
+ 
+diff --git a/lib/imgui.hpp b/lib/imgui.hpp
+index a40f297d7066e9ea6285fde0bc4bceb013d24fed..35799a76c48b56bfb5f77b2b1076803a76525911 100644
+--- a/lib/imgui.hpp
++++ b/lib/imgui.hpp
+@@ -7,9 +7,9 @@
+ 
+ union SDL_Event;
+ 
+-namespace wgpu {
+-class RenderPassEncoder;
+-} // namespace wgpu
++namespace aurora::gl {
++class PassEncoder;
++} // namespace aurora::gl
+ 
+ namespace aurora::imgui {
+ class DrawData {
+@@ -24,7 +24,7 @@ private:
+   std::shared_ptr<Impl> m_impl;
+ 
+   friend DrawData freeze() noexcept;
+-  friend void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept;
++  friend void render(gl::PassEncoder& pass, const DrawData& drawData) noexcept;
+ };
+ 
+ void create_context() noexcept;
+@@ -35,5 +35,5 @@ void process_event(const SDL_Event& event) noexcept;
+ void set_cursor_managed(bool managed) noexcept;
+ void new_frame(const AuroraWindowSize& size) noexcept;
+ DrawData freeze() noexcept;
+-void render(const wgpu::RenderPassEncoder& pass, const DrawData& drawData) noexcept;
++void render(gl::PassEncoder& pass, const DrawData& drawData) noexcept;
+ } // namespace aurora::imgui
+diff --git a/lib/rmlui.cpp b/lib/rmlui.cpp
+index b3a662a67af7060956cea59da30d9ed626498de9..5252951218b4f5530147b97dba02d1302978e5c8 100644
+--- a/lib/rmlui.cpp
++++ b/lib/rmlui.cpp
+@@ -40,7 +40,6 @@ uint32_t s_pressedMouseButtons = 0;
+ std::array<TrackedTouch, MaxTrackedTouches> s_trackedTouches{};
+ float s_uiScale = 0.0f;
+ webgpu::TextureWithSampler s_renderTarget;
+-wgpu::BindGroup s_renderTargetCopyBindGroup;
+ 
+ WebGPURenderInterface* get_render_interface() noexcept {
+   return static_cast<WebGPURenderInterface*>(Backend::GetRenderInterface()); // NOLINT(*-pro-type-static-cast-downcast)
+@@ -82,7 +81,6 @@ void ensure_render_target(Rml::Vector2i dimensions) noexcept {
+     return;
+   }
+   s_renderTarget = webgpu::create_render_texture(width, height, false);
+-  s_renderTargetCopyBindGroup = webgpu::create_copy_bind_group(s_renderTarget);
+ }
+ 
+ bool element_has_visible_backdrop_filter(const Rml::Element* element) noexcept {
+@@ -559,7 +557,8 @@ RecordedFrame record_frame(const webgpu::Viewport& presentViewport) noexcept {
+     return {};
+   }
+   return {
+-      .bindGroup = s_renderTargetCopyBindGroup,
++      .texture = s_renderTarget.view,
++      .sampler = s_renderTarget.sampler,
+       .overlay = !needsBackdrop,
+   };
+ }
+@@ -574,6 +573,5 @@ void shutdown() noexcept {
+   Backend::Shutdown();
+   g_context = nullptr;
+   s_renderTarget = {};
+-  s_renderTargetCopyBindGroup = {};
+ }
+ } // namespace aurora::rmlui
+diff --git a/lib/rmlui.hpp b/lib/rmlui.hpp
+index 22c31d462baf5fc690a750c5c0b3ee30bd89f966..c5c156f5e57c6a958462880d68675418bfe974d2 100644
+--- a/lib/rmlui.hpp
++++ b/lib/rmlui.hpp
+@@ -1,17 +1,18 @@
+ #pragma once
+ 
+ #include "aurora/aurora.h"
++#include "gfx/common.hpp"
+ #include "webgpu/gpu.hpp"
+ 
+ #include <SDL3/SDL_events.h>
+ #include <aurora/rmlui.hpp>
+-#include <dawn/webgpu_cpp.h>
+ 
+ namespace aurora::rmlui {
+ 
+ struct RecordedFrame {
+-  wgpu::BindGroup bindGroup;
+-  bool overlay = false;
++  gl::Texture texture;   // the composited UI target sampled by the present overlay (id 0 = nothing recorded)
++  gl::Sampler sampler;   // its filtering sampler
++  bool overlay = false;  // true = blend the UI over the scene; false = UI already seeded the scene (opaque)
+ };
+ 
+ void initialize(const AuroraWindowSize& size) noexcept;
+diff --git a/lib/rmlui/WebGPURenderInterface.cpp b/lib/rmlui/WebGPURenderInterface.cpp
+index 8901dc51bfb53148e6170731b2424a8f16a0236a..589ef669e7387872d1843184a73fe6e66db29235 100644
+--- a/lib/rmlui/WebGPURenderInterface.cpp
++++ b/lib/rmlui/WebGPURenderInterface.cpp
+@@ -18,27 +18,17 @@
+ #include <utility>
+ #include <vector>
+ 
+-#include "../gfx/recording.hpp"
+-#include "../gfx/texture.hpp"
+ #include "../logging.hpp"
+ #include "../webgpu/gpu.hpp"
++#include "../gfx/texture.hpp"
+ 
+ namespace aurora::rmlui {
+-
+-struct MaskSnapshot {
+-  wgpu::Texture texture;
+-  wgpu::TextureView view;
+-  wgpu::Extent3D size;
+-};
+-
+ namespace {
+ Module Log("aurora::rmlui::RenderInterface");
+ 
+ constexpr size_t rmlBufferOffsetAlignment = 4;
+ constexpr float FilterEpsilon = 0.0001f;
+ 
+-constexpr size_t rmlBytesPerPixel = 4;
+-
+ struct Image {
+   std::unique_ptr<uint8_t[]> data;
+   size_t size;
+@@ -52,19 +42,16 @@ struct ShaderGeometryData {
+ };
+ 
+ struct ShaderTextureData {
+-  wgpu::Texture m_texture;
+-  wgpu::TextureView m_textureView;
++  gl::Texture m_texture;
++  gl::Texture m_textureView;
+   std::vector<Rml::byte> m_pendingUpload;
+-  wgpu::Extent3D m_size{};
+-  uint32_t m_mipLevels;
+-  uint32_t m_bytesPerPixel;
++  gl::Extent3D m_size{};
++  uint32_t m_rowBytes = 0;
+   bool m_uploaded = false;
+ };
+ 
+ struct CompiledShaderData {
+-  GradientUniformBlock gradient{};
+-  ImageEffectsUniformBlock image{};
+-  bool imageEffects = false;
++  GradientUniformBlock gradient;
+ };
+ 
+ enum class FilterType {
+@@ -73,7 +60,6 @@ enum class FilterType {
+   DropShadow,
+   ColorMatrix,
+   MaskImage,
+-  Glass,
+ };
+ 
+ struct CompiledFilter {
+@@ -83,16 +69,6 @@ struct CompiledFilter {
+   Rml::Vector2f offset;
+   Rml::ColourbPremultiplied color;
+   Rml::Matrix4f colorMatrix;
+-  float bezel = 0.f;
+-  float refraction = 0.f;
+-  float specular = 0.f;
+-  float saturation = 1.f;
+-  float profile = 0.f;
+-  float dome = 0.f;
+-  float edges = -1.f;
+-  Rml::Vector2f rectSize;
+-  Rml::Vector4f radii;
+-  std::shared_ptr<MaskSnapshot> mask;
+ };
+ 
+ Image get_image(const Rml::String& source) {
+@@ -220,9 +196,6 @@ bool is_identity_filter(const CompiledFilter& filter) {
+     return filter.sigma < 0.5f;
+   case FilterType::ColorMatrix:
+     return is_identity_matrix(filter.colorMatrix);
+-  case FilterType::Glass:
+-    return filter.refraction < 0.5f && filter.specular <= FilterEpsilon && filter.color.alpha == 0 &&
+-           std::abs(filter.saturation - 1.f) <= FilterEpsilon && std::abs(filter.dome) <= FilterEpsilon;
+   case FilterType::DropShadow:
+   case FilterType::MaskImage:
+   default:
+@@ -263,7 +236,6 @@ bool try_fold_simple_filters(Rml::Span<const Rml::CompiledFilterHandle> filters,
+     case FilterType::Blur:
+     case FilterType::DropShadow:
+     case FilterType::MaskImage:
+-    case FilterType::Glass:
+     default:
+       return false;
+     }
+@@ -278,9 +250,9 @@ Rml::Rectanglei downsample_scissor(Rml::Rectanglei scissor) {
+   return scissor;
+ }
+ 
+-PipelineConfig make_pipeline_config(PipelineKind kind, wgpu::TextureFormat colorFormat, uint32_t sampleCount,
++PipelineConfig make_pipeline_config(PipelineKind kind, gl::TextureFormat colorFormat, uint32_t sampleCount,
+                                     VertexLayoutKind vertexLayout, StencilMode stencilMode, BlendMode blendMode,
+-                                    wgpu::ColorWriteMask colorWriteMask = wgpu::ColorWriteMask::All) {
++                                    gl::ColorWriteMask colorWriteMask = gl::ColorWriteMask::All) {
+   return {
+       .kind = static_cast<uint32_t>(kind),
+       .colorFormat = static_cast<uint32_t>(colorFormat),
+@@ -293,21 +265,21 @@ PipelineConfig make_pipeline_config(PipelineKind kind, wgpu::TextureFormat color
+   };
+ }
+ 
+-gfx::PipelineRef geometry_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
++gfx::PipelineRef geometry_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount,
+                                    WebGPURenderInterface::PipelineType type) {
+   StencilMode stencilMode = StencilMode::AlwaysKeep;
+-  auto colorWriteMask = wgpu::ColorWriteMask::All;
++  auto colorWriteMask = gl::ColorWriteMask::All;
+   switch (type) {
+   case WebGPURenderInterface::PipelineType::Masked:
+     stencilMode = StencilMode::EqualKeep;
+     break;
+   case WebGPURenderInterface::PipelineType::ClipReplace:
+     stencilMode = StencilMode::ClipReplace;
+-    colorWriteMask = wgpu::ColorWriteMask::None;
++    colorWriteMask = gl::ColorWriteMask::None;
+     break;
+   case WebGPURenderInterface::PipelineType::ClipIntersect:
+     stencilMode = StencilMode::ClipIntersect;
+-    colorWriteMask = wgpu::ColorWriteMask::None;
++    colorWriteMask = gl::ColorWriteMask::None;
+     break;
+   case WebGPURenderInterface::PipelineType::Normal:
+   case WebGPURenderInterface::PipelineType::Count:
+@@ -319,13 +291,13 @@ gfx::PipelineRef geometry_pipeline(wgpu::TextureFormat colorFormat, uint32_t sam
+                                                 colorWriteMask));
+ }
+ 
+-gfx::PipelineRef gradient_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount, bool masked) {
++gfx::PipelineRef gradient_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount, bool masked) {
+   return gfx::pipeline_ref(
+       make_pipeline_config(PipelineKind::Gradient, colorFormat, sampleCount, VertexLayoutKind::Geometry,
+                            masked ? StencilMode::EqualKeep : StencilMode::AlwaysKeep, BlendMode::Premultiplied));
+ }
+ 
+-gfx::PipelineRef blit_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
++gfx::PipelineRef blit_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount,
+                                WebGPURenderInterface::BlitPipelineType type, bool useStencil) {
+   const bool blend = type == WebGPURenderInterface::BlitPipelineType::Blend ||
+                      type == WebGPURenderInterface::BlitPipelineType::BlendMasked;
+@@ -337,7 +309,7 @@ gfx::PipelineRef blit_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleC
+                            blend ? BlendMode::Premultiplied : BlendMode::None));
+ }
+ 
+-gfx::PipelineRef simple_filter_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount,
++gfx::PipelineRef simple_filter_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount,
+                                         WebGPURenderInterface::BlitPipelineType type, bool useStencil) {
+   const bool blend = type == WebGPURenderInterface::BlitPipelineType::Blend ||
+                      type == WebGPURenderInterface::BlitPipelineType::BlendMasked;
+@@ -349,13 +321,13 @@ gfx::PipelineRef simple_filter_pipeline(wgpu::TextureFormat colorFormat, uint32_
+                            blend ? BlendMode::Premultiplied : BlendMode::None));
+ }
+ 
+-gfx::PipelineRef seed_resample_pipeline(wgpu::TextureFormat colorFormat, uint32_t sampleCount, bool useStencil) {
++gfx::PipelineRef seed_resample_pipeline(gl::TextureFormat colorFormat, uint32_t sampleCount, bool useStencil) {
+   return gfx::pipeline_ref(
+       make_pipeline_config(PipelineKind::SeedResample, colorFormat, sampleCount, VertexLayoutKind::Fullscreen,
+                            useStencil ? StencilMode::AlwaysKeep : StencilMode::None, BlendMode::None));
+ }
+ 
+-gfx::PipelineRef filter_pipeline(PipelineKind kind, wgpu::TextureFormat colorFormat,
++gfx::PipelineRef filter_pipeline(PipelineKind kind, gl::TextureFormat colorFormat,
+                                  VertexLayoutKind vertexLayout = VertexLayoutKind::Fullscreen,
+                                  BlendMode blendMode = BlendMode::None) {
+   return gfx::pipeline_ref(make_pipeline_config(kind, colorFormat, 1, vertexLayout, StencilMode::None, blendMode));
+@@ -365,29 +337,9 @@ void queue_texture_upload_if_needed(ShaderTextureData& texture) {
+   if (texture.m_uploaded || texture.m_pendingUpload.empty()) {
+     return;
+   }
+-
+-  auto const* texPtr = texture.m_pendingUpload.data();
+-  auto width = texture.m_size.width;
+-  auto height = texture.m_size.height;
+-
+-  assert(texture.m_mipLevels == 1 || texture.m_size.depthOrArrayLayers == 1);
+-
+-  for (uint32_t mipLevel = 0; mipLevel < texture.m_mipLevels; ++mipLevel) {
+-    auto layerSize = static_cast<size_t>(width) * height * texture.m_bytesPerPixel;
+-
+-    const wgpu::TexelCopyTextureInfo dst{
+-        .texture = texture.m_texture,
+-        .mipLevel = mipLevel,
+-        .aspect = wgpu::TextureAspect::All,
+-    };
+-    gfx::queue_texture_upload_data(texPtr, texture.m_bytesPerPixel * width, height, dst,
+-                                   {width, height, texture.m_size.depthOrArrayLayers});
+-
+-    texPtr += layerSize;
+-
+-    width = std::max(width / 2, 1u);
+-    height = std::max(height / 2, 1u);
+-  }
++  // Phase 5: direct glTexSubImage2D from CPU memory (no staging buffer / CopyBufferToTexture).
++  gfx::queue_texture_upload_data(texture.m_pendingUpload.data(), texture.m_rowBytes, texture.m_size.height,
++                                 texture.m_texture, gl::Origin3D{}, texture.m_size);
+   texture.m_pendingUpload.clear();
+   texture.m_pendingUpload.shrink_to_fit();
+   texture.m_uploaded = true;
+@@ -415,8 +367,7 @@ void WebGPURenderInterface::RenderGeometry(Rml::CompiledGeometryHandle geometry,
+ }
+ 
+ void WebGPURenderInterface::DrawGeometry(Rml::CompiledGeometryHandle geometry, Rml::Vector2f translation,
+-                                         Rml::TextureHandle texture, gfx::PipelineRef pipeline,
+-                                         gfx::Range effectUniform) {
++                                         Rml::TextureHandle texture, gfx::PipelineRef pipeline) {
+   EnsureActiveLayerPass("RmlUi resumed geometry layer pass");
+   if (!m_passActive) {
+     return;
+@@ -441,9 +392,6 @@ void WebGPURenderInterface::DrawGeometry(Rml::CompiledGeometryHandle geometry, R
+       .indexRange = indexRange,
+       .uniformRange = uniformRange,
+       .bindGroup1 = texture_bind_group_ref(textureData->m_textureView),
+-      .bindGroup2 = effectUniform.size != 0 ? uniform_bind_group_ref() : 0,
+-      .bindGroup2DynamicOffset = effectUniform.offset,
+-      .dynamicBindGroupMask = effectUniform.size != 0 ? (1u << 2u) : 0u,
+       .drawKind = static_cast<uint32_t>(DrawKind::Geometry),
+       .indexCount = static_cast<uint32_t>(geometryData->indices.size()),
+       .stencilRef = m_stencilRef,
+@@ -456,67 +404,9 @@ void WebGPURenderInterface::ReleaseGeometry(Rml::CompiledGeometryHandle geometry
+   delete reinterpret_cast<ShaderGeometryData*>(geometry);
+ }
+ 
+-static Rml::byte mipmap_sample(Rml::byte const* source, uint32_t sourceWidth, uint32_t sourceHeight, uint32_t mipX,
+-                               uint32_t mipY, uint32_t offset) {
+-  const auto x0 = std::min(mipX * 2, sourceWidth - 1);
+-  const auto x1 = std::min(x0 + 1, sourceWidth - 1);
+-  const auto y0 = std::min(mipY * 2, sourceHeight - 1);
+-  const auto y1 = std::min(y0 + 1, sourceHeight - 1);
+-
+-  auto const s1 = source[(static_cast<size_t>(y0) * sourceWidth + x0) * rmlBytesPerPixel + offset];
+-  auto const s2 = source[(static_cast<size_t>(y1) * sourceWidth + x0) * rmlBytesPerPixel + offset];
+-  auto const s3 = source[(static_cast<size_t>(y0) * sourceWidth + x1) * rmlBytesPerPixel + offset];
+-  auto const s4 = source[(static_cast<size_t>(y1) * sourceWidth + x1) * rmlBytesPerPixel + offset];
+-
+-  return (s1 + s2 + s3 + s4) / 4;
+-}
+-
+-static std::vector<Rml::byte> generate_mips(std::span<Rml::byte const> source, uint32_t width, uint32_t height,
+-                                            uint32_t& outLevels) {
+-  outLevels = 1;
+-
+-  assert(source.size() == width * height * rmlBytesPerPixel);
+-
+-  std::vector<Rml::byte> mipmapped;
+-  mipmapped.assign(source.begin(), source.end());
+-
+-  uint32_t mipWidth = width;
+-  uint32_t mipHeight = height;
+-  size_t prevTexelsOffset = 0;
+-  while (mipWidth > 1 || mipHeight > 1) {
+-    const auto prevWidth = mipWidth;
+-    const auto prevHeight = mipHeight;
+-
+-    outLevels += 1;
+-    mipWidth = std::max(mipWidth / 2, 1u);
+-    mipHeight = std::max(mipHeight / 2, 1u);
+-
+-    auto const layerSize = mipWidth * mipHeight * rmlBytesPerPixel;
+-    auto prevSize = mipmapped.size();
+-
+-    mipmapped.resize(mipmapped.size() + layerSize, 0);
+-
+-    auto level = &mipmapped[prevSize];
+-    auto prevLevel = &mipmapped[prevTexelsOffset];
+-    for (uint32_t y = 0; y < mipHeight; ++y) {
+-      for (uint32_t x = 0; x < mipWidth; ++x) {
+-        level[(y * mipWidth + x) * rmlBytesPerPixel + 0] = mipmap_sample(prevLevel, prevWidth, prevHeight, x, y, 0);
+-        level[(y * mipWidth + x) * rmlBytesPerPixel + 1] = mipmap_sample(prevLevel, prevWidth, prevHeight, x, y, 1);
+-        level[(y * mipWidth + x) * rmlBytesPerPixel + 2] = mipmap_sample(prevLevel, prevWidth, prevHeight, x, y, 2);
+-        level[(y * mipWidth + x) * rmlBytesPerPixel + 3] = mipmap_sample(prevLevel, prevWidth, prevHeight, x, y, 3);
+-      }
+-    }
+-
+-    prevTexelsOffset = prevSize;
+-  }
+-
+-  return mipmapped;
+-}
+-
+ Rml::TextureHandle WebGPURenderInterface::LoadTexture(Rml::Vector2i& dimensions, const Rml::String& source) {
+   if (const auto runtimeTexture = load_runtime_texture(source)) {
+-    constexpr size_t texelSize = 4;
+-    size_t size = static_cast<size_t>(runtimeTexture->width) * static_cast<size_t>(runtimeTexture->height) * texelSize;
++    const size_t size = static_cast<size_t>(runtimeTexture->width) * static_cast<size_t>(runtimeTexture->height) * 4;
+     if (runtimeTexture->width == 0 || runtimeTexture->height == 0 || runtimeTexture->rgba8.size() < size) {
+       Log.error("Runtime texture provider returned invalid texture! Path: {}", source);
+       return 0;
+@@ -526,7 +416,7 @@ Rml::TextureHandle WebGPURenderInterface::LoadTexture(Rml::Vector2i& dimensions,
+     std::vector<Rml::byte> premultiplied;
+     if (!runtimeTexture->premultipliedAlpha) {
+       premultiplied.assign(texels, texels + size);
+-      for (size_t offset = 0; offset < premultiplied.size(); offset += texelSize) {
++      for (size_t offset = 0; offset < premultiplied.size(); offset += 4) {
+         const uint8_t alpha = premultiplied[offset + 3];
+         for (size_t channel = 0; channel < 3; ++channel) {
+           premultiplied[offset + channel] = static_cast<uint8_t>(
+@@ -536,18 +426,9 @@ Rml::TextureHandle WebGPURenderInterface::LoadTexture(Rml::Vector2i& dimensions,
+       texels = premultiplied.data();
+     }
+ 
+-    std::vector<Rml::byte> mipmapped;
+-    uint32_t mipmapLevels = 1;
+-    if (runtimeTexture->generateMipmaps) {
+-      mipmapped = generate_mips(std::span(texels, size), runtimeTexture->width, runtimeTexture->height, mipmapLevels);
+-
+-      texels = mipmapped.data();
+-      size = mipmapped.size();
+-    }
+-
+     dimensions.x = static_cast<int>(runtimeTexture->width);
+     dimensions.y = static_cast<int>(runtimeTexture->height);
+-    return GenerateTexture({texels, size}, dimensions, mipmapLevels);
++    return GenerateTexture({texels, size}, dimensions);
+   }
+ 
+   // load texels from image source
+@@ -564,33 +445,24 @@ Rml::TextureHandle WebGPURenderInterface::LoadTexture(Rml::Vector2i& dimensions,
+ 
+ Rml::TextureHandle WebGPURenderInterface::GenerateTexture(Rml::Span<const Rml::byte> source,
+                                                           Rml::Vector2i source_dimensions) {
+-  return GenerateTexture(source, source_dimensions, 1);
+-}
+-
+-Rml::TextureHandle WebGPURenderInterface::GenerateTexture(Rml::Span<const Rml::byte> source,
+-                                                          Rml::Vector2i source_dimensions, uint32_t mipmapLevels) {
+   auto* texData = new ShaderTextureData();
+-  const wgpu::Extent3D size{
++  const gl::Extent3D size{
+       .width = static_cast<uint32_t>(source_dimensions.x),
+       .height = static_cast<uint32_t>(source_dimensions.y),
+       .depthOrArrayLayers = 1,
+   };
+-  const wgpu::TextureDescriptor textureDesc{
+-      .label = "RmlUi Texture",
+-      .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
+-      .dimension = wgpu::TextureDimension::e2D,
+-      .size = size,
+-      .format = wgpu::TextureFormat::RGBA8Unorm,
+-      .mipLevelCount = mipmapLevels,
+-  };
+-  texData->m_texture = webgpu::g_device.CreateTexture(&textureDesc);
+-  texData->m_textureView = texData->m_texture.CreateView(nullptr);
+-
++  // Immutable RGBA8 2D texture (sampled only, so not renderable); create_gl_texture marshals
++  // the GL create to the render worker and blocks, so the handle is valid on this recording
++  // thread. queue_texture_upload_if_needed then fills it via glTexSubImage2D. The view
++  // collapses into the texture handle on GL.
++  texData->m_texture = gfx::create_gl_texture(gl::TextureFormat::RGBA8Unorm, size, 1, /*renderable=*/false);
++  texData->m_textureView = texData->m_texture;
++
++  constexpr uint32_t BytesPerPixel = 4;
+   texData->m_size = size;
++  texData->m_rowBytes = static_cast<uint32_t>(source_dimensions.x) * BytesPerPixel;
+   texData->m_pendingUpload.assign(source.begin(), source.end());
+   texData->m_uploaded = texData->m_pendingUpload.empty();
+-  texData->m_mipLevels = mipmapLevels;
+-  texData->m_bytesPerPixel = rmlBytesPerPixel;
+   return reinterpret_cast<Rml::TextureHandle>(texData);
+ }
+ 
+@@ -704,7 +576,7 @@ void WebGPURenderInterface::SetTransform(const Rml::Matrix4f* transform) {
+   }
+ }
+ 
+-void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char* label, const wgpu::Extent3D& size,
++void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char* label, const gl::Extent3D& size,
+                                                bool multisampled) {
+   const bool useMultisampling = multisampled && LayerSampleCount > 1;
+   if (target.view && target.size == size && static_cast<bool>(target.multisampleView) == useMultisampling) {
+@@ -713,34 +585,20 @@ void WebGPURenderInterface::EnsureRenderTarget(RenderTarget& target, const char*
+ 
+   target = {};
+   target.size = size;
+-  const wgpu::TextureDescriptor textureDesc{
+-      .label = label,
+-      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc,
+-      .dimension = wgpu::TextureDimension::e2D,
+-      .size = size,
+-      .format = m_renderTargetFormat,
+-      .mipLevelCount = 1,
+-      .sampleCount = 1,
+-  };
+-  target.texture = webgpu::g_device.CreateTexture(&textureDesc);
+-  target.view = target.texture.CreateView(nullptr);
++  // Renderable color target (the FBO cache picks it up as the attachment in begin_color_pass).
++  // View == texture on GL. create_gl_texture marshals to the worker and blocks.
++  target.texture = gfx::create_gl_texture(m_renderTargetFormat, size, 1, /*renderable=*/true);
++  target.view = target.texture;
+ 
+   if (useMultisampling) {
+-    const wgpu::TextureDescriptor multisampleTextureDesc{
+-        .label = "RmlUi Multisampled Render Target",
+-        .usage = wgpu::TextureUsage::RenderAttachment,
+-        .dimension = wgpu::TextureDimension::e2D,
+-        .size = size,
+-        .format = m_renderTargetFormat,
+-        .mipLevelCount = 1,
+-        .sampleCount = LayerSampleCount,
+-    };
+-    target.multisampleTexture = webgpu::g_device.CreateTexture(&multisampleTextureDesc);
+-    target.multisampleView = target.multisampleTexture.CreateView(nullptr);
++    // MSAA is out of scope (EnableMsaa == false => LayerSampleCount == 1 => useMultisampling is
++    // always false), so this never executes; kept for when a multisampled layer path returns.
++    target.multisampleTexture = gfx::create_gl_texture(m_renderTargetFormat, size, 1, /*renderable=*/true);
++    target.multisampleView = target.multisampleTexture;
+   }
+ }
+ 
+-void WebGPURenderInterface::EnsureFrameTargets(const wgpu::Extent3D& size) {
++void WebGPURenderInterface::EnsureFrameTargets(const gl::Extent3D& size) {
+   if (m_layers.empty()) {
+     m_layers.resize(1);
+   }
+@@ -748,6 +606,7 @@ void WebGPURenderInterface::EnsureFrameTargets(const wgpu::Extent3D& size) {
+   EnsureRenderTarget(m_postprocessTargets[0], "RmlUi Postprocess A", size);
+   EnsureRenderTarget(m_postprocessTargets[1], "RmlUi Postprocess B", size);
+   EnsureRenderTarget(m_postprocessTargets[2], "RmlUi Postprocess C", size);
++  EnsureRenderTarget(m_blendMaskTarget, "RmlUi Blend Mask", size);
+ }
+ 
+ TexCoordLimits WebGPURenderInterface::GetPostprocessTexCoordLimits() const {
+@@ -802,23 +661,22 @@ void WebGPURenderInterface::ApplyFullFrameScissor() const {
+   gfx::set_scissor({0, 0, static_cast<int32_t>(m_frameSize.width), static_cast<int32_t>(m_frameSize.height)});
+ }
+ 
+-void WebGPURenderInterface::BeginRenderTargetPass(const wgpu::TextureView& view, wgpu::LoadOp loadOp, const char* label,
++void WebGPURenderInterface::BeginRenderTargetPass(const gl::Texture& view, gl::LoadOp loadOp, const char* label,
+                                                   bool clearStencil) {
+   EndActivePass();
+   gfx::begin_color_pass({
+       .label = label,
+       .colorView = view,
+-      .colorFormat = m_renderTargetFormat,
+-      .depthStencilView = clearStencil ? GetClipMaskStencilView(m_frameSize) : wgpu::TextureView{},
+-      .depthStencilFormat = clearStencil ? ClipMaskStencilFormat : wgpu::TextureFormat::Undefined,
++      .depthStencilView = clearStencil ? GetClipMaskStencilView(m_frameSize) : gl::Texture{},
+       .targetSize = m_frameSize,
+       .sampleCount = 1,
+       .colorLoadOp = loadOp,
+-      .colorStoreOp = wgpu::StoreOp::Store,
++      .colorStoreOp = gl::StoreOp::Store,
+       .clearColor = {0.f, 0.f, 0.f, 0.f},
++      .depthReadOnly = clearStencil,
+       .hasStencil = clearStencil,
+-      .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Undefined,
+-      .stencilStoreOp = clearStencil ? wgpu::StoreOp::Store : wgpu::StoreOp::Undefined,
++      .stencilLoadOp = clearStencil ? gl::LoadOp::Clear : gl::LoadOp::Undefined,
++      .stencilStoreOp = clearStencil ? gl::StoreOp::Store : gl::StoreOp::Undefined,
+       .stencilClearValue = 0,
+   });
+   m_passActive = true;
+@@ -826,7 +684,7 @@ void WebGPURenderInterface::BeginRenderTargetPass(const wgpu::TextureView& view,
+   ApplyScissorRegion();
+ }
+ 
+-void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp loadOp, const char* label,
++void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, gl::LoadOp loadOp, const char* label,
+                                            bool clearStencil, bool resolveMultisampled) {
+   m_activeLayer = layer;
+   EndActivePass();
+@@ -836,18 +694,17 @@ void WebGPURenderInterface::BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp
+   gfx::begin_color_pass({
+       .label = label,
+       .colorView = multisampled ? target.multisampleView : target.view,
+-      .resolveView = multisampled && resolveMultisampled ? target.view : wgpu::TextureView{},
+-      .colorFormat = m_renderTargetFormat,
++      .resolveView = multisampled && resolveMultisampled ? target.view : gl::Texture{},
+       .depthStencilView = GetClipMaskStencilView(m_frameSize),
+-      .depthStencilFormat = ClipMaskStencilFormat,
+       .targetSize = m_frameSize,
+       .sampleCount = multisampled ? LayerSampleCount : 1,
+       .colorLoadOp = loadOp,
+-      .colorStoreOp = wgpu::StoreOp::Store,
++      .colorStoreOp = gl::StoreOp::Store,
+       .clearColor = {0.f, 0.f, 0.f, 0.f},
++      .depthReadOnly = true,
+       .hasStencil = true,
+-      .stencilLoadOp = clearStencil ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+-      .stencilStoreOp = wgpu::StoreOp::Store,
++      .stencilLoadOp = clearStencil ? gl::LoadOp::Clear : gl::LoadOp::Load,
++      .stencilStoreOp = gl::StoreOp::Store,
+       .stencilClearValue = 0,
+   });
+   m_passActive = true;
+@@ -862,7 +719,7 @@ void WebGPURenderInterface::EnsureFrameRenderingStarted() {
+ 
+   m_frameRenderingStarted = true;
+   if (m_baseLayerContent == BaseLayerContent::Transparent) {
+-    BeginLayerPass(0, wgpu::LoadOp::Clear, "RmlUi transparent base layer pass", true);
++    BeginLayerPass(0, gl::LoadOp::Clear, "RmlUi transparent base layer pass", true);
+     return;
+   }
+ 
+@@ -874,17 +731,17 @@ void WebGPURenderInterface::EnsureFrameRenderingStarted() {
+   });
+ 
+   if (m_layers[0].multisampleView) {
+-    BeginLayerPass(0, wgpu::LoadOp::Clear, "RmlUi base layer seed pass", true);
++    BeginLayerPass(0, gl::LoadOp::Clear, "RmlUi base layer seed pass", true);
+     ApplyFullFrameScissor();
+     DrawFullscreenTexture(seedBindGroup, seed_resample_pipeline(m_renderTargetFormat, LayerSampleCount, true),
+                           uniform_bind_group_ref(), seedUniformRange);
+-    BeginLayerPass(0, wgpu::LoadOp::Load, "RmlUi base layer pass");
++    BeginLayerPass(0, gl::LoadOp::Load, "RmlUi base layer pass");
+   } else {
+-    BeginRenderTargetPass(m_layers[0].view, wgpu::LoadOp::Clear, "RmlUi game frame copy pass");
++    BeginRenderTargetPass(m_layers[0].view, gl::LoadOp::Clear, "RmlUi game frame copy pass");
+     ApplyFullFrameScissor();
+     DrawFullscreenTexture(seedBindGroup, seed_resample_pipeline(m_renderTargetFormat, 1, false),
+                           uniform_bind_group_ref(), seedUniformRange);
+-    BeginLayerPass(0, wgpu::LoadOp::Load, "RmlUi base layer pass", true);
++    BeginLayerPass(0, gl::LoadOp::Load, "RmlUi base layer pass", true);
+   }
+ }
+ 
+@@ -894,7 +751,7 @@ void WebGPURenderInterface::EnsureActiveLayerPass(const char* label) {
+     return;
+   }
+ 
+-  BeginLayerPass(m_activeLayer, wgpu::LoadOp::Load, label);
++  BeginLayerPass(m_activeLayer, gl::LoadOp::Load, label);
+ }
+ 
+ void WebGPURenderInterface::EndActivePass() {
+@@ -927,8 +784,8 @@ void WebGPURenderInterface::DrawFullscreenTexture(gfx::BindGroupRef bindGroup, g
+   });
+ }
+ 
+-void WebGPURenderInterface::CompositeToTarget(gfx::BindGroupRef bindGroup, const wgpu::TextureView& view,
+-                                              wgpu::LoadOp loadOp, gfx::PipelineRef pipeline, const char* label,
++void WebGPURenderInterface::CompositeToTarget(gfx::BindGroupRef bindGroup, const gl::Texture& view,
++                                              gl::LoadOp loadOp, gfx::PipelineRef pipeline, const char* label,
+                                               gfx::BindGroupRef extraBindGroup, gfx::Range extraUniformRange,
+                                               bool extraBindGroupHasDynamicOffset, std::array<float, 4> blendConstant,
+                                               bool hasBlendConstant) {
+@@ -972,14 +829,16 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
+     const int bottom = std::clamp(texCoordRegion.Bottom(), top, maxHeight);
+     const Rml::Vector2f viewportOrigin{m_viewport.left, m_viewport.top};
+     const Rml::Vector2f viewportSize{viewportWidth, viewportHeight};
++    const float minX = (static_cast<float>(left) - viewportOrigin.x) / viewportSize.x;
++    const float maxX = (static_cast<float>(right) - viewportOrigin.x) / viewportSize.x;
++    const float topY = (static_cast<float>(top) - viewportOrigin.y) / viewportSize.y;
++    const float bottomY = (static_cast<float>(bottom) - viewportOrigin.y) / viewportSize.y;
+     const BlurUniformBlock uniform{
+         .texelOffset = {},
+         .radius = 0.f,
+         .padding = 0.f,
+-        .texCoordMin =
+-            (Rml::Vector2f(static_cast<float>(left), static_cast<float>(top)) - viewportOrigin) / viewportSize,
+-        .texCoordMax =
+-            (Rml::Vector2f(static_cast<float>(right), static_cast<float>(bottom)) - viewportOrigin) / viewportSize,
++        .texCoordMin = {minX, topY},
++        .texCoordMax = {maxX, bottomY},
+         .weights = weights,
+     };
+     return gfx::push_uniform(uniform);
+@@ -1001,7 +860,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
+     const RenderTarget& source = fromSource ? sourceDestination : temp;
+     const RenderTarget& destination = fromSource ? temp : sourceDestination;
+ 
+-    BeginRenderTargetPass(destination.view, wgpu::LoadOp::Clear, "RmlUi blur downsample pass");
++    BeginRenderTargetPass(destination.view, gl::LoadOp::Clear, "RmlUi blur downsample pass");
+     gfx::set_viewport({m_viewport.left, m_viewport.top, std::max(m_viewport.width * 0.5f, 1.f),
+                        std::max(m_viewport.height * 0.5f, 1.f), m_viewport.znear, m_viewport.zfar});
+     ApplyScissorRegion(scissor);
+@@ -1010,7 +869,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
+   }
+ 
+   if ((passLevel % 2) == 0) {
+-    BeginRenderTargetPass(temp.view, wgpu::LoadOp::Clear, "RmlUi blur transfer pass");
++    BeginRenderTargetPass(temp.view, gl::LoadOp::Clear, "RmlUi blur transfer pass");
+     ApplyViewport();
+     ApplyScissorRegion(scissor);
+     DrawFullscreenTexture(texture_bind_group_ref(sourceDestination.view),
+@@ -1019,7 +878,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
+ 
+   const auto verticalRange =
+       write_blur_uniform({0.f, 1.f / std::max(m_viewport.height, 1.f)}, scissor, radius, weights);
+-  BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Clear, "RmlUi vertical blur pass");
++  BeginRenderTargetPass(sourceDestination.view, gl::LoadOp::Clear, "RmlUi vertical blur pass");
+   ApplyScissorRegion(scissor);
+   DrawFullscreenTexture(texture_bind_group_ref(temp.view),
+                         filter_pipeline(PipelineKind::Blur, m_renderTargetFormat, VertexLayoutKind::BlurFullscreen),
+@@ -1027,14 +886,14 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
+ 
+   const auto horizontalRange =
+       write_blur_uniform({1.f / std::max(m_viewport.width, 1.f), 0.f}, scissor, radius, weights);
+-  BeginRenderTargetPass(temp.view, wgpu::LoadOp::Clear, "RmlUi horizontal blur pass");
++  BeginRenderTargetPass(temp.view, gl::LoadOp::Clear, "RmlUi horizontal blur pass");
+   ApplyScissorRegion(scissor);
+   DrawFullscreenTexture(texture_bind_group_ref(sourceDestination.view),
+                         filter_pipeline(PipelineKind::Blur, m_renderTargetFormat, VertexLayoutKind::BlurFullscreen),
+                         uniform_bind_group_ref(), horizontalRange);
+ 
+   const auto upscaleRange = write_region_blit_uniform(scissor, weights);
+-  BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Clear, "RmlUi blur upscale pass");
++  BeginRenderTargetPass(sourceDestination.view, gl::LoadOp::Clear, "RmlUi blur upscale pass");
+   gfx::set_viewport({static_cast<float>(originalScissor.Left()), static_cast<float>(originalScissor.Top()),
+                      static_cast<float>(std::max(originalScissor.Width(), 1)),
+                      static_cast<float>(std::max(originalScissor.Height(), 1)), 0.f, 1.f});
+@@ -1047,7 +906,7 @@ void WebGPURenderInterface::RenderBlur(float sigma, const RenderTarget& sourceDe
+   const auto targetMax = scissor.p1 * (1 << passLevel);
+   const auto targetRegion = Rml::Rectanglei::FromCorners(targetMin, targetMax);
+   if (targetRegion.p0 != originalScissor.p0 || targetRegion.p1 != originalScissor.p1) {
+-    BeginRenderTargetPass(sourceDestination.view, wgpu::LoadOp::Load, "RmlUi blur power-of-two upscale pass");
++    BeginRenderTargetPass(sourceDestination.view, gl::LoadOp::Load, "RmlUi blur power-of-two upscale pass");
+     gfx::set_viewport({static_cast<float>(targetRegion.Left()), static_cast<float>(targetRegion.Top()),
+                        static_cast<float>(std::max(targetRegion.Width(), 1)),
+                        static_cast<float>(std::max(targetRegion.Height(), 1)), 0.f, 1.f});
+@@ -1076,7 +935,7 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
+           .opacity = {filter->opacity, 0.f, 0.f, 0.f},
+       };
+       const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
+-      BeginRenderTargetPass(m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear, "RmlUi opacity pass");
++      BeginRenderTargetPass(m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear, "RmlUi opacity pass");
+       DrawFullscreenTexture(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+                             filter_pipeline(PipelineKind::SimpleFilter, m_renderTargetFormat), uniform_bind_group_ref(),
+                             simpleFilterRange);
+@@ -1110,14 +969,14 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
+       };
+       const auto dropShadowRange = gfx::push_uniform(dropShadowUniform);
+       CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
++                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear,
+                         filter_pipeline(PipelineKind::DropShadow, m_renderTargetFormat), "RmlUi drop shadow pass",
+                         uniform_bind_group_ref(), dropShadowRange);
+ 
+       RenderBlur(filter->sigma, m_postprocessTargets[scratchIndex], m_postprocessTargets[tempIndex]);
+ 
+       CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Load,
++                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Load,
+                         blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Blend, false),
+                         "RmlUi drop shadow source composite pass");
+       sourceIndex = scratchIndex;
+@@ -1131,101 +990,19 @@ size_t WebGPURenderInterface::RenderFilters(Rml::Span<const Rml::CompiledFilterH
+       const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
+ 
+       CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
++                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear,
+                         filter_pipeline(PipelineKind::SimpleFilter, m_renderTargetFormat), "RmlUi color matrix pass",
+                         uniform_bind_group_ref(), simpleFilterRange);
+       sourceIndex = scratchIndex;
+       break;
+     }
+     case FilterType::MaskImage: {
+-      CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+-                        filter_pipeline(PipelineKind::MaskImage, m_renderTargetFormat), "RmlUi mask image pass",
+-                        texture_bind_group_ref(filter->mask->view), {}, false);
+-      sourceIndex = scratchIndex;
+-      break;
+-    }
+-    case FilterType::Glass: {
+-      float inkExtension = 0.f;
+-      for (Rml::CompiledFilterHandle handle : filters) {
+-        const auto* chained = reinterpret_cast<const CompiledFilter*>(handle);
+-        if (chained == nullptr) {
+-          continue;
+-        }
+-        switch (chained->type) {
+-        case FilterType::Blur:
+-          inkExtension += 3.f * std::max(chained->sigma, 1.f);
+-          break;
+-        case FilterType::DropShadow:
+-          inkExtension += 3.f * chained->sigma + std::max(std::abs(chained->offset.x), std::abs(chained->offset.y));
+-          break;
+-        case FilterType::Glass:
+-          inkExtension += chained->refraction + 1.f;
+-          break;
+-        default:
+-          break;
+-        }
+-      }
+-      const auto recover_center = [inkExtension](float obsMin, float obsMax, float size, float viewport) {
+-        if (obsMin > 0.5f) {
+-          return obsMin + inkExtension + size * 0.5f;
+-        }
+-        if (obsMax < viewport - 0.5f) {
+-          return obsMax - inkExtension - size * 0.5f;
+-        }
+-        return (obsMin + obsMax) * 0.5f;
+-      };
+-      const Rml::Rectanglei scissor = m_scissorRegion;
+-      const auto [texCoordMin, texCoordMax] = GetPostprocessTexCoordLimits();
+-      const Rml::Vector2f rectCenter{
+-          recover_center(static_cast<float>(scissor.Left()), static_cast<float>(scissor.Right()), filter->rectSize.x,
+-                         static_cast<float>(m_frameSize.width)),
+-          recover_center(static_cast<float>(scissor.Top()), static_cast<float>(scissor.Bottom()), filter->rectSize.y,
+-                         static_cast<float>(m_frameSize.height)),
+-      };
+-      // Per-edge bezel fades (top, right, bottom, left)
+-      Rml::Vector4f edgeFades{1.f, 1.f, 1.f, 1.f};
+-      if (filter->edges >= 0.f) {
+-        const auto bits = static_cast<uint32_t>(filter->edges);
+-        edgeFades = {(bits & 1u) != 0 ? 1.f : 0.f, (bits & 2u) != 0 ? 1.f : 0.f, (bits & 4u) != 0 ? 1.f : 0.f,
+-                     (bits & 8u) != 0 ? 1.f : 0.f};
+-      } else {
+-        const Rml::Vector2f halfSize = filter->rectSize * 0.5f;
+-        if (rectCenter.y - halfSize.y <= 1.f) {
+-          edgeFades.x = 0.f;
+-        }
+-        if (rectCenter.x + halfSize.x >= static_cast<float>(m_frameSize.width) - 1.f) {
+-          edgeFades.y = 0.f;
+-        }
+-        if (rectCenter.y + halfSize.y >= static_cast<float>(m_frameSize.height) - 1.f) {
+-          edgeFades.z = 0.f;
+-        }
+-        if (rectCenter.x - halfSize.x <= 1.f) {
+-          edgeFades.w = 0.f;
+-        }
+-      }
+-      const GlassUniformBlock glassUniform{
+-          .rectCenter = rectCenter,
+-          .rectHalfSize = filter->rectSize * 0.5f,
+-          .cornerRadii = filter->radii,
+-          .tintColor = to_colorf(filter->color),
+-          .frameSize = {static_cast<float>(m_frameSize.width), static_cast<float>(m_frameSize.height)},
+-          .texCoordMin = texCoordMin,
+-          .texCoordMax = texCoordMax,
+-          .bezelWidth = filter->bezel,
+-          .refraction = filter->refraction,
+-          .specular = filter->specular,
+-          .saturation = filter->saturation,
+-          .profile = filter->profile,
+-          .dome = filter->dome,
+-          .edgeFades = edgeFades,
+-          .lightDir = g_glassLightDir,
+-      };
+-      const auto glassRange = gfx::push_uniform(glassUniform);
+-      CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[sourceIndex].view),
+-                        m_postprocessTargets[scratchIndex].view, wgpu::LoadOp::Clear,
+-                        filter_pipeline(PipelineKind::Glass, m_renderTargetFormat), "RmlUi glass pass",
+-                        uniform_bind_group_ref(), glassRange);
++      // maskImage samples the source image (`t`, unit 0) and the mask (`mask_t`, unit 1) in one
++      // draw, so both go in a single texture bind group -- a separate mask group would rebind
++      // unit 0 and clobber the image (GL texture groups bind every unit from the array).
++      CompositeToTarget(mask_bind_group_ref(m_postprocessTargets[sourceIndex].view, m_blendMaskTarget.view),
++                        m_postprocessTargets[scratchIndex].view, gl::LoadOp::Clear,
++                        filter_pipeline(PipelineKind::MaskImage, m_renderTargetFormat), "RmlUi mask image pass");
+       sourceIndex = scratchIndex;
+       break;
+     }
+@@ -1259,24 +1036,16 @@ void WebGPURenderInterface::BeginFrame(const webgpu::TextureWithSampler& target,
+ 
+   NewFrame();
+   EnsureFrameTargets(target.size);
+-  wgpu::Texture multisampleTexture;
+-  wgpu::TextureView multisampleView;
++  gl::Texture multisampleTexture;
++  gl::Texture multisampleView;
+   if constexpr (LayerSampleCount > 1) {
+     if (m_layers[0].multisampleView && m_layers[0].size == target.size) {
+       multisampleTexture = m_layers[0].multisampleTexture;
+       multisampleView = m_layers[0].multisampleView;
+     } else {
+-      const wgpu::TextureDescriptor multisampleTextureDesc{
+-          .label = "RmlUi Multisampled Base Layer",
+-          .usage = wgpu::TextureUsage::RenderAttachment,
+-          .dimension = wgpu::TextureDimension::e2D,
+-          .size = target.size,
+-          .format = m_renderTargetFormat,
+-          .mipLevelCount = 1,
+-          .sampleCount = LayerSampleCount,
+-      };
+-      multisampleTexture = webgpu::g_device.CreateTexture(&multisampleTextureDesc);
+-      multisampleView = multisampleTexture.CreateView(nullptr);
++      // Phase 5: allocate the multisampled base-layer render-attachment texture.
++      multisampleTexture = gl::Texture{};
++      multisampleView = multisampleTexture;
+     }
+   }
+ 
+@@ -1318,7 +1087,7 @@ Rml::LayerHandle WebGPURenderInterface::PushLayer() {
+ 
+   EnsureRenderTarget(m_layers[static_cast<size_t>(layer)], "RmlUi Layer", m_frameSize, true);
+   m_layerStack.push_back(layer);
+-  BeginLayerPass(layer, wgpu::LoadOp::Clear, "RmlUi pushed layer pass");
++  BeginLayerPass(layer, gl::LoadOp::Clear, "RmlUi pushed layer pass");
+   return layer;
+ }
+ 
+@@ -1339,25 +1108,8 @@ void WebGPURenderInterface::CompositeLayers(Rml::LayerHandle source, Rml::LayerH
+   const BlitPipelineType pipelineType =
+       replace ? (m_clipMaskEnabled ? BlitPipelineType::ReplaceMasked : BlitPipelineType::Replace)
+               : (m_clipMaskEnabled ? BlitPipelineType::BlendMasked : BlitPipelineType::Blend);
+-  if (source != destination && activeFilters.size() == 1) {
+-    const auto* filter = reinterpret_cast<const CompiledFilter*>(activeFilters[0]);
+-    if (filter->type == FilterType::MaskImage && filter->mask) {
+-      BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi mask composite pass");
+-      const auto pipeline = gfx::pipeline_ref(make_pipeline_config(
+-          PipelineKind::MaskImage, m_renderTargetFormat, LayerSampleCount, VertexLayoutKind::Fullscreen,
+-          m_clipMaskEnabled ? StencilMode::EqualKeep : StencilMode::AlwaysKeep,
+-          replace ? BlendMode::None : BlendMode::Premultiplied));
+-      DrawFullscreenTexture(texture_bind_group_ref(m_layers[source].view), pipeline,
+-                            texture_bind_group_ref(filter->mask->view), {}, false);
+-      if (destination != topLayer) {
+-        EndActivePass();
+-        m_activeLayer = topLayer;
+-      }
+-      return;
+-    }
+-  }
+   if (activeFilters.empty() && source != destination) {
+-    BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi layer direct composite pass");
++    BeginLayerPass(destination, gl::LoadOp::Load, "RmlUi layer direct composite pass");
+     DrawFullscreenTexture(texture_bind_group_ref(m_layers[source].view),
+                           blit_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true));
+ 
+@@ -1376,7 +1128,7 @@ void WebGPURenderInterface::CompositeLayers(Rml::LayerHandle source, Rml::LayerH
+         .opacity = {simpleFilterOpacity, 0.f, 0.f, 0.f},
+     };
+     const auto simpleFilterRange = gfx::push_uniform(simpleFilterUniform);
+-    BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi simple filter composite pass");
++    BeginLayerPass(destination, gl::LoadOp::Load, "RmlUi simple filter composite pass");
+     DrawFullscreenTexture(texture_bind_group_ref(m_layers[source].view),
+                           simple_filter_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true),
+                           uniform_bind_group_ref(), simpleFilterRange);
+@@ -1388,11 +1140,11 @@ void WebGPURenderInterface::CompositeLayers(Rml::LayerHandle source, Rml::LayerH
+     return;
+   }
+ 
+-  CompositeToTarget(texture_bind_group_ref(m_layers[source].view), m_postprocessTargets[0].view, wgpu::LoadOp::Clear,
++  CompositeToTarget(texture_bind_group_ref(m_layers[source].view), m_postprocessTargets[0].view, gl::LoadOp::Clear,
+                     blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false), "RmlUi layer copy pass");
+   const size_t filteredIndex = RenderFilters(activeFilters);
+ 
+-  BeginLayerPass(destination, wgpu::LoadOp::Load, "RmlUi layer composite pass");
++  BeginLayerPass(destination, gl::LoadOp::Load, "RmlUi layer composite pass");
+   DrawFullscreenTexture(texture_bind_group_ref(m_postprocessTargets[filteredIndex].view),
+                         blit_pipeline(m_renderTargetFormat, LayerSampleCount, pipelineType, true));
+ 
+@@ -1441,45 +1193,39 @@ Rml::TextureHandle WebGPURenderInterface::SaveLayerAsTexture() {
+   }
+ 
+   auto* texData = new ShaderTextureData();
+-  const wgpu::Extent3D textureSize{
++  const gl::Extent3D textureSize{
+       .width = static_cast<uint32_t>(right - left),
+       .height = static_cast<uint32_t>(bottom - top),
+       .depthOrArrayLayers = 1,
+   };
+-  const wgpu::TextureDescriptor textureDesc{
+-      .label = "RmlUi Saved Layer Texture",
+-      .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
+-      .dimension = wgpu::TextureDimension::e2D,
+-      .size = textureSize,
+-      .format = m_renderTargetFormat,
+-      .mipLevelCount = 1,
+-      .sampleCount = 1,
+-  };
+-  texData->m_texture = webgpu::g_device.CreateTexture(&textureDesc);
+-  texData->m_textureView = texData->m_texture.CreateView(nullptr);
++  // Renderable saved-layer color target (the queue_texture_copy below blits the layer subregion
++  // into it via glBlitFramebuffer, so it must be FBO-attachable). View == texture on GL.
++  texData->m_texture = gfx::create_gl_texture(m_renderTargetFormat, textureSize, 1, /*renderable=*/true);
++  texData->m_textureView = texData->m_texture;
+   texData->m_size = textureSize;
++  texData->m_rowBytes = textureSize.width * 4;
+   texData->m_uploaded = true;
+-  texData->m_bytesPerPixel = rmlBytesPerPixel;
+-  texData->m_mipLevels = 1;
+ 
+   EndActivePass();
+ 
+-  const wgpu::TexelCopyTextureInfo src{
++  // Texture-to-texture copy (layer subregion -> saved texture) via glBlitFramebuffer.
++  const gfx::TextureCopyView src{
+       .texture = m_layers[layer].texture,
+       .origin =
+-          wgpu::Origin3D{
++          gl::Origin3D{
+               .x = static_cast<uint32_t>(left),
+               .y = static_cast<uint32_t>(top),
+           },
+-      .aspect = wgpu::TextureAspect::All,
+   };
+-  const wgpu::TexelCopyTextureInfo dst{
++  const gfx::TextureCopyView dst{
+       .texture = texData->m_texture,
+-      .aspect = wgpu::TextureAspect::All,
+   };
+-  gfx::queue_texture_copy(src, dst, textureSize);
++  // The layer is a GL (bottom-left) target but src.origin is a top-left scissor origin, and the
++  // saved texture is later sampled by top-left RmlUi geometry (e.g. box-shadow selection
++  // highlights); flipY converts the source band and stores the region upright.
++  gfx::queue_texture_copy(src, dst, textureSize, /*flipY=*/true);
+ 
+-  BeginLayerPass(layer, wgpu::LoadOp::Load, "RmlUi saved layer restore pass");
++  BeginLayerPass(layer, gl::LoadOp::Load, "RmlUi saved layer restore pass");
+   return reinterpret_cast<Rml::TextureHandle>(texData);
+ }
+ 
+@@ -1497,40 +1243,17 @@ Rml::CompiledFilterHandle WebGPURenderInterface::SaveLayerAsMaskImage() {
+ 
+   EnsureFrameRenderingStarted();
+ 
+-  std::shared_ptr<MaskSnapshot> snapshot{};
+-  std::erase_if(m_maskSnapshots,
+-                [this](const auto& entry) { return entry.use_count() == 1 && entry->size != m_frameSize; });
+-  for (const auto& entry : m_maskSnapshots) {
+-    if (entry.use_count() == 1) {
+-      snapshot = entry;
+-      break;
+-    }
+-  }
+-  if (!snapshot) {
+-    snapshot = std::make_shared<MaskSnapshot>();
+-    snapshot->size = m_frameSize;
+-    const wgpu::TextureDescriptor desc{
+-        .label = "RmlUi Mask Snapshot",
+-        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+-        .dimension = wgpu::TextureDimension::e2D,
+-        .size = m_frameSize,
+-        .format = m_renderTargetFormat,
+-        .mipLevelCount = 1,
+-        .sampleCount = 1,
+-    };
+-    snapshot->texture = webgpu::g_device.CreateTexture(&desc);
+-    snapshot->view = snapshot->texture.CreateView();
+-    m_maskSnapshots.push_back(snapshot);
+-  }
+-  CompositeToTarget(texture_bind_group_ref(m_layers[layer].view), snapshot->view, wgpu::LoadOp::Clear,
++  CompositeToTarget(texture_bind_group_ref(m_layers[layer].view), m_postprocessTargets[0].view, gl::LoadOp::Clear,
++                    blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false),
++                    "RmlUi mask source copy pass");
++  CompositeToTarget(texture_bind_group_ref(m_postprocessTargets[0].view), m_blendMaskTarget.view, gl::LoadOp::Clear,
+                     blit_pipeline(m_renderTargetFormat, 1, BlitPipelineType::Replace, false),
+                     "RmlUi mask image save pass");
+-  EndActivePass();
+-  m_activeLayer = layer;
++
++  BeginLayerPass(layer, gl::LoadOp::Load, "RmlUi mask image restore pass");
+ 
+   auto* filter = new CompiledFilter{
+       .type = FilterType::MaskImage,
+-      .mask = std::move(snapshot),
+   };
+   return reinterpret_cast<Rml::CompiledFilterHandle>(filter);
+ }
+@@ -1563,23 +1286,6 @@ Rml::CompiledFilterHandle WebGPURenderInterface::CompileFilter(const Rml::String
+     return reinterpret_cast<Rml::CompiledFilterHandle>(filter);
+   }
+ 
+-  if (name == "glass") {
+-    auto* filter = new CompiledFilter{
+-        .type = FilterType::Glass,
+-        .color = Rml::Get(parameters, "tint", Rml::Colourb()).ToPremultiplied(),
+-        .bezel = Rml::Get(parameters, "bezel", 10.f),
+-        .refraction = Rml::Get(parameters, "refraction", 20.f),
+-        .specular = Rml::Get(parameters, "specular", 0.5f),
+-        .saturation = Rml::Get(parameters, "saturation", 1.f),
+-        .profile = Rml::Get(parameters, "profile", 0.f),
+-        .dome = Rml::Get(parameters, "dome", 0.f),
+-        .edges = Rml::Get(parameters, "edges", -1.f),
+-        .rectSize = Rml::Get(parameters, "rect_size", Rml::Vector2f(0.f)),
+-        .radii = Rml::Get(parameters, "radii", Rml::Vector4f(0.f)),
+-    };
+-    return reinterpret_cast<Rml::CompiledFilterHandle>(filter);
+-  }
+-
+   CompiledFilter colorMatrixFilter = {
+       .type = FilterType::ColorMatrix,
+   };
+@@ -1640,12 +1346,6 @@ void WebGPURenderInterface::ReleaseFilter(Rml::CompiledFilterHandle filter) {
+ 
+ Rml::CompiledShaderHandle WebGPURenderInterface::CompileShader(const Rml::String& name,
+                                                                const Rml::Dictionary& parameters) {
+-  if (name == "image-effects") {
+-    auto* shader = new CompiledShaderData{};
+-    shader->imageEffects = true;
+-    shader->image.parameters = Rml::Get(parameters, "parameters", Rml::Vector4f{});
+-    return reinterpret_cast<Rml::CompiledShaderHandle>(shader);
+-  }
+   const bool supportedGradient = name == "linear-gradient" || name == "radial-gradient" || name == "conic-gradient";
+   if (!supportedGradient) {
+     Log.warn("Unsupported RmlUi shader '{}'", name);
+@@ -1703,19 +1403,12 @@ Rml::CompiledShaderHandle WebGPURenderInterface::CompileShader(const Rml::String
+ }
+ 
+ void WebGPURenderInterface::RenderShader(Rml::CompiledShaderHandle shader, Rml::CompiledGeometryHandle geometry,
+-                                         Rml::Vector2f translation, Rml::TextureHandle texture) {
++                                         Rml::Vector2f translation, Rml::TextureHandle) {
+   const auto* shaderData = reinterpret_cast<const CompiledShaderData*>(shader);
+   const auto* geometryData = reinterpret_cast<const ShaderGeometryData*>(geometry);
+   if (shaderData == nullptr || geometryData == nullptr) {
+     return;
+   }
+-  if (shaderData->imageEffects) {
+-    const auto pipeline = gfx::pipeline_ref(make_pipeline_config(
+-        PipelineKind::ImageEffects, m_renderTargetFormat, LayerSampleCount, VertexLayoutKind::Geometry,
+-        m_clipMaskEnabled ? StencilMode::EqualKeep : StencilMode::AlwaysKeep, BlendMode::Premultiplied));
+-    DrawGeometry(geometry, translation, texture, pipeline, gfx::push_uniform(shaderData->image));
+-    return;
+-  }
+   EnsureActiveLayerPass("RmlUi resumed shader layer pass");
+   if (!m_passActive) {
+     return;
+@@ -1749,29 +1442,11 @@ void WebGPURenderInterface::ReleaseShader(Rml::CompiledShaderHandle shader) {
+ }
+ 
+ void WebGPURenderInterface::CreateDeviceObjects() {
++  // Phase 5: gl::TextureFormat only enumerates the formats this fork ships, so the sRGB
++  // gamma set collapses to the single sRGB member present (RGBA8UnormSrgb). The GL backend
++  // never selects the BC/ETC/ASTC/BGRA sRGB render-target formats the old Dawn switch listed.
+   switch (m_renderTargetFormat) {
+-  case wgpu::TextureFormat::ASTC10x10UnormSrgb:
+-  case wgpu::TextureFormat::ASTC10x5UnormSrgb:
+-  case wgpu::TextureFormat::ASTC10x6UnormSrgb:
+-  case wgpu::TextureFormat::ASTC10x8UnormSrgb:
+-  case wgpu::TextureFormat::ASTC12x10UnormSrgb:
+-  case wgpu::TextureFormat::ASTC12x12UnormSrgb:
+-  case wgpu::TextureFormat::ASTC4x4UnormSrgb:
+-  case wgpu::TextureFormat::ASTC5x5UnormSrgb:
+-  case wgpu::TextureFormat::ASTC6x5UnormSrgb:
+-  case wgpu::TextureFormat::ASTC6x6UnormSrgb:
+-  case wgpu::TextureFormat::ASTC8x5UnormSrgb:
+-  case wgpu::TextureFormat::ASTC8x6UnormSrgb:
+-  case wgpu::TextureFormat::ASTC8x8UnormSrgb:
+-  case wgpu::TextureFormat::BC1RGBAUnormSrgb:
+-  case wgpu::TextureFormat::BC2RGBAUnormSrgb:
+-  case wgpu::TextureFormat::BC3RGBAUnormSrgb:
+-  case wgpu::TextureFormat::BC7RGBAUnormSrgb:
+-  case wgpu::TextureFormat::BGRA8UnormSrgb:
+-  case wgpu::TextureFormat::ETC2RGB8A1UnormSrgb:
+-  case wgpu::TextureFormat::ETC2RGB8UnormSrgb:
+-  case wgpu::TextureFormat::ETC2RGBA8UnormSrgb:
+-  case wgpu::TextureFormat::RGBA8UnormSrgb:
++  case gl::TextureFormat::RGBA8UnormSrgb:
+     m_gamma = 2.2f;
+     break;
+   default:
+@@ -1837,30 +1512,17 @@ void WebGPURenderInterface::NewFrame() {
+   m_stencilRef = 0;
+ }
+ 
+-wgpu::TextureView WebGPURenderInterface::GetClipMaskStencilView(const wgpu::Extent3D& size) {
++gl::Texture WebGPURenderInterface::GetClipMaskStencilView(const gl::Extent3D& size) {
+   if (m_clipMaskStencilView && m_clipMaskStencilSize == size) {
+     return m_clipMaskStencilView;
+   }
+ 
+   m_clipMaskStencilSize = size;
+-  const wgpu::TextureDescriptor textureDesc{
+-      .label = "RmlUi Clip Mask Stencil",
+-      .usage = wgpu::TextureUsage::RenderAttachment,
+-      .dimension = wgpu::TextureDimension::e2D,
+-      .size = size,
+-      .format = ClipMaskStencilFormat,
+-      .mipLevelCount = 1,
+-      .sampleCount = LayerSampleCount,
+-  };
+-  m_clipMaskStencilTexture = webgpu::g_device.CreateTexture(&textureDesc);
+-
+-  constexpr wgpu::TextureViewDescriptor viewDesc{
+-      .label = "RmlUi Clip Mask Stencil View",
+-      .format = ClipMaskStencilFormat,
+-      .dimension = wgpu::TextureViewDimension::e2D,
+-      .aspect = wgpu::TextureAspect::StencilOnly,
+-  };
+-  m_clipMaskStencilView = m_clipMaskStencilTexture.CreateView(&viewDesc);
++  // DEPTH24_STENCIL8 clip-mask attachment. The depth aspect is unused; only the stencil aspect
++  // drives clipping. On GL the view collapses into the texture. create_gl_texture marshals the
++  // create to the worker and blocks so the handle is valid here.
++  m_clipMaskStencilTexture = gfx::create_gl_texture(ClipMaskStencilFormat, size, 1, /*renderable=*/true);
++  m_clipMaskStencilView = m_clipMaskStencilTexture;
+   return m_clipMaskStencilView;
+ }
+ 
+diff --git a/lib/rmlui/WebGPURenderInterface.hpp b/lib/rmlui/WebGPURenderInterface.hpp
+index b24ec60f982be490f9a62b2edd2d9c685dcf6d7a..e80a8bbea8ff545495e25cea47f105b75dd4d54b 100644
+--- a/lib/rmlui/WebGPURenderInterface.hpp
++++ b/lib/rmlui/WebGPURenderInterface.hpp
+@@ -3,7 +3,6 @@
+ #include <memory>
+ #include <vector>
+ 
+-#include <dawn/webgpu_cpp.h>
+ 
+ #include "../gfx/clear.hpp"
+ #include "RmlUi/Core/RenderInterface.h"
+@@ -96,7 +95,10 @@ enum class BaseLayerContent {
+ 
+ class WebGPURenderInterface : public Rml::RenderInterface {
+ public:
+-  static constexpr wgpu::TextureFormat ClipMaskStencilFormat = wgpu::TextureFormat::Stencil8;
++  // Combined depth-stencil rather than standalone Stencil8: a stencil-only texture maps to
++  // GL_STENCIL_INDEX8, which needs GL_OES_texture_stencil8 (ES 3.2) and is absent on older GLES
++  // blobs (e.g. some PowerVR). GL_DEPTH24_STENCIL8 is core ES 3.0. The depth aspect goes unused.
++  static constexpr gl::TextureFormat ClipMaskStencilFormat = gl::TextureFormat::Depth24PlusStencil8;
+ 
+   enum class PipelineType {
+     Normal,
+@@ -116,20 +118,20 @@ public:
+ 
+ private:
+   struct RenderTarget {
+-    wgpu::Texture texture;
+-    wgpu::TextureView view;
+-    wgpu::Texture multisampleTexture;
+-    wgpu::TextureView multisampleView;
+-    wgpu::Extent3D size;
++    gl::Texture texture;
++    gl::Texture view;
++    gl::Texture multisampleTexture;
++    gl::Texture multisampleView;
++    gl::Extent3D size;
+   };
+ 
+-  wgpu::TextureView m_frameSeedView;
++  gl::Texture m_frameSeedView;
+ 
+-  wgpu::TextureFormat m_renderTargetFormat = wgpu::TextureFormat::Undefined;
+-  wgpu::Texture m_clipMaskStencilTexture;
+-  wgpu::TextureView m_clipMaskStencilView;
+-  wgpu::Extent3D m_clipMaskStencilSize{};
+-  wgpu::Extent3D m_frameSize{};
++  gl::TextureFormat m_renderTargetFormat = gl::TextureFormat::Undefined;
++  gl::Texture m_clipMaskStencilTexture;
++  gl::Texture m_clipMaskStencilView;
++  gl::Extent3D m_clipMaskStencilSize{};
++  gl::Extent3D m_frameSize{};
+   gfx::Viewport m_viewport{};
+ 
+   Rml::TextureHandle m_nullTexture = 0;
+@@ -157,15 +159,15 @@ private:
+ 
+   gfx::Range SetupRenderState(const Rml::Vector2f& translation);
+ 
+-  void EnsureRenderTarget(RenderTarget& target, const char* label, const wgpu::Extent3D& size,
++  void EnsureRenderTarget(RenderTarget& target, const char* label, const gl::Extent3D& size,
+                           bool multisampled = false);
+-  void EnsureFrameTargets(const wgpu::Extent3D& size);
++  void EnsureFrameTargets(const gl::Extent3D& size);
+   Rml::Rectanglei GetActiveScissorRegion() const;
+   TexCoordLimits GetPostprocessTexCoordLimits() const;
+   TexCoordLimits GetPostprocessTexCoordLimits(Rml::Rectanglei region) const;
+-  void BeginRenderTargetPass(const wgpu::TextureView& view, wgpu::LoadOp loadOp, const char* label,
++  void BeginRenderTargetPass(const gl::Texture& view, gl::LoadOp loadOp, const char* label,
+                              bool clearStencil = false);
+-  void BeginLayerPass(Rml::LayerHandle layer, wgpu::LoadOp loadOp, const char* label, bool clearStencil = false,
++  void BeginLayerPass(Rml::LayerHandle layer, gl::LoadOp loadOp, const char* label, bool clearStencil = false,
+                       bool resolveMultisampled = true);
+   void EnsureFrameRenderingStarted();
+   void EnsureActiveLayerPass(const char* label);
+@@ -182,7 +184,7 @@ private:
+                              gfx::BindGroupRef extraBindGroup = 0, gfx::Range extraUniformRange = {},
+                              bool extraBindGroupHasDynamicOffset = true, std::array<float, 4> blendConstant = {},
+                              bool hasBlendConstant = false);
+-  void CompositeToTarget(gfx::BindGroupRef bindGroup, const wgpu::TextureView& view, wgpu::LoadOp loadOp,
++  void CompositeToTarget(gfx::BindGroupRef bindGroup, const gl::Texture& view, gl::LoadOp loadOp,
+                          gfx::PipelineRef pipeline, const char* label, gfx::BindGroupRef extraBindGroup = 0,
+                          gfx::Range extraUniformRange = {}, bool extraBindGroupHasDynamicOffset = true,
+                          std::array<float, 4> blendConstant = {}, bool hasBlendConstant = false);
+@@ -222,8 +224,8 @@ public:
+                   BaseLayerContent baseLayerContent);
+   bool EndFrame();
+   void SetWindowSize(const Rml::Vector2i& window_size) { m_windowSize = window_size; }
+-  void SetRenderTargetFormat(wgpu::TextureFormat render_target_format) { m_renderTargetFormat = render_target_format; }
+-  wgpu::TextureView GetClipMaskStencilView(const wgpu::Extent3D& size);
++  void SetRenderTargetFormat(gl::TextureFormat render_target_format) { m_renderTargetFormat = render_target_format; }
++  gl::Texture GetClipMaskStencilView(const gl::Extent3D& size);
+ 
+   void CreateDeviceObjects();
+ 
+diff --git a/lib/rmlui/pipeline.cpp b/lib/rmlui/pipeline.cpp
+index 82fcbcdd2f69f0564766b5af0f7ad3d1ecc1d356..ca45588318f84ddf66dd4e91972a1973e0d36568 100644
+--- a/lib/rmlui/pipeline.cpp
++++ b/lib/rmlui/pipeline.cpp
+@@ -1,13 +1,15 @@
+ #include "pipeline.hpp"
+ 
+-#include "../gfx/encoding.hpp"
+-#include "../gfx/resources.hpp"
+-#include "../gfx/resource_cache.hpp"
+ #include "../internal.hpp"
+ #include "../webgpu/gpu.hpp"
+ 
++#include "../gl/gl_core.hpp"
++#include "../gl/program.hpp"
++#include "../gl/state.hpp"
++
+ #include <algorithm>
+ #include <array>
++#include <string>
+ #include <string_view>
+ 
+ #include <RmlUi/Core/Vertex.h>
+@@ -17,696 +19,417 @@ namespace aurora::rmlui {
+ namespace {
+ using namespace std::string_view_literals;
+ 
+-wgpu::BindGroupLayout g_commonBindGroupLayout;
+-wgpu::BindGroupLayout g_imageBindGroupLayout;
+-wgpu::BindGroupLayout g_uniformBindGroupLayout;
+-wgpu::Sampler g_sampler;
++// WebGPU bind-group *layouts* have no GL equivalent (GL binds textures/uniform
++// blocks by unit/index at draw time), so the three layout globals are gone. Only
++// the shared filtering sampler survives.
++gl::Sampler g_sampler;
+ 
+ constexpr uint32_t DynamicGroup1 = 1u << 1u;
+ constexpr uint32_t DynamicGroup2 = 1u << 2u;
+ 
++// GL uniform-block binding points (S4). The common vertex/gamma block sits at 0
++// (common_bind_group_ref); the per-effect block (gradient/blur/seed/filter/shadow) at
++// 1 (uniform_bind_group_ref). GL_INVALID_INDEX (0xFFFFFFFF) means the program does not
++// declare that block, which is fine -- the inert bind is ignored.
++constexpr gl::GLuint kCommonBlockBinding = 0;
++constexpr gl::GLuint kExtraBlockBinding = 1;
++constexpr gl::GLuint kInvalidBlockIndex = 0xFFFFFFFFu;
++// Texture units: the image sampler `t` is unit 0, the mask sampler `mask_t` unit 1.
++constexpr gl::GLint kImageTextureUnit = 0;
++constexpr gl::GLint kMaskTextureUnit = 1;
++
+ constexpr uint64_t CommonUniformBindingSize = AURORA_ALIGN(sizeof(UniformBlock), 16);
+ constexpr uint64_t ExtraUniformBindingSize =
+     AURORA_ALIGN(std::max({sizeof(BlurUniformBlock), sizeof(DropShadowUniformBlock), sizeof(SimpleFilterUniformBlock),
+-                           sizeof(GradientUniformBlock), sizeof(SeedResampleUniformBlock), sizeof(GlassUniformBlock),
+-                           sizeof(ImageEffectsUniformBlock)}),
++                           sizeof(GradientUniformBlock), sizeof(SeedResampleUniformBlock)}),
+                  16);
+ 
+-constexpr std::string_view vertexSource = R"(
+-struct VertexInput {
+-    @location(0) position: vec2<f32>,
+-    @location(1) uv: vec2<f32>,
+-    @location(2) color: vec4<f32>,
+-};
+-
+-struct VertexOutput {
+-    @builtin(position) position: vec4<f32>,
+-    @location(0) color: vec4<f32>,
+-    @location(1) uv: vec2<f32>,
+-    @location(2) local_position: vec2<f32>,
+-};
+-
+-struct Uniforms {
+-    mvp: mat4x4<f32>,
+-    translation: vec4<f32>,
+-    gamma: f32,
+-};
+-
+-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+-
+-@vertex
+-fn main(in: VertexInput) -> VertexOutput {
+-    var out: VertexOutput;
+-    var translatedPos = uniforms.translation.xy + in.position;
+-
+-    out.position = uniforms.mvp * vec4<f32>(translatedPos, 0.0, 1.0);
+-    out.color = in.color;
+-    out.uv = in.uv;
+-    out.local_position = in.position;
+-    return out;
++// ---------------------------------------------------------------------------
++// GLSL (#version 300 es) ports of the RmlUi WGSL shaders. Translation rules
++// (mirrors the GX emitter): textureSample(t,s,uv) -> texture(t,uv) (combined
++// samplers, S3); textureLoad -> texelFetch; textureDimensions -> textureSize;
++// @builtin(position) fragment input -> gl_FragCoord; @builtin(vertex_index) ->
++// gl_VertexID; uniform blocks -> layout(std140) uniform Name {...} inst; (S4);
++// atan2(y,x) -> atan(y,x). The `Uniforms` block is declared identically in the
++// vertex and fragment stages (GLSL ES requires matching block declarations).
++// No projection Y-flip here: the MVP flip lives in SetupRenderState (S1d).
++// ---------------------------------------------------------------------------
++
++// Geometry vertex shader (also used by the gradient pipeline). The `Uniforms` block is
++// repeated verbatim in every stage that references it (GLSL ES requires the vertex and
++// fragment declarations of a shared block to match exactly).
++
++constexpr std::string_view vertexSource = R"(#version 300 es
++layout(std140) uniform Uniforms {
++  mat4 mvp;
++  vec4 translation;
++  float gamma;
++} uniforms;
++layout(location = 0) in vec2 in_position;
++layout(location = 1) in vec2 in_uv;
++layout(location = 2) in vec4 in_color;
++out vec4 v_color;
++out vec2 v_uv;
++void main() {
++  vec2 translatedPos = uniforms.translation.xy + in_position;
++  gl_Position = uniforms.mvp * vec4(translatedPos, 0.0, 1.0);
++  v_color = in_color;
++  v_uv = in_uv;
+ }
+ )"sv;
+ 
+-constexpr std::string_view fragmentSource = R"(
+-struct VertexOutput {
+-    @builtin(position) position: vec4<f32>,
+-    @location(0) color: vec4<f32>,
+-    @location(1) uv: vec2<f32>,
+-};
+-
+-struct Uniforms {
+-    mvp: mat4x4<f32>,
+-    translation: vec4<f32>,
+-    gamma: f32,
+-};
+-
+-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-
+-@fragment
+-fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+-    let color = in.color * textureSample(t, s, in.uv);
+-    if (uniforms.gamma == 1.0) {
+-        return color;
+-    }
+-    let corrected_color = pow(color.rgb, vec3<f32>(uniforms.gamma));
+-    return vec4<f32>(corrected_color, color.a);
++constexpr std::string_view fragmentSource = R"(#version 300 es
++precision highp float;
++layout(std140) uniform Uniforms {
++  mat4 mvp;
++  vec4 translation;
++  float gamma;
++} uniforms;
++uniform sampler2D t;
++in vec4 v_color;
++in vec2 v_uv;
++out vec4 out_color;
++void main() {
++  vec4 color = v_color * texture(t, v_uv);
++  if (uniforms.gamma == 1.0) {
++    out_color = color;
++  } else {
++    vec3 corrected = pow(color.rgb, vec3(uniforms.gamma));
++    out_color = vec4(corrected, color.a);
++  }
+ }
+ )"sv;
+ 
+-constexpr std::string_view imageEffectsFragmentSource = R"(
+-struct VertexOutput {
+-    @builtin(position) position: vec4<f32>,
+-    @location(0) color: vec4<f32>,
+-    @location(1) uv: vec2<f32>,
+-    @location(2) local_position: vec2<f32>,
+-};
+-
+-struct Uniforms {
+-    mvp: mat4x4<f32>,
+-    translation: vec4<f32>,
+-    gamma: f32,
+-};
+-struct ImageEffects { parameters: vec4<f32> };
+-
+-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var<uniform> image: ImageEffects;
+-
+-@fragment
+-fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+-    var color = in.color * textureSample(t, s, in.uv);
+-    if (uniforms.gamma != 1.0) {
+-        color = vec4<f32>(pow(color.rgb, vec3<f32>(uniforms.gamma)), color.a);
+-    }
+-    let gray = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+-    color = vec4<f32>(mix(color.rgb, vec3<f32>(gray), image.parameters.z), color.a);
+-    if (image.parameters.w > 0.0) {
+-        let fade = clamp((image.parameters.y - in.local_position.y) /
+-                         max(image.parameters.y - image.parameters.x, 0.000001), 0.0, 1.0);
+-        color *= fade;
++constexpr std::string_view gradientFragmentSource = R"(#version 300 es
++precision highp float;
++precision highp int;
++layout(std140) uniform Uniforms {
++  mat4 mvp;
++  vec4 translation;
++  float gamma;
++} uniforms;
++layout(std140) uniform GradientUniforms {
++  int function;
++  int num_stops;
++  vec2 p;
++  vec2 v;
++  vec2 padding;
++  vec4 stop_colors[16];
++  vec4 stop_positions[4];
++} gradient;
++in vec4 v_color;
++in vec2 v_uv;
++out vec4 out_color;
++
++const int LINEAR = 0;
++const int RADIAL = 1;
++const int CONIC = 2;
++const int REPEATING_LINEAR = 3;
++const int REPEATING_RADIAL = 4;
++const int REPEATING_CONIC = 5;
++const float PI = 3.14159265;
++
++float bayer_dither(vec2 position) {
++  int bayer[64] = int[64](
++    0, 32, 8, 40, 2, 34, 10, 42,
++    48, 16, 56, 24, 50, 18, 58, 26,
++    12, 44, 4, 36, 14, 46, 6, 38,
++    60, 28, 52, 20, 62, 30, 54, 22,
++    3, 35, 11, 43, 1, 33, 9, 41,
++    51, 19, 59, 27, 49, 17, 57, 25,
++    15, 47, 7, 39, 13, 45, 5, 37,
++    63, 31, 55, 23, 61, 29, 53, 21);
++  int x = int(position.x) % 8;
++  int y = int(position.y) % 8;
++  return (float(bayer[x + y * 8]) / 64.0 - 0.5) / 255.0;
++}
++
++float stop_position(int index) {
++  int group_index = index / 4;
++  int component_index = index % 4;
++  return gradient.stop_positions[group_index][component_index];
++}
++
++vec4 stop_color_mix(float t) {
++  vec4 color = gradient.stop_colors[0];
++  for (int i = 1; i < 16; i++) {
++    if (i < gradient.num_stops) {
++      color = mix(color, gradient.stop_colors[i], smoothstep(stop_position(i - 1), stop_position(i), t));
+     }
+-    return color;
+-}
+-)"sv;
+-
+-constexpr std::string_view gradientFragmentSource = R"(
+-struct VertexOutput {
+-    @builtin(position) position: vec4<f32>,
+-    @location(0) color: vec4<f32>,
+-    @location(1) uv: vec2<f32>,
+-};
+-
+-struct Uniforms {
+-    mvp: mat4x4<f32>,
+-    translation: vec4<f32>,
+-    gamma: f32,
+-};
+-
+-struct GradientUniforms {
+-    function: i32,
+-    num_stops: i32,
+-    p: vec2<f32>,
+-    v: vec2<f32>,
+-    padding: vec2<f32>,
+-    stop_colors: array<vec4<f32>, 16>,
+-    stop_positions: array<vec4<f32>, 4>,
+-};
+-
+-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+-@group(1) @binding(0) var<uniform> gradient: GradientUniforms;
+-
+-const LINEAR: i32 = 0;
+-const RADIAL: i32 = 1;
+-const CONIC: i32 = 2;
+-const REPEATING_LINEAR: i32 = 3;
+-const REPEATING_RADIAL: i32 = 4;
+-const REPEATING_CONIC: i32 = 5;
+-const PI: f32 = 3.14159265;
+-
+-fn bayer_dither(position: vec4<f32>) -> f32 {
+-    let x = u32(position.x) % 8u;
+-    let y = u32(position.y) % 8u;
+-    let z = x ^ y;
+-    let bayer = ((z & 1u) << 5u) | ((y & 1u) << 4u) | ((z & 2u) << 2u) |
+-                ((y & 2u) << 1u) | ((z & 4u) >> 1u) | ((y & 4u) >> 2u);
+-    return (f32(bayer) / 64.0 - 0.5) / 255.0;
+-}
+-
+-fn stop_position(index: i32) -> f32 {
+-    let stop_index = u32(index);
+-    let group_index = stop_index / 4u;
+-    let component_index = stop_index % 4u;
+-    return gradient.stop_positions[group_index][component_index];
+-}
+-
+-fn stop_color_mix(t: f32) -> vec4<f32> {
+-    var color = gradient.stop_colors[0];
+-
+-    for (var i = 1; i < 16; i = i + 1) {
+-        if (i < gradient.num_stops) {
+-            color = mix(color, gradient.stop_colors[u32(i)], smoothstep(stop_position(i - 1), stop_position(i), t));
+-        }
+-    }
+-
+-    return color;
+-}
+-
+-@fragment
+-fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+-    var t = 0.0;
+-
+-    if (gradient.function == LINEAR || gradient.function == REPEATING_LINEAR) {
+-        let dist_square = dot(gradient.v, gradient.v);
+-        let v = in.uv - gradient.p;
+-        t = dot(gradient.v, v) / dist_square;
+-    } else if (gradient.function == RADIAL || gradient.function == REPEATING_RADIAL) {
+-        let v = in.uv - gradient.p;
+-        t = length(gradient.v * v);
+-    } else if (gradient.function == CONIC || gradient.function == REPEATING_CONIC) {
+-        let v = in.uv - gradient.p;
+-        let rotated = vec2<f32>(
+-            gradient.v.x * v.x + gradient.v.y * v.y,
+-            -gradient.v.y * v.x + gradient.v.x * v.y
+-        );
+-        t = 0.5 + atan2(-rotated.x, rotated.y) / (2.0 * PI);
+-    }
+-
+-    if (gradient.function == REPEATING_LINEAR ||
+-        gradient.function == REPEATING_RADIAL ||
+-        gradient.function == REPEATING_CONIC) {
+-        let t0 = stop_position(0);
+-        let t1 = stop_position(gradient.num_stops - 1);
+-        let span = t1 - t0;
+-        t = t0 + (t - t0) - span * floor((t - t0) / span);
+-    }
+-
+-    let color = in.color * stop_color_mix(t);
+-    if (uniforms.gamma == 1.0) {
+-        return color;
+-    }
+-    let corrected_color = pow(color.rgb, vec3<f32>(uniforms.gamma));
+-    let dithered_color = clamp(corrected_color + vec3<f32>(bayer_dither(in.position)), vec3<f32>(0.0), vec3<f32>(1.0));
+-    return vec4<f32>(dithered_color, color.a);
++  }
++  return color;
++}
++
++void main() {
++  float t = 0.0;
++  if (gradient.function == LINEAR || gradient.function == REPEATING_LINEAR) {
++    float dist_square = dot(gradient.v, gradient.v);
++    vec2 vv = v_uv - gradient.p;
++    t = dot(gradient.v, vv) / dist_square;
++  } else if (gradient.function == RADIAL || gradient.function == REPEATING_RADIAL) {
++    vec2 vv = v_uv - gradient.p;
++    t = length(gradient.v * vv);
++  } else if (gradient.function == CONIC || gradient.function == REPEATING_CONIC) {
++    vec2 vv = v_uv - gradient.p;
++    vec2 rotated = vec2(gradient.v.x * vv.x + gradient.v.y * vv.y,
++                        -gradient.v.y * vv.x + gradient.v.x * vv.y);
++    t = 0.5 + atan(-rotated.x, rotated.y) / (2.0 * PI);
++  }
++  if (gradient.function == REPEATING_LINEAR ||
++      gradient.function == REPEATING_RADIAL ||
++      gradient.function == REPEATING_CONIC) {
++    float t0 = stop_position(0);
++    float t1 = stop_position(gradient.num_stops - 1);
++    float span = t1 - t0;
++    t = t0 + (t - t0) - span * floor((t - t0) / span);
++  }
++  vec4 color = v_color * stop_color_mix(t);
++  if (uniforms.gamma == 1.0) {
++    out_color = color;
++  } else {
++    vec3 corrected = pow(color.rgb, vec3(uniforms.gamma));
++    vec3 dithered = clamp(corrected + vec3(bayer_dither(gl_FragCoord.xy)), vec3(0.0), vec3(1.0));
++    out_color = vec4(dithered, color.a);
++  }
+ }
+ )"sv;
+ 
+-constexpr std::string_view fullscreenVertexSource = R"(
+-struct VertexOutput {
+-    @builtin(position) position: vec4<f32>,
+-    @location(0) uv: vec2<f32>,
+-};
+-
+-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+-    vec2(-1.0, 1.0),
+-    vec2(-1.0, -3.0),
+-    vec2(3.0, 1.0),
+-);
+-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+-    vec2(0.0, 0.0),
+-    vec2(0.0, 2.0),
+-    vec2(2.0, 0.0),
+-);
+-
+-@vertex
+-fn main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
+-    var out: VertexOutput;
+-    out.position = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
+-    out.uv = uvs[vtxIdx];
+-    return out;
++// Fullscreen-triangle vertex shader (gl_VertexID; no vertex buffer). Orientation-preserving in GL:
++// v=0 at NDC.y=-1 (dest row 0), so a fullscreen copy maps source row R -> dest row R. The whole GL
++// pipeline is bottom-left origin (GX scene target, every RmlUi render target, the window), so
++// preserving here keeps the entire chain -- scene seed, layer copies, blur/filter passes and the
++// final present composite -- consistently GL-native with no explicit V-flip anywhere.
++constexpr std::string_view fullscreenVertexSource = R"(#version 300 es
++out vec2 v_uv;
++void main() {
++  const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
++  const vec2 uvs[3] = vec2[3](vec2(0.0, 1.0), vec2(0.0, -1.0), vec2(2.0, 1.0));
++  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
++  v_uv = uvs[gl_VertexID];
+ }
+ )"sv;
+ 
+-constexpr std::string_view blurVertexSource = R"(
+-struct BlurUniforms {
+-    texel_offset: vec2<f32>,
+-    radius: f32,
+-    padding: f32,
+-    tex_coord_min: vec2<f32>,
+-    tex_coord_max: vec2<f32>,
+-    weights: vec4<f32>,
+-};
+-
+-struct VertexOutput {
+-    @builtin(position) position: vec4<f32>,
+-    @location(0) uv0: vec2<f32>,
+-    @location(1) uv1: vec2<f32>,
+-    @location(2) uv2: vec2<f32>,
+-    @location(3) uv3: vec2<f32>,
+-    @location(4) uv4: vec2<f32>,
+-    @location(5) uv5: vec2<f32>,
+-    @location(6) uv6: vec2<f32>,
+-};
+-
+-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
+-
+-const BLUR_NUM_WEIGHTS: i32 = 4;
+-
+-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+-    vec2(-1.0, 1.0),
+-    vec2(-1.0, -3.0),
+-    vec2(3.0, 1.0),
+-);
+-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(
+-    vec2(0.0, 0.0),
+-    vec2(0.0, 2.0),
+-    vec2(2.0, 0.0),
+-);
+-
+-fn blur_uv(uv: vec2<f32>, index: i32) -> vec2<f32> {
+-    return uv - f32(index - BLUR_NUM_WEIGHTS + 1) * blur.texel_offset;
+-}
+-
+-@vertex
+-fn main(@builtin(vertex_index) vtxIdx: u32) -> VertexOutput {
+-    let uv = uvs[vtxIdx];
+-    var out: VertexOutput;
+-    out.position = vec4<f32>(pos[vtxIdx], 0.0, 1.0);
+-    out.uv0 = blur_uv(uv, 0);
+-    out.uv1 = blur_uv(uv, 1);
+-    out.uv2 = blur_uv(uv, 2);
+-    out.uv3 = blur_uv(uv, 3);
+-    out.uv4 = blur_uv(uv, 4);
+-    out.uv5 = blur_uv(uv, 5);
+-    out.uv6 = blur_uv(uv, 6);
+-    return out;
++// Blur/region fullscreen vertex shader: pre-computes seven tap UVs from the texel offset.
++constexpr std::string_view blurVertexSource = R"(#version 300 es
++layout(std140) uniform BlurUniforms {
++  vec2 texel_offset;
++  float radius;
++  float padding;
++  vec2 tex_coord_min;
++  vec2 tex_coord_max;
++  vec4 weights;
++} blur;
++out vec2 v_uv0;
++out vec2 v_uv1;
++out vec2 v_uv2;
++out vec2 v_uv3;
++out vec2 v_uv4;
++out vec2 v_uv5;
++out vec2 v_uv6;
++const int BLUR_NUM_WEIGHTS = 4;
++vec2 blur_uv(vec2 uv, int index) {
++  return uv - float(index - BLUR_NUM_WEIGHTS + 1) * blur.texel_offset;
++}
++void main() {
++  const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
++  const vec2 uvs[3] = vec2[3](vec2(0.0, 1.0), vec2(0.0, -1.0), vec2(2.0, 1.0));
++  vec2 uv = uvs[gl_VertexID];
++  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
++  v_uv0 = blur_uv(uv, 0);
++  v_uv1 = blur_uv(uv, 1);
++  v_uv2 = blur_uv(uv, 2);
++  v_uv3 = blur_uv(uv, 3);
++  v_uv4 = blur_uv(uv, 4);
++  v_uv5 = blur_uv(uv, 5);
++  v_uv6 = blur_uv(uv, 6);
+ }
+ )"sv;
+ 
+-constexpr std::string_view blitFragmentSource = R"(
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-
+-@fragment
+-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    return textureSample(t, s, uv);
+-}
++constexpr std::string_view blitFragmentSource = R"(#version 300 es
++precision highp float;
++uniform sampler2D t;
++in vec2 v_uv;
++out vec4 out_color;
++void main() { out_color = texture(t, v_uv); }
+ )"sv;
+ 
+-constexpr std::string_view opaqueBlitFragmentSource = R"(
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-
+-@fragment
+-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    let color = textureSample(t, s, uv);
+-    return vec4<f32>(color.rgb, 1.0);
+-}
++constexpr std::string_view opaqueBlitFragmentSource = R"(#version 300 es
++precision highp float;
++uniform sampler2D t;
++in vec2 v_uv;
++out vec4 out_color;
++void main() { out_color = vec4(texture(t, v_uv).rgb, 1.0); }
+ )"sv;
+ 
+-constexpr std::string_view seedResampleFragmentSource = R"(
+-struct SeedUniforms {
+-    sampler_mode: u32,
+-    frame_width: f32,
+-    frame_height: f32,
+-    pad: u32,
+-};
+-
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var<uniform> uniforms: SeedUniforms;
+-
+-fn sample_by_pixel(pixel: vec2<i32>) -> vec4<f32> {
+-    let source_dims = textureDimensions(t);
+-    let max_coord = vec2<i32>(source_dims) - vec2<i32>(1, 1);
+-    let coord = clamp(pixel, vec2<i32>(0, 0), max_coord);
+-    return textureLoad(t, coord, 0);
+-}
+-
+-fn sample_area(frag_position: vec4<f32>) -> vec4<f32> {
+-    let source_size = vec2<f32>(textureDimensions(t));
+-    let target_size = max(vec2<f32>(uniforms.frame_width, uniforms.frame_height), vec2<f32>(1.0, 1.0));
+-
+-    let source_min = clamp((frag_position.xy - vec2<f32>(0.5, 0.5)) / target_size,
+-                           vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)) * source_size;
+-    let source_max = clamp((frag_position.xy + vec2<f32>(0.5, 0.5)) / target_size,
+-                           vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0)) * source_size;
+-
+-    let first_pixel = vec2<i32>(floor(source_min));
+-    let last_pixel = vec2<i32>(ceil(source_max));
+-    let max_iterations: i32 = 16;
+-
+-    var avg_color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+-    var total_weight = 0.0;
+-
+-    for (var iy: i32 = 0; iy < max_iterations; iy = iy + 1) {
+-        let source_y = first_pixel.y + iy;
+-        if (source_y < last_pixel.y) {
+-            let y0 = f32(source_y);
+-            let weight_y = max(min(source_max.y, y0 + 1.0) - max(source_min.y, y0), 0.0);
+-
+-            for (var ix: i32 = 0; ix < max_iterations; ix = ix + 1) {
+-                let source_x = first_pixel.x + ix;
+-                if (source_x < last_pixel.x) {
+-                    let x0 = f32(source_x);
+-                    let weight_x = max(min(source_max.x, x0 + 1.0) - max(source_min.x, x0), 0.0);
+-                    let weight = weight_x * weight_y;
+-                    avg_color += weight * sample_by_pixel(vec2<i32>(source_x, source_y));
+-                    total_weight += weight;
+-                }
+-            }
++constexpr std::string_view seedResampleFragmentSource = R"(#version 300 es
++precision highp float;
++precision highp int;
++uniform sampler2D t;
++layout(std140) uniform SeedUniforms {
++  uint sampler_mode;
++  float frame_width;
++  float frame_height;
++  uint pad;
++} seed;
++in vec2 v_uv;
++out vec4 out_color;
++
++vec4 sample_by_pixel(ivec2 pixel) {
++  ivec2 source_dims = textureSize(t, 0);
++  ivec2 max_coord = source_dims - ivec2(1, 1);
++  ivec2 coord = clamp(pixel, ivec2(0, 0), max_coord);
++  return texelFetch(t, coord, 0);
++}
++
++vec4 sample_area(vec2 frag_position) {
++  vec2 source_size = vec2(textureSize(t, 0));
++  vec2 target_size = max(vec2(seed.frame_width, seed.frame_height), vec2(1.0, 1.0));
++  vec2 source_min = clamp((frag_position - vec2(0.5, 0.5)) / target_size, vec2(0.0), vec2(1.0)) * source_size;
++  vec2 source_max = clamp((frag_position + vec2(0.5, 0.5)) / target_size, vec2(0.0), vec2(1.0)) * source_size;
++  ivec2 first_pixel = ivec2(floor(source_min));
++  ivec2 last_pixel = ivec2(ceil(source_max));
++  const int max_iterations = 16;
++  vec4 avg_color = vec4(0.0);
++  float total_weight = 0.0;
++  for (int iy = 0; iy < max_iterations; iy++) {
++    int source_y = first_pixel.y + iy;
++    if (source_y < last_pixel.y) {
++      float y0 = float(source_y);
++      float weight_y = max(min(source_max.y, y0 + 1.0) - max(source_min.y, y0), 0.0);
++      for (int ix = 0; ix < max_iterations; ix++) {
++        int source_x = first_pixel.x + ix;
++        if (source_x < last_pixel.x) {
++          float x0 = float(source_x);
++          float weight_x = max(min(source_max.x, x0 + 1.0) - max(source_min.x, x0), 0.0);
++          float weight = weight_x * weight_y;
++          avg_color += weight * sample_by_pixel(ivec2(source_x, source_y));
++          total_weight += weight;
+         }
++      }
+     }
+-
+-    return avg_color / max(total_weight, 0.000001);
+-}
+-
+-@fragment
+-fn main(@builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    var color = textureSample(t, s, uv);
+-    if (uniforms.sampler_mode == 1u) {
+-        color = sample_area(position);
+-    }
+-    return vec4(color.rgb, 1.0);
++  }
++  return avg_color / max(total_weight, 0.000001);
+ }
+-)"sv;
+-
+-constexpr std::string_view simpleFilterFragmentSource = R"(
+-struct SimpleFilterUniforms {
+-    matrix: mat4x4<f32>,
+-    opacity: vec4<f32>,
+-};
+-
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var<uniform> simple_filter: SimpleFilterUniforms;
+ 
+-@fragment
+-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    let tex_color = textureSample(t, s, uv);
+-    let transformed_color = simple_filter.matrix * tex_color;
+-    return vec4<f32>(transformed_color.rgb, tex_color.a) * simple_filter.opacity.x;
++void main() {
++  // Scene, RmlUi targets and window are all GL-native (bottom-left origin), so this seed just
++  // preserves orientation like every other fullscreen pass -- no V-flip needed.
++  vec4 color = texture(t, v_uv);
++  if (seed.sampler_mode == 1u) {
++    color = sample_area(gl_FragCoord.xy);
++  }
++  out_color = vec4(color.rgb, 1.0);
+ }
+ )"sv;
+ 
+-constexpr std::string_view maskImageFragmentSource = R"(
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var mask_t: texture_2d<f32>;
+-
+-@fragment
+-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    let tex_color = textureSample(t, s, uv);
+-    let mask_alpha = textureSample(mask_t, s, uv).a;
+-    return tex_color * mask_alpha;
++constexpr std::string_view simpleFilterFragmentSource = R"(#version 300 es
++precision highp float;
++uniform sampler2D t;
++layout(std140) uniform SimpleFilterUniforms {
++  mat4 matrix;
++  vec4 opacity;
++} simple_filter;
++in vec2 v_uv;
++out vec4 out_color;
++void main() {
++  vec4 tex_color = texture(t, v_uv);
++  vec4 transformed = simple_filter.matrix * tex_color;
++  out_color = vec4(transformed.rgb, tex_color.a) * simple_filter.opacity.x;
+ }
+ )"sv;
+ 
+-constexpr std::string_view blurFragmentSource = R"(
+-struct BlurUniforms {
+-    texel_offset: vec2<f32>,
+-    radius: f32,
+-    padding: f32,
+-    tex_coord_min: vec2<f32>,
+-    tex_coord_max: vec2<f32>,
+-    weights: vec4<f32>,
+-};
+-
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
+-
+-fn get_weight(index: i32) -> f32 {
+-    return blur.weights[u32(abs(index))];
+-}
+-
+-fn sample_blur(sample_uv: vec2<f32>, offset_index: i32) -> vec4<f32> {
+-    let in_region = step(blur.tex_coord_min, sample_uv) * step(sample_uv, blur.tex_coord_max);
+-    return textureSample(t, s, sample_uv) * get_weight(offset_index) * in_region.x * in_region.y;
+-}
+-
+-@fragment
+-fn main(@location(0) uv0: vec2<f32>, @location(1) uv1: vec2<f32>, @location(2) uv2: vec2<f32>,
+-        @location(3) uv3: vec2<f32>, @location(4) uv4: vec2<f32>, @location(5) uv5: vec2<f32>,
+-        @location(6) uv6: vec2<f32>) -> @location(0) vec4<f32> {
+-    var color = sample_blur(uv0, -3);
+-    color += sample_blur(uv1, -2);
+-    color += sample_blur(uv2, -1);
+-    color += sample_blur(uv3, 0);
+-    color += sample_blur(uv4, 1);
+-    color += sample_blur(uv5, 2);
+-    color += sample_blur(uv6, 3);
+-    return color;
++constexpr std::string_view maskImageFragmentSource = R"(#version 300 es
++precision highp float;
++uniform sampler2D t;
++uniform sampler2D mask_t;
++in vec2 v_uv;
++out vec4 out_color;
++void main() {
++  vec4 tex_color = texture(t, v_uv);
++  float mask_alpha = texture(mask_t, v_uv).a;
++  out_color = tex_color * mask_alpha;
+ }
+ )"sv;
+ 
+-constexpr std::string_view regionBlitFragmentSource = R"(
+-struct BlurUniforms {
+-    texel_offset: vec2<f32>,
+-    radius: f32,
+-    padding: f32,
+-    tex_coord_min: vec2<f32>,
+-    tex_coord_max: vec2<f32>,
+-    weights: vec4<f32>,
+-};
+-
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var<uniform> blur: BlurUniforms;
+-
+-@fragment
+-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    let sample_uv = mix(blur.tex_coord_min, blur.tex_coord_max, uv);
+-    return textureSample(t, s, sample_uv);
++constexpr std::string_view blurFragmentSource = R"(#version 300 es
++precision highp float;
++precision highp int;
++uniform sampler2D t;
++layout(std140) uniform BlurUniforms {
++  vec2 texel_offset;
++  float radius;
++  float padding;
++  vec2 tex_coord_min;
++  vec2 tex_coord_max;
++  vec4 weights;
++} blur;
++in vec2 v_uv0;
++in vec2 v_uv1;
++in vec2 v_uv2;
++in vec2 v_uv3;
++in vec2 v_uv4;
++in vec2 v_uv5;
++in vec2 v_uv6;
++out vec4 out_color;
++float get_weight(int index) { return blur.weights[abs(index)]; }
++vec4 sample_blur(vec2 sample_uv, int offset_index) {
++  vec2 in_region = step(blur.tex_coord_min, sample_uv) * step(sample_uv, blur.tex_coord_max);
++  return texture(t, sample_uv) * get_weight(offset_index) * in_region.x * in_region.y;
++}
++void main() {
++  vec4 color = sample_blur(v_uv0, -3);
++  color += sample_blur(v_uv1, -2);
++  color += sample_blur(v_uv2, -1);
++  color += sample_blur(v_uv3, 0);
++  color += sample_blur(v_uv4, 1);
++  color += sample_blur(v_uv5, 2);
++  color += sample_blur(v_uv6, 3);
++  out_color = color;
+ }
+ )"sv;
+ 
+-constexpr std::string_view dropShadowFragmentSource = R"(
+-struct DropShadowUniforms {
+-    color: vec4<f32>,
+-    uv_offset: vec2<f32>,
+-    tex_coord_min: vec2<f32>,
+-    tex_coord_max: vec2<f32>,
+-};
+-
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var<uniform> shadow: DropShadowUniforms;
+-
+-@fragment
+-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    let sample_uv = uv - shadow.uv_offset;
+-    let in_region = step(shadow.tex_coord_min, sample_uv) * step(sample_uv, shadow.tex_coord_max);
+-    let alpha = textureSample(t, s, sample_uv).a * in_region.x * in_region.y;
+-    return shadow.color * alpha;
++constexpr std::string_view regionBlitFragmentSource = R"(#version 300 es
++precision highp float;
++uniform sampler2D t;
++layout(std140) uniform BlurUniforms {
++  vec2 texel_offset;
++  float radius;
++  float padding;
++  vec2 tex_coord_min;
++  vec2 tex_coord_max;
++  vec4 weights;
++} blur;
++in vec2 v_uv;
++out vec4 out_color;
++void main() {
++  vec2 sample_uv = mix(blur.tex_coord_min, blur.tex_coord_max, v_uv);
++  out_color = texture(t, sample_uv);
+ }
+ )"sv;
+ 
+-constexpr std::string_view glassFragmentSource = R"(
+-struct GlassUniforms {
+-    rect_center: vec2<f32>,
+-    rect_half_size: vec2<f32>,
+-    corner_radii: vec4<f32>,
+-    tint: vec4<f32>,
+-    frame_size: vec2<f32>,
+-    tex_coord_min: vec2<f32>,
+-    tex_coord_max: vec2<f32>,
+-    bezel_width: f32,
+-    refraction: f32,
+-    specular: f32,
+-    saturation: f32,
+-    profile: f32,
+-    dome: f32,
+-    edge_fades: vec4<f32>, // per-edge bezel strength (top, right, bottom, left)
+-    light_dir: vec2<f32>,  // direction from surfaces toward the specular light
+-    _padding: vec2<f32>,
+-};
+-
+-@group(0) @binding(1) var s: sampler;
+-@group(1) @binding(0) var t: texture_2d<f32>;
+-@group(2) @binding(0) var<uniform> glass: GlassUniforms;
+-
+-const SLOPE_MAX: f32 = 4.0;
+-// tan(atan(SLOPE_MAX) - asin(sin(atan(SLOPE_MAX)) / IOR)) where IOR == 1.5
+-const TAN_BEND_MAX: f32 = 0.7185;
+-
+-fn corner_radius(p: vec2<f32>) -> f32 {
+-    return select(
+-        select(glass.corner_radii.z, glass.corner_radii.y, p.y < 0.0),
+-        select(glass.corner_radii.w, glass.corner_radii.x, p.y < 0.0),
+-        p.x < 0.0
+-    );
+-}
+-
+-fn sd_rounded_rect(p: vec2<f32>) -> f32 {
+-    let r = corner_radius(p);
+-    let q = abs(p) - glass.rect_half_size + vec2<f32>(r);
+-    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+-}
+-
+-fn sdf_normal(p: vec2<f32>) -> vec2<f32> {
+-    let e = 0.5;
+-    let grad = vec2<f32>(
+-        sd_rounded_rect(p + vec2<f32>(e, 0.0)) - sd_rounded_rect(p - vec2<f32>(e, 0.0)),
+-        sd_rounded_rect(p + vec2<f32>(0.0, e)) - sd_rounded_rect(p - vec2<f32>(0.0, e)),
+-    );
+-    return grad / max(length(grad), 1e-4);
+-}
+-
+-fn bezel_height(x: f32) -> f32 {
+-    let convex = pow(max(1.0 - pow(1.0 - x, 4.0), 0.0), 0.25);
+-    let lip = mix(convex, 1.0 - convex, smoothstep(0.0, 1.0, x));
+-    return mix(convex, lip, glass.profile);
+-}
+-
+-@fragment
+-fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+-    let p = uv * glass.frame_size - glass.rect_center;
+-    let d = sd_rounded_rect(p);
+-    let n = sdf_normal(p);
+-
+-    // Per-edge bezel fade
+-    var edge_fade = 1.0;
+-    edge_fade *= mix(1.0, glass.edge_fades.x, clamp(-n.y, 0.0, 1.0));
+-    edge_fade *= mix(1.0, glass.edge_fades.y, clamp(n.x, 0.0, 1.0));
+-    edge_fade *= mix(1.0, glass.edge_fades.z, clamp(n.y, 0.0, 1.0));
+-    edge_fade *= mix(1.0, glass.edge_fades.w, clamp(-n.x, 0.0, 1.0));
+-
+-    // Bezel coordinate: 0 at the rim, 1 at the inner end of the band
+-    let x = clamp(-d, 0.0, glass.bezel_width) / max(glass.bezel_width, 1.0);
+-
+-    // Calculate slope to tilt the surface normal
+-    let inv = 1.0 - x;
+-    let he = 0.005;
+-    var slope = (bezel_height(min(x + he, 1.0)) - bezel_height(max(x - he, 0.0))) / (2.0 * he);
+-    slope = clamp(slope, -SLOPE_MAX, SLOPE_MAX);
+-
+-    // Snell deflection
+-    let theta = atan(abs(slope));
+-    let bend = theta - asin(clamp(sin(theta) / 1.5, -1.0, 1.0));
+-    let disp = glass.refraction * (tan(bend) / TAN_BEND_MAX) * sign(slope) * edge_fade;
+-
+-    // Full-surface dome
+-    let dome_disp = -p * glass.dome;
+-
+-    let sample_uv = clamp(uv + (n * disp + dome_disp) / glass.frame_size, glass.tex_coord_min, glass.tex_coord_max);
+-    var color = textureSample(t, s, sample_uv);
+-
+-    // Saturation
+-    let luma = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+-    color = vec4<f32>(mix(vec3<f32>(luma), color.rgb, glass.saturation), color.a);
+-
+-    // Tint
+-    let tint = glass.tint * mix(1.0, mix(0.35, 1.0, smoothstep(0.0, 1.0, x)), edge_fade);
+-    color = vec4<f32>(tint.rgb + color.rgb * (1.0 - tint.a),
+-                      tint.a + color.a * (1.0 - tint.a));
+-
+-    // Specular rim
+-    let rim = mix(0.4, 1.0, 0.5 + 0.5 * dot(n, glass.light_dir));
+-    color = vec4<f32>(color.rgb + glass.specular * rim * inv * inv * edge_fade, color.a);
+-
+-    // Outside of the shape, pass the background through
+-    let passthrough = textureSample(t, s, clamp(uv, glass.tex_coord_min, glass.tex_coord_max));
+-    return mix(passthrough, color, 1.0 - smoothstep(-0.75, 0.75, d));
++constexpr std::string_view dropShadowFragmentSource = R"(#version 300 es
++precision highp float;
++uniform sampler2D t;
++layout(std140) uniform DropShadowUniforms {
++  vec4 color;
++  vec2 uv_offset;
++  vec2 tex_coord_min;
++  vec2 tex_coord_max;
++} shadow;
++in vec2 v_uv;
++out vec4 out_color;
++void main() {
++  vec2 sample_uv = v_uv - shadow.uv_offset;
++  vec2 in_region = step(shadow.tex_coord_min, sample_uv) * step(sample_uv, shadow.tex_coord_max);
++  float alpha = texture(t, sample_uv).a * in_region.x * in_region.y;
++  out_color = shadow.color * alpha;
+ }
+ )"sv;
+ 
+-wgpu::ComputeState compile_shader(std::string_view wgslSource, std::string_view label) {
+-  const wgpu::ShaderSourceWGSL source{
+-      wgpu::ShaderSourceWGSL::Init{
+-          .nextInChain = nullptr,
+-          .code = wgslSource,
+-      },
+-  };
+-  const wgpu::ShaderModuleDescriptor desc{
+-      .nextInChain = &source,
+-      .label = label,
+-  };
+-  return {
+-      .module = webgpu::g_device.CreateShaderModule(&desc),
+-      .entryPoint = "main",
+-  };
+-}
+-
+-wgpu::BlendState blend_state(BlendMode mode) {
+-  switch (mode) {
+-  case BlendMode::Premultiplied:
+-    return {
+-        .color =
+-            {
+-                .operation = wgpu::BlendOperation::Add,
+-                .srcFactor = wgpu::BlendFactor::One,
+-                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
+-            },
+-        .alpha =
+-            {
+-                .operation = wgpu::BlendOperation::Add,
+-                .srcFactor = wgpu::BlendFactor::One,
+-                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
+-            },
+-    };
+-  case BlendMode::None:
+-  default:
+-    return {};
+-  }
+-}
+-
+-const wgpu::PipelineLayout create_pipeline_layout(PipelineKind kind) {
+-  std::array<wgpu::BindGroupLayout, 3> layouts{};
+-  uint32_t layoutCount = 0;
+-  layouts[layoutCount++] = g_commonBindGroupLayout;
+-
+-  switch (kind) {
+-  case PipelineKind::Gradient:
+-    layouts[layoutCount++] = g_uniformBindGroupLayout;
+-    break;
+-  case PipelineKind::MaskImage:
+-    layouts[layoutCount++] = g_imageBindGroupLayout;
+-    layouts[layoutCount++] = g_imageBindGroupLayout;
+-    break;
+-  case PipelineKind::Blur:
+-  case PipelineKind::RegionBlit:
+-  case PipelineKind::DropShadow:
+-  case PipelineKind::SimpleFilter:
+-  case PipelineKind::SeedResample:
+-  case PipelineKind::Glass:
+-  case PipelineKind::ImageEffects:
+-    layouts[layoutCount++] = g_imageBindGroupLayout;
+-    layouts[layoutCount++] = g_uniformBindGroupLayout;
+-    break;
+-  case PipelineKind::Geometry:
+-  case PipelineKind::Blit:
+-  case PipelineKind::OpaqueBlit:
+-  default:
+-    layouts[layoutCount++] = g_imageBindGroupLayout;
+-    break;
+-  }
+-
+-  const wgpu::PipelineLayoutDescriptor layoutDesc{
+-      .bindGroupLayoutCount = layoutCount,
+-      .bindGroupLayouts = layouts.data(),
+-  };
+-  return webgpu::g_device.CreatePipelineLayout(&layoutDesc);
+-}
+-
+-const std::string_view fragment_source(PipelineKind kind) {
++std::string_view fragment_source(PipelineKind kind) {
+   switch (kind) {
+   case PipelineKind::Geometry:
+     return fragmentSource;
+-  case PipelineKind::ImageEffects:
+-    return imageEffectsFragmentSource;
+   case PipelineKind::Gradient:
+     return gradientFragmentSource;
+   case PipelineKind::OpaqueBlit:
+@@ -723,15 +446,13 @@ const std::string_view fragment_source(PipelineKind kind) {
+     return simpleFilterFragmentSource;
+   case PipelineKind::MaskImage:
+     return maskImageFragmentSource;
+-  case PipelineKind::Glass:
+-    return glassFragmentSource;
+   case PipelineKind::Blit:
+   default:
+     return blitFragmentSource;
+   }
+ }
+ 
+-const std::string_view vertex_source(VertexLayoutKind kind) {
++std::string_view vertex_source(VertexLayoutKind kind) {
+   switch (kind) {
+   case VertexLayoutKind::Geometry:
+     return vertexSource;
+@@ -743,269 +464,197 @@ const std::string_view vertex_source(VertexLayoutKind kind) {
+   }
+ }
+ 
++// Compile + link the GLSL pair and wire fixed bindings: the `Uniforms` block -> point 0,
++// any per-effect block -> point 1, the `t`/`mask_t` samplers -> units 0/1. Runs on a
++// GL-context thread (the pipeline compiler share context or the render worker), so it
++// issues GL directly (no marshal), matching gx::create_pipeline and tex_copy_conv.
++gl::GLuint compile_rml_program(VertexLayoutKind vertexLayout, PipelineKind kind, const char* label) {
++  const std::string vs{vertex_source(vertexLayout)};
++  const std::string fs{fragment_source(kind)};
++  const gl::GLuint program = gl::compile_program(vs.c_str(), fs.c_str(), label);
++  if (program == 0) {
++    return 0;
++  }
++  const gl::GLuint commonIndex = gl::gl.GetUniformBlockIndex(program, "Uniforms");
++  if (commonIndex != kInvalidBlockIndex) {
++    gl::gl.UniformBlockBinding(program, commonIndex, kCommonBlockBinding);
++  }
++  for (const char* name :
++       {"GradientUniforms", "BlurUniforms", "SeedUniforms", "SimpleFilterUniforms", "DropShadowUniforms"}) {
++    const gl::GLuint index = gl::gl.GetUniformBlockIndex(program, name);
++    if (index != kInvalidBlockIndex) {
++      gl::gl.UniformBlockBinding(program, index, kExtraBlockBinding);
++    }
++  }
++  gl::gl.UseProgram(program);
++  const gl::GLint imageLoc = gl::gl.GetUniformLocation(program, "t");
++  if (imageLoc >= 0) {
++    gl::gl.Uniform1i(imageLoc, kImageTextureUnit);
++  }
++  const gl::GLint maskLoc = gl::gl.GetUniformLocation(program, "mask_t");
++  if (maskLoc >= 0) {
++    gl::gl.Uniform1i(maskLoc, kMaskTextureUnit);
++  }
++  gl::gl.UseProgram(0);
++  // A program linked on the compiler share context must be flushed to be visible on the
++  // render worker's context.
++  gl::gl.Flush();
++  return program;
++}
++
+ } // namespace
+ 
+ void initialize_pipeline() {
+-  constexpr std::array commonEntries{
+-      wgpu::BindGroupLayoutEntry{
+-          .binding = 0,
+-          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+-          .buffer =
+-              {
+-                  .type = wgpu::BufferBindingType::Uniform,
+-                  .hasDynamicOffset = true,
+-              },
+-      },
+-      wgpu::BindGroupLayoutEntry{
+-          .binding = 1,
+-          .visibility = wgpu::ShaderStage::Fragment,
+-          .sampler =
+-              {
+-                  .type = wgpu::SamplerBindingType::Filtering,
+-              },
+-      },
+-  };
+-  const wgpu::BindGroupLayoutDescriptor commonDesc{
+-      .entryCount = commonEntries.size(),
+-      .entries = commonEntries.data(),
+-  };
+-  g_commonBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&commonDesc);
+-
+-  constexpr std::array imageEntries{
+-      wgpu::BindGroupLayoutEntry{
+-          .binding = 0,
+-          .visibility = wgpu::ShaderStage::Fragment,
+-          .texture =
+-              {
+-                  .sampleType = wgpu::TextureSampleType::Float,
+-                  .viewDimension = wgpu::TextureViewDimension::e2D,
+-              },
+-      },
+-  };
+-  const wgpu::BindGroupLayoutDescriptor imageDesc{
+-      .entryCount = imageEntries.size(),
+-      .entries = imageEntries.data(),
+-  };
+-  g_imageBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&imageDesc);
+-
+-  constexpr std::array uniformEntries{
+-      wgpu::BindGroupLayoutEntry{
+-          .binding = 0,
+-          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+-          .buffer =
+-              {
+-                  .type = wgpu::BufferBindingType::Uniform,
+-                  .hasDynamicOffset = true,
+-              },
+-      },
+-  };
+-  const wgpu::BindGroupLayoutDescriptor uniformDesc{
+-      .entryCount = uniformEntries.size(),
+-      .entries = uniformEntries.data(),
+-  };
+-  g_uniformBindGroupLayout = webgpu::g_device.CreateBindGroupLayout(&uniformDesc);
+-
+-  constexpr wgpu::SamplerDescriptor samplerDesc{
+-      .addressModeU = wgpu::AddressMode::Repeat,
+-      .addressModeV = wgpu::AddressMode::Repeat,
+-      .addressModeW = wgpu::AddressMode::Repeat,
+-      .magFilter = wgpu::FilterMode::Linear,
+-      .minFilter = wgpu::FilterMode::Linear,
+-      .mipmapFilter = wgpu::MipmapFilterMode::Linear,
++  // The three WebGPU bind-group layouts are gone (no GL equivalent). Only the shared
++  // filtering sampler remains; gfx::sampler_ref is the GL-native replacement for the
++  // old g_device.CreateSampler.
++  constexpr gl::SamplerDescriptor samplerDesc{
++      .addressU = gl::AddressMode::Repeat,
++      .addressV = gl::AddressMode::Repeat,
++      .addressW = gl::AddressMode::Repeat,
++      .magFilter = gl::FilterMode::Linear,
++      .minFilter = gl::FilterMode::Linear,
++      .mipmapFilter = gl::MipmapFilterMode::Linear,
+       .maxAnisotropy = 1,
+   };
+-  g_sampler = webgpu::g_device.CreateSampler(&samplerDesc);
++  g_sampler = gfx::sampler_ref(samplerDesc);
+ }
+ 
+ void shutdown_pipeline() {
+-  g_commonBindGroupLayout = {};
+-  g_imageBindGroupLayout = {};
+-  g_uniformBindGroupLayout = {};
+   g_sampler = {};
+ }
+ 
+-gfx::BindGroupRef texture_bind_group_ref(const wgpu::TextureView& view) {
+-  const std::array entries{
+-      wgpu::BindGroupEntry{
+-          .binding = 0,
+-          .textureView = view,
+-      },
+-  };
+-  const wgpu::BindGroupDescriptor desc{
+-      .layout = g_imageBindGroupLayout,
+-      .entryCount = entries.size(),
+-      .entries = entries.data(),
+-  };
+-  return gfx::bind_group_ref(desc);
++gfx::BindGroupRef texture_bind_group_ref(const gl::Texture& view) {
++  gl::BindingSet set{};
++  set.textures[kImageTextureUnit].texture = view.id;
++  // The common filtering sampler pairs with the image texture on GL (WebGPU kept the
++  // sampler in group 0; GL binds texture+sampler together at the unit).
++  set.textures[kImageTextureUnit].sampler = g_sampler.id;
++  return gfx::bind_group_ref(set);
++}
++
++gfx::BindGroupRef mask_bind_group_ref(const gl::Texture& imageView, const gl::Texture& maskView) {
++  // maskImage samples two textures in one draw: `t` at unit 0 and `mask_t` at unit 1.
++  // A single bind group carries both so the second SetBindGroup does not clobber unit 0.
++  gl::BindingSet set{};
++  set.textures[kImageTextureUnit].texture = imageView.id;
++  set.textures[kImageTextureUnit].sampler = g_sampler.id;
++  set.textures[kMaskTextureUnit].texture = maskView.id;
++  set.textures[kMaskTextureUnit].sampler = g_sampler.id;
++  return gfx::bind_group_ref(set);
+ }
+ 
+ gfx::BindGroupRef common_bind_group_ref() {
+-  const std::array entries{
+-      wgpu::BindGroupEntry{
+-          .binding = 0,
+-          .buffer = gfx::detail::resources().uniformBuffer,
+-          .offset = 0,
+-          .size = CommonUniformBindingSize,
+-      },
+-      wgpu::BindGroupEntry{
+-          .binding = 1,
+-          .sampler = g_sampler,
+-      },
+-  };
+-  const wgpu::BindGroupDescriptor desc{
+-      .layout = g_commonBindGroupLayout,
+-      .entryCount = entries.size(),
+-      .entries = entries.data(),
++  gl::BindingSet set{};
++  set.buffers[0] = gl::BindingSet::BufferBinding{
++      .buffer = gfx::g_uniformBuffer.id,
++      .binding = kCommonBlockBinding,
++      .offset = 0,
++      .size = static_cast<uint32_t>(CommonUniformBindingSize),
++      .dynamic = true,
+   };
+-  return gfx::bind_group_ref(desc);
++  set.bufferCount = 1;
++  return gfx::bind_group_ref(set);
+ }
+ 
+ gfx::BindGroupRef uniform_bind_group_ref() {
+-  const std::array entries{
+-      wgpu::BindGroupEntry{
+-          .binding = 0,
+-          .buffer = gfx::detail::resources().uniformBuffer,
+-          .offset = 0,
+-          .size = ExtraUniformBindingSize,
+-      },
+-  };
+-  const wgpu::BindGroupDescriptor desc{
+-      .layout = g_uniformBindGroupLayout,
+-      .entryCount = entries.size(),
+-      .entries = entries.data(),
++  gl::BindingSet set{};
++  set.buffers[0] = gl::BindingSet::BufferBinding{
++      .buffer = gfx::g_uniformBuffer.id,
++      .binding = kExtraBlockBinding,
++      .offset = 0,
++      .size = static_cast<uint32_t>(ExtraUniformBindingSize),
++      .dynamic = true,
+   };
+-  return gfx::bind_group_ref(desc);
++  set.bufferCount = 1;
++  return gfx::bind_group_ref(set);
+ }
+ 
+-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
++gl::Pipeline create_pipeline(const PipelineConfig& config) {
+   ZoneScoped;
+   const auto kind = static_cast<PipelineKind>(config.kind);
+   const auto vertexLayoutKind = static_cast<VertexLayoutKind>(config.vertexLayout);
+-  const auto colorFormat = static_cast<wgpu::TextureFormat>(config.colorFormat);
+-  const auto stencilFormat = static_cast<wgpu::TextureFormat>(config.stencilFormat);
+   const auto stencilMode = static_cast<StencilMode>(config.stencilMode);
+   const auto blendMode = static_cast<BlendMode>(config.blendMode);
+ 
+-  const auto vertexShader = compile_shader(vertex_source(vertexLayoutKind), "RmlUi Vertex Shader");
+-  const auto fragmentShader = compile_shader(fragment_source(kind), "RmlUi Fragment Shader");
+-
+-  constexpr std::array vertexAttributes{
+-      wgpu::VertexAttribute{
+-          .format = wgpu::VertexFormat::Float32x2,
+-          .offset = offsetof(Rml::Vertex, position),
+-          .shaderLocation = 0,
+-      },
+-      wgpu::VertexAttribute{
+-          .format = wgpu::VertexFormat::Float32x2,
+-          .offset = offsetof(Rml::Vertex, tex_coord),
+-          .shaderLocation = 1,
+-      },
+-      wgpu::VertexAttribute{
+-          .format = wgpu::VertexFormat::Unorm8x4,
+-          .offset = offsetof(Rml::Vertex, colour),
+-          .shaderLocation = 2,
+-      },
+-  };
+-  const std::array vertexBufferLayouts{
+-      wgpu::VertexBufferLayout{
+-          .stepMode = wgpu::VertexStepMode::Vertex,
+-          .arrayStride = sizeof(Rml::Vertex),
+-          .attributeCount = vertexAttributes.size(),
+-          .attributes = vertexAttributes.data(),
+-      },
+-  };
+-
+-  const auto blend = blend_state(blendMode);
+-  const wgpu::ColorTargetState colorState{
+-      .format = colorFormat,
+-      .blend = blendMode == BlendMode::None ? nullptr : &blend,
+-      .writeMask = static_cast<wgpu::ColorWriteMask>(config.colorWriteMask),
+-  };
+-  const wgpu::FragmentState fragmentState{
+-      .module = fragmentShader.module,
+-      .entryPoint = fragmentShader.entryPoint,
+-      .targetCount = 1,
+-      .targets = &colorState,
+-  };
++  const std::string label = fmt::format("RmlUi Pipeline kind {} vtx {}", config.kind, config.vertexLayout);
++  const gl::GLuint program = compile_rml_program(vertexLayoutKind, kind, label.c_str());
++
++  // Bake the fixed-function state from the backend-agnostic config. Blend and stencil
++  // config survive the cutover; the colour/stencil formats and MSAA sample count are
++  // resolved by the render-target/FBO setup, not the pipeline, on GL.
++  gl::BakedState state{};
++  if (blendMode == BlendMode::Premultiplied) {
++    state.blendEnabled = true;
++    state.colorOp = gl::BlendOperation::Add;
++    state.colorSrc = gl::BlendFactor::One;
++    state.colorDst = gl::BlendFactor::OneMinusSrcAlpha;
++    state.alphaOp = gl::BlendOperation::Add;
++    state.alphaSrc = gl::BlendFactor::One;
++    state.alphaDst = gl::BlendFactor::OneMinusSrcAlpha;
++  }
++  state.writeMask = static_cast<gl::ColorWriteMask>(config.colorWriteMask);
++  state.topology = gl::PrimitiveTopology::TriangleList;
++  state.frontFace = gl::FrontFace::CW;
++  state.cull = gl::CullMode::None;
++  // Combined depth-stencil format: the depth aspect is present but unused, so depth
++  // writes are off and the depth test always passes (matches the clip-mask passes).
++  state.depthTest = false;
++  state.depthWrite = false;
++  state.depthCompare = gl::CompareFunction::Always;
+ 
+-  wgpu::DepthStencilState depthStencilState{};
+-  const wgpu::DepthStencilState* depthStencil = nullptr;
+   if (stencilMode != StencilMode::None) {
+-    wgpu::CompareFunction compare = wgpu::CompareFunction::Always;
+-    wgpu::StencilOperation passOp = wgpu::StencilOperation::Keep;
++    state.stencilTest = true;
++    // failOp / depthFailOp are always Keep; only the compare and passOp vary by mode,
++    // mirroring the WebGPU StencilFaceState the Dawn path used.
++    state.stencilFail = gl::GL_KEEP;
++    state.stencilDepthFail = gl::GL_KEEP;
+     switch (stencilMode) {
+     case StencilMode::EqualKeep:
+-      compare = wgpu::CompareFunction::Equal;
+-      break;
+-    case StencilMode::ClipReplace:
+-      passOp = wgpu::StencilOperation::Replace;
++      state.stencilCompare = gl::CompareFunction::Equal;
++      state.stencilPass = gl::GL_KEEP;
+       break;
+     case StencilMode::ClipIntersect:
+-      compare = wgpu::CompareFunction::Equal;
+-      passOp = wgpu::StencilOperation::IncrementClamp;
++      state.stencilCompare = gl::CompareFunction::Equal;
++      state.stencilPass = gl::GL_INCR; // IncrementClamp
++      break;
++    case StencilMode::ClipReplace:
++      state.stencilCompare = gl::CompareFunction::Always;
++      state.stencilPass = gl::GL_REPLACE;
+       break;
+     case StencilMode::AlwaysKeep:
+     case StencilMode::None:
+     default:
++      state.stencilCompare = gl::CompareFunction::Always;
++      state.stencilPass = gl::GL_KEEP;
+       break;
+     }
+-    const wgpu::StencilFaceState face{
+-        .compare = compare,
+-        .failOp = wgpu::StencilOperation::Keep,
+-        .depthFailOp = wgpu::StencilOperation::Keep,
+-        .passOp = passOp,
+-    };
+-    depthStencilState = {
+-        .format = stencilFormat,
+-        .stencilFront = face,
+-        .stencilBack = face,
+-        .stencilReadMask = 0xFF,
+-        .stencilWriteMask = 0xFF,
+-    };
+-    depthStencil = &depthStencilState;
++    state.stencilReadMask = 0xFF;
++    state.stencilWriteMask = 0xFF;
+   }
+ 
+-  const bool hasVertexBuffer = vertexLayoutKind == VertexLayoutKind::Geometry;
+-  const auto pipelineLayout = create_pipeline_layout(kind);
+-  const auto label = fmt::format("RmlUi Pipeline {}", config.kind);
+-  const wgpu::RenderPipelineDescriptor pipelineDesc{
+-      .label = label.c_str(),
+-      .layout = pipelineLayout,
+-      .vertex =
+-          {
+-              .module = vertexShader.module,
+-              .entryPoint = vertexShader.entryPoint,
+-              .bufferCount = hasVertexBuffer ? vertexBufferLayouts.size() : 0,
+-              .buffers = hasVertexBuffer ? vertexBufferLayouts.data() : nullptr,
+-          },
+-      .primitive =
+-          {
+-              .topology = wgpu::PrimitiveTopology::TriangleList,
+-              .stripIndexFormat = wgpu::IndexFormat::Undefined,
+-              .frontFace = wgpu::FrontFace::CW,
+-              .cullMode = wgpu::CullMode::None,
+-          },
+-      .depthStencil = depthStencil,
+-      .multisample =
+-          {
+-              .count = config.sampleCount,
+-          },
+-      .fragment = &fragmentState,
+-  };
+-  return webgpu::g_device.CreateRenderPipeline(&pipelineDesc);
++  gl::Pipeline pipeline{};
++  pipeline.program = program;
++  pipeline.state = state;
++  // Geometry draws feed an interleaved Rml::Vertex buffer (its own VAO); fullscreen and
++  // blur pipelines are attribute-less (gl_VertexID), so they use vertexLayout 0.
++  pipeline.vertexLayout =
++      vertexLayoutKind == VertexLayoutKind::Geometry ? gl::kRmlGeometryVertexLayout : 0u;
++  return pipeline;
+ }
+ 
+-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
++void render(const DrawData& data, gl::PassEncoder& pass) {
++  // bind_pipeline early-outs on a missing/empty (program 0) pipeline.
+   if (!gfx::bind_pipeline(data.pipeline, pass)) {
+     return;
+   }
+ 
+-  const auto commonBindGroup = gfx::find_bind_group(common_bind_group_ref());
++  const auto& commonBindGroup = gfx::find_bind_group(common_bind_group_ref());
+   const std::array commonOffsets{data.uniformRange.offset};
+   pass.SetBindGroup(0, commonBindGroup, commonOffsets.size(), commonOffsets.data());
+ 
+   if (data.bindGroup1 != 0) {
+-    const auto bindGroup = gfx::find_bind_group(data.bindGroup1);
++    const auto& bindGroup = gfx::find_bind_group(data.bindGroup1);
+     if ((data.dynamicBindGroupMask & DynamicGroup1) != 0) {
+       const std::array offsets{data.bindGroup1DynamicOffset};
+       pass.SetBindGroup(1, bindGroup, offsets.size(), offsets.data());
+@@ -1015,7 +664,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+   }
+ 
+   if (data.bindGroup2 != 0) {
+-    const auto bindGroup = gfx::find_bind_group(data.bindGroup2);
++    const auto& bindGroup = gfx::find_bind_group(data.bindGroup2);
+     if ((data.dynamicBindGroupMask & DynamicGroup2) != 0) {
+       const std::array offsets{data.bindGroup2DynamicOffset};
+       pass.SetBindGroup(2, bindGroup, offsets.size(), offsets.data());
+@@ -1025,15 +674,14 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+   }
+ 
+   if (data.hasBlendConstant != 0) {
+-    const wgpu::Color color{data.blendConstant[0], data.blendConstant[1], data.blendConstant[2], data.blendConstant[3]};
++    const gl::Color color{data.blendConstant[0], data.blendConstant[1], data.blendConstant[2], data.blendConstant[3]};
+     pass.SetBlendConstant(&color);
+   }
+   pass.SetStencilReference(data.stencilRef);
+ 
+   if (static_cast<DrawKind>(data.drawKind) == DrawKind::Geometry) {
+-    auto& resources = gfx::detail::resources();
+-    pass.SetVertexBuffer(0, resources.vertexBuffer, data.vertexRange.offset, data.vertexRange.size);
+-    pass.SetIndexBuffer(resources.indexBuffer, wgpu::IndexFormat::Uint32, data.indexRange.offset, data.indexRange.size);
++    pass.SetVertexBuffer(0, gfx::g_vertexBuffer, data.vertexRange.offset, data.vertexRange.size);
++    pass.SetIndexBuffer(gfx::g_indexBuffer, gl::IndexFormat::Uint32, data.indexRange.offset, data.indexRange.size);
+     pass.DrawIndexed(data.indexCount);
+   } else {
+     pass.Draw(data.vertexCount);
+diff --git a/lib/rmlui/pipeline.hpp b/lib/rmlui/pipeline.hpp
+index be3c42e2ca56a3c43055942a153d60d74d9d9ac2..048ddb5c6fb8aef0dd7cc803ae137e0280919425 100644
+--- a/lib/rmlui/pipeline.hpp
++++ b/lib/rmlui/pipeline.hpp
+@@ -6,8 +6,6 @@
+ #include <array>
+ #include <cstdint>
+ 
+-#include <webgpu/webgpu_cpp.h>
+-
+ namespace aurora::rmlui {
+ 
+ constexpr uint32_t RmlPipelineConfigVersion = 3;
+@@ -54,13 +52,13 @@ enum class DrawKind : uint32_t {
+ struct PipelineConfig {
+   uint32_t version = RmlPipelineConfigVersion;
+   uint32_t kind = static_cast<uint32_t>(PipelineKind::Geometry);
+-  uint32_t colorFormat = static_cast<uint32_t>(wgpu::TextureFormat::Undefined);
++  uint32_t colorFormat = static_cast<uint32_t>(gl::TextureFormat::Undefined);
+   uint32_t sampleCount = 1;
+   uint32_t vertexLayout = static_cast<uint32_t>(VertexLayoutKind::Geometry);
+-  uint32_t stencilFormat = static_cast<uint32_t>(wgpu::TextureFormat::Undefined);
++  uint32_t stencilFormat = static_cast<uint32_t>(gl::TextureFormat::Undefined);
+   uint32_t stencilMode = static_cast<uint32_t>(StencilMode::None);
+   uint32_t blendMode = static_cast<uint32_t>(BlendMode::Premultiplied);
+-  uint32_t colorWriteMask = static_cast<uint32_t>(wgpu::ColorWriteMask::All);
++  uint32_t colorWriteMask = static_cast<uint32_t>(gl::ColorWriteMask::All);
+ };
+ static_assert(std::has_unique_object_representations_v<PipelineConfig>);
+ 
+@@ -93,12 +91,13 @@ static_assert(std::is_trivially_copyable_v<DrawData>);
+ void initialize_pipeline();
+ void shutdown_pipeline();
+ 
+-gfx::BindGroupRef texture_bind_group_ref(const wgpu::TextureView& view);
++gfx::BindGroupRef texture_bind_group_ref(const gl::Texture& view);
++gfx::BindGroupRef mask_bind_group_ref(const gl::Texture& imageView, const gl::Texture& maskView);
+ gfx::BindGroupRef common_bind_group_ref();
+ gfx::BindGroupRef uniform_bind_group_ref();
+ 
+-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config);
+-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
++gl::Pipeline create_pipeline(const PipelineConfig& config);
++void render(const DrawData& data, gl::PassEncoder& pass);
+ 
+ uint32_t sampler_mode() noexcept;
+ 
+diff --git a/lib/window.cpp b/lib/window.cpp
+index 13cda5ad8db15e7ca79f73c82934ce3c697bb443..3956e94635d2ff0415869310665a83aa3a4c66c2 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -30,6 +30,7 @@ extern "C" void Android_UnlockActivityMutex(void);
+ #endif
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <deque>
+ #include <string>
+@@ -347,7 +348,36 @@ const AuroraEvent* poll_events() {
+ }
+ 
+ bool create_window(AuroraBackend backend) {
+-  SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
++  // The SDL2 shim is our custom SDL3 video driver wrapping the device's firmware SDL2 (kmsdrm/gbm via
++  // libMali). On that driver we let SDL create/own the GL context so it exposes the firmware's borrowed
++  // EGL display/surface/context, which Dawn then binds to via the adapter proc loader. On desktop
++  // (wayland/x11) Dawn owns EGL itself, so an SDL-owned context would make Dawn's worker-thread
++  // eglMakeCurrent fail with EGL_BAD_ACCESS — keep upstream's no-GL-flag behaviour there.
++  const char* videoDriver = SDL_GetCurrentVideoDriver();
++  const bool sdl2ShimDriver = videoDriver != nullptr && SDL_strcmp(videoDriver, "sdl2") == 0;
++
++  // The shim exists to lend Dawn the firmware's EGL/GLES display; no other backend can present
++  // through it. On a fresh config (backend "auto") the backend loop would otherwise attempt
++  // Vulkan first, and that attempt's window create/destroy cycle leaves the firmware SDL2/EGL
++  // stack unable to keep a context current for the later GLES attempt's EFB present init
++  // (fresh-install crash in the field). Refuse non-GLES backends before touching the display so
++  // the loop falls straight through to OpenGLES. BACKEND_NULL stays allowed: it is the loop's
++  // final fallback and must reach webgpu::initialize to produce the loud EFB-or-bust fatal.
++  if (sdl2ShimDriver && backend != BACKEND_OPENGLES && backend != BACKEND_NULL) {
++    constexpr std::array kBackendNames{"Auto",     "D3D11",  "D3D12",  "Metal", "Vulkan",
++                                       "OpenGL", "OpenGLES", "WebGPU", "Null"};
++    const auto idx = static_cast<size_t>(backend);
++    Log.info("Skipping backend {} on the sdl2 shim driver (GLES-only display path)",
++             idx < kBackendNames.size() ? kBackendNames[idx] : "?");
++    return false;
++  }
++
++  SDL_WindowFlags flags = 0;
++  // The borrowed-EGL path presents at the shim's own drawable size; high-DPI scaling here would desync
++  // the WebGPU swapchain extent from the borrowed surface. Skip it on the shim driver only.
++  if (!sdl2ShimDriver) {
++    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
++  }
+ #if TARGET_OS_IOS || TARGET_OS_TV
+   flags |= SDL_WINDOW_FULLSCREEN;
+ #else
+@@ -355,6 +385,13 @@ bool create_window(AuroraBackend backend) {
+   if (g_config.startFullscreen) {
+     flags |= SDL_WINDOW_FULLSCREEN;
+   }
++#endif
++#ifdef AURORA_ENABLE_GX
++  // The GL backend renders through a real SDL GL context (desktop: SDL_GL_CreateContext;
++  // device: the shim's borrowed EGL context), so the window must be an OpenGL window.
++  if (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES) {
++    flags |= SDL_WINDOW_OPENGL;
++  }
+ #endif
+   auto width = static_cast<Sint32>(g_config.windowWidth);
+   auto height = static_cast<Sint32>(g_config.windowHeight);
+@@ -369,6 +406,26 @@ bool create_window(AuroraBackend backend) {
+     height = 480;
+   }
+ 
++  // Device (sdl2 shim) path: the firmware SDL2 creates its fbdev surface at exactly the size we
++  // request and there is no compositor to place or scale it, so a window that is not the panel size
++  // shows up clipped and offset -- and SDL_WINDOW_FULLSCREEN is a no-op through the shim, so it
++  // cannot fix that. Size the window to the panel's native mode (the shim republishes the firmware
++  // SDL2 desktop mode as this SDL3 display), which makes every handheld fill its own panel with no
++  // per-device window-size config. Desktop keeps the configured/default size. The min-size clamp
++  // above stays as the floor for the pathological "mode query failed" case.
++  if (sdl2ShimDriver) {
++    const SDL_DisplayID display = SDL_GetPrimaryDisplay();
++    const SDL_DisplayMode* mode = display != 0 ? SDL_GetDesktopDisplayMode(display) : nullptr;
++    if (mode != nullptr && mode->w > 0 && mode->h > 0) {
++      width = mode->w;
++      height = mode->h;
++      Log.info("Device panel mode is {}x{}; sizing the window to fill it", width, height);
++    } else {
++      Log.warn("Could not query the device panel mode ({}); leaving window at {}x{}",
++               SDL_GetError(), width, height);
++    }
++  }
++
+   Sint32 posX = g_config.windowPosX;
+   Sint32 posY = g_config.windowPosY;
+   if (posX < 0 || posY < 0) {
+@@ -389,7 +446,12 @@ bool create_window(AuroraBackend backend) {
+       SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, SDL_GetError());
+   TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags), "Failed to set {}: {}",
+       SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_GetError());
+-  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, backend != BACKEND_NULL),
++  // Only the shim (device) path supplies the GL context externally (the firmware
++  // EGL context aurora borrows). On desktop, SDL owns the GL context via
++  // SDL_GL_CreateContext, so the window must NOT be flagged external -- otherwise
++  // SDL skips GL setup and SDL_GL_CreateContext rejects the window.
++  const bool externalGraphicsContext = sdl2ShimDriver && backend != BACKEND_NULL;
++  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, externalGraphicsContext),
+       "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
+   g_window = SDL_CreateWindowWithProperties(props);
+   if (g_window == nullptr) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 9ab5ed69b7c960ba553506740de5ce21701cd24d..fd0b48af57adb17322f5272db086086938211f5d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,12 +1,5 @@
+ include(FetchContent)
+ include(GoogleTest)
+-include(${CMAKE_CURRENT_LIST_DIR}/../cmake/AuroraCopyRuntimeDLLs.cmake)
+-
+-set(CMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE PRE_TEST)
+-
+-if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+-  add_compile_options(/Zc:__cplusplus)
+-endif ()
+ 
+ if (NOT TARGET gtest)
+   FetchContent_Declare(googletest
+@@ -18,72 +11,6 @@ if (NOT TARGET gtest)
+   FetchContent_MakeAvailable(googletest)
+ endif ()
+ 
+-add_executable(io_tests
+-  io_test.cpp
+-  ../lib/card/FileIO.cpp
+-  ../lib/io.cpp
+-)
+-target_include_directories(io_tests PRIVATE ../lib)
+-target_link_libraries(io_tests PRIVATE gtest gtest_main ${AURORA_SDL3_TARGET})
+-aurora_copy_runtime_dlls(io_tests)
+-gtest_discover_tests(io_tests)
+-
+-add_executable(input_tests
+-  input_binding_test.cpp
+-  input_router_test.cpp
+-  ../lib/input/binding.cpp
+-  ../lib/input/capture.cpp
+-  ../lib/input/router.cpp
+-  ../lib/input/source_state.cpp
+-)
+-target_include_directories(input_tests PRIVATE
+-  ../include
+-  ../lib
+-)
+-target_compile_definitions(input_tests PRIVATE AURORA TARGET_PC)
+-target_link_libraries(input_tests PRIVATE gtest gtest_main ${AURORA_SDL3_TARGET})
+-aurora_copy_runtime_dlls(input_tests)
+-gtest_discover_tests(input_tests)
+-
+-add_executable(pad_adapter_tests
+-  pad_adapter_test.cpp
+-)
+-target_include_directories(pad_adapter_tests PRIVATE
+-  ../include
+-  ../lib
+-)
+-target_link_libraries(pad_adapter_tests PRIVATE aurora::pad gtest gtest_main)
+-if (AURORA_ENABLE_GX)
+-  target_link_libraries(pad_adapter_tests PRIVATE aurora::gx aurora::vi)
+-endif ()
+-aurora_copy_runtime_dlls(pad_adapter_tests)
+-gtest_discover_tests(pad_adapter_tests)
+-
+-add_executable(time_tests
+-  time_test.cpp
+-  ../lib/time.cpp
+-)
+-target_include_directories(time_tests PRIVATE
+-  ../include
+-  ../lib
+-)
+-target_link_libraries(time_tests PRIVATE gtest gtest_main)
+-gtest_discover_tests(time_tests)
+-
+-add_executable(os_time_tests
+-  os_time_test.cpp
+-  os_time_test_stubs.cpp
+-  ../lib/time.cpp
+-  ../lib/dolphin/os/OSTime.cpp
+-)
+-target_include_directories(os_time_tests PRIVATE
+-  ../include
+-  ../lib
+-)
+-target_compile_definitions(os_time_tests PRIVATE AURORA TARGET_PC)
+-target_link_libraries(os_time_tests PRIVATE fmt::fmt gtest gtest_main)
+-gtest_discover_tests(os_time_tests)
+-
+ if (AURORA_ENABLE_GX)
+   # GX FIFO round-trip tests
+   # Compile GX sources directly to avoid pulling in the full renderer/WebGPU runtime
+@@ -113,8 +40,6 @@ if (AURORA_ENABLE_GX)
+     # FIFO/command processor (encoder + decoder)
+     ../lib/gx/fifo.cpp
+     ../lib/gx/command_processor.cpp
+-    ../lib/gx/regs.cpp
+-    ../lib/thread.cpp
+     # Display list reader/optimizer
+     ../lib/gx/attr_fmt.cpp
+     ../lib/gx/dl.cpp
+@@ -133,61 +58,18 @@ if (AURORA_ENABLE_GX)
+     gtest
+     gtest_main
+     fmt::fmt
+-    xxHash::xxhash
++    xxhash
+     absl::flat_hash_map
+     absl::btree
+-    dawn::dawncpp_headers
+-    Tracy::TracyClient
++    TracyClient
+     ${AURORA_SDL3_TARGET}
+   )
+ 
+   gtest_discover_tests(gx_fifo_tests)
+ 
+-  add_executable(gx_texture_cache_tests
+-    gx_texture_cache_test.cpp
+-    gx_texture_cache_test_stubs.cpp
+-    ../lib/gx/texture.cpp
+-  )
+-  target_include_directories(gx_texture_cache_tests PRIVATE
+-    ../include
+-    ../lib
+-  )
+-  target_compile_definitions(gx_texture_cache_tests PRIVATE AURORA TARGET_PC)
+-  target_link_libraries(gx_texture_cache_tests PRIVATE
+-    gtest
+-    gtest_main
+-    fmt::fmt
+-    xxHash::xxhash
+-    absl::flat_hash_map
+-    dawn::webgpu_dawn
+-    Tracy::TracyClient
+-    ${AURORA_SDL3_TARGET}
+-  )
+-  aurora_copy_runtime_dlls(gx_texture_cache_tests)
+-  gtest_discover_tests(gx_texture_cache_tests)
+-
+-  add_executable(texture_replacement_streaming_tests
+-    texture_replacement_streaming_test.cpp
+-  )
+-  target_include_directories(texture_replacement_streaming_tests PRIVATE
+-    ../include
+-    ../lib
+-  )
+-  target_compile_definitions(texture_replacement_streaming_tests PRIVATE AURORA TARGET_PC)
+-  target_link_libraries(texture_replacement_streaming_tests PRIVATE
+-    aurora::gx
+-    aurora::vi
+-    gtest
+-    gtest_main
+-  )
+-  aurora_copy_runtime_dlls(texture_replacement_streaming_tests)
+-  gtest_discover_tests(texture_replacement_streaming_tests)
+-
+   add_executable(render_worker_tests
+     render_worker_test.cpp
+-    thread_test.cpp
+     ../lib/gfx/render_worker.cpp
+-    ../lib/thread.cpp
+   )
+   target_include_directories(render_worker_tests PRIVATE
+     ../include
+@@ -197,39 +79,15 @@ if (AURORA_ENABLE_GX)
+   target_link_libraries(render_worker_tests PRIVATE
+     gtest
+     gtest_main
+-    Tracy::TracyClient
+-    ${AURORA_SDL3_TARGET}
++    TracyClient
+   )
+   gtest_discover_tests(render_worker_tests)
+-
+-  add_executable(gfx_recording_tests
+-    gfx_recording_test.cpp
+-    render_target_layout_test.cpp
+-  )
+-  target_include_directories(gfx_recording_tests PRIVATE
+-    ../include
+-    ../lib
+-  )
+-  target_compile_definitions(gfx_recording_tests PRIVATE AURORA TARGET_PC)
+-  target_link_libraries(gfx_recording_tests PRIVATE
+-    aurora::gx
+-    aurora::vi
+-    gtest
+-    gtest_main
+-  )
+-  aurora_copy_runtime_dlls(gfx_recording_tests)
+-  gtest_discover_tests(gfx_recording_tests)
+ endif () # AURORA_ENABLE_GX
+ 
+ # DVD API tests
+ if (TARGET aurora::dvd)
+-  add_executable(dvd_tests
+-    test_dvd.cpp
+-    dvd_test_stubs.cpp
+-    ../lib/logging.cpp
+-  )
++  add_executable(dvd_tests test_dvd.cpp)
+   target_link_libraries(dvd_tests PRIVATE aurora::dvd gtest gtest_main)
+-  aurora_copy_runtime_dlls(dvd_tests)
+ 
+   # Pass disc image path as a compile definition if provided
+   if (DEFINED DVD_TEST_IMAGE AND EXISTS "${DVD_TEST_IMAGE}")
