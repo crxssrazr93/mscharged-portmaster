@@ -1,0 +1,52 @@
+diff --git a/src/platform/ai.cpp b/src/platform/ai.cpp
+index 17452645..d942c994 100644
+--- a/src/platform/ai.cpp
++++ b/src/platform/ai.cpp
+@@ -76,6 +76,7 @@ struct AIState {
+     struct Window {
+         std::uint64_t pulls{}, short_pulls{}, short_bytes{}, blocks{}, held{}, held_max_ns{}, skipped_cells{};
+         std::uint64_t dispatched{}, late_cb{}, lat_sum_ns{}, lat_max_ns{}, replayed{}, dup{}, nosrc{};
++        std::uint64_t movie_pulls{}, movie_short_pulls{}, movie_short_bytes{}, movie_blocks{};
+         std::uint64_t queue_samples{}, queue_sum{}, queue_min{~std::uint64_t(0)}, queue_last{};
+     } win;
+     std::uint64_t prev_block_hash{};
+@@ -388,6 +389,7 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+                 catch (...) { std::free(packet); throw; }
+                 state.last_hash = Hash(packet->Data(), state.fifo.size());
+                 ++state.win.blocks;
++                if (state.callback && state.callback != state.base_callback) ++state.win.movie_blocks;
+                 if (HashLog()) std::fprintf(HashLog(), "%llu %016llx\n", (unsigned long long)state.submitted,
+                                             (unsigned long long)state.last_hash);
+                 // A block equal to the one before it (and not silence) is a replayed, stale source buffer.
+@@ -461,7 +463,7 @@ void StatsTick(AIState& state, SDL_AudioStream* stream) {
+     std::fprintf(stderr,
+         "[audiostats] dt=%.2fs run=%d lead_ms=%.0f queue_ms min=%.1f avg=%.1f now=%.1f pulls=%llu underruns=%llu silence_ms=%.1f "
+         "blocks=%llu held=%llu held_ms_max=%.1f late_blocks=%llu cb_lat_ms avg=%.1f max=%.1f skipped_blocks=%.1f "
+-        "replayed=%llu dup=%llu nosrc=%llu ax_jobs=%llu ax_compute_ms_max=%.2f ax_commit_delay_ms avg=%.2f max=%.2f svc_calls=%llu svc_periods=%llu svc_bursts=%llu pace_timeouts=%llu\n",
++        "replayed=%llu dup=%llu nosrc=%llu ax_jobs=%llu ax_compute_ms_max=%.2f ax_commit_delay_ms avg=%.2f max=%.2f movie_blocks=%llu movie_pulls=%llu movie_underruns=%llu movie_silence_ms=%.1f svc_calls=%llu svc_periods=%llu svc_bursts=%llu pace_timeouts=%llu\n",
+         double(dt) / 1e9, running ? 1 : 0, double(lead_cells) * 8000.0 / rate, qmin, qavg, double(queued_now) / bytes_per_ms,
+         (unsigned long long)w.pulls, (unsigned long long)w.short_pulls, double(w.short_bytes) / bytes_per_ms,
+         (unsigned long long)w.blocks, (unsigned long long)w.held, double(w.held_max_ns) / 1e6,
+@@ -469,6 +471,8 @@ void StatsTick(AIState& state, SDL_AudioStream* stream) {
+         double(w.lat_max_ns) / 1e6, double(w.skipped_cells) / 12.0, (unsigned long long)w.replayed,
+         (unsigned long long)w.dup, (unsigned long long)w.nosrc, (unsigned long long)ax_jobs, double(ax_comp) / 1e6,
+         ax_jobs ? double(ax_dsum) / double(ax_jobs) / 1e6 : 0.0, double(ax_dmax) / 1e6,
++        (unsigned long long)w.movie_blocks, (unsigned long long)w.movie_pulls, (unsigned long long)w.movie_short_pulls,
++        double(w.movie_short_bytes) / bytes_per_ms,
+         (unsigned long long)svc_calls, (unsigned long long)svc_periods, (unsigned long long)svc_bursts,
+         (unsigned long long)svc_timeouts);
+     std::fflush(stderr);
+@@ -539,9 +543,13 @@ void SDLCALL Feed(void* userdata, SDL_AudioStream* stream, int additional, int t
+         ++w.pulls;
+         const auto have = std::uint64_t(std::max(depth, 0));
+         const auto need = std::uint64_t(std::max(additional, 0));
++        // A callback other than the first registered one (the AX engine) is the movie player's audio mix.
++        const bool movie = state.callback && state.callback != state.base_callback;
++        if (movie) ++w.movie_pulls;
+         if (have < need) {
+             ++w.short_pulls;
+             w.short_bytes += need - have;
++            if (movie) { ++w.movie_short_pulls; w.movie_short_bytes += need - have; }
+         }
+         w.queue_min = std::min(w.queue_min, have);
+         w.queue_sum += have;
