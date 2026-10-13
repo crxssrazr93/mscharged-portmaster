@@ -1,0 +1,579 @@
+Subject: Fast native THP video decoder (bit-identical output)
+
+Same arithmetic and output as the reference decoder: lookup table Huffman decoding from a 64 bit
+bit window (instead of one bit per iteration), DC-only blocks computed once, GX tile stores per row,
+and the column IDCT pass on NEON (same operation order, fused multiply-adds as std::fma). The row passes keep
+their per-row path selection, which differs in rounding. Hardware interrupt service points can be
+coarsened with AURORA_THP_SERVICE_STRIDE (default: after every MCU as before). MSCHARGED_THPSTATS=1
+prints one [thpstats] line per second.
+
+diff --git a/lib/dolphin/thp/THPDec.cpp b/lib/dolphin/thp/THPDec.cpp
+index 0644130..f948887 100644
+--- a/lib/dolphin/thp/THPDec.cpp
++++ b/lib/dolphin/thp/THPDec.cpp
+@@ -8,7 +8,22 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
++
++// The reference arithmetic is single operation float math plus explicit fused multiply-adds; never let the compiler
++// contract anything else.
++#if defined(__clang__)
++#pragma clang fp contract(off)
++#endif
+ 
+ namespace {
+ // Error codes
+@@ -65,7 +80,11 @@ struct QuantizationTable {
+   bool valid = false;
+ };
+ 
++constexpr size_t kLookupBits = 9;
++
+ struct HuffmanTable {
++  // Codes of up to kLookupBits bits: (length << 8) | symbol, indexed by the next kLookupBits bits; 0 = longer code.
++  std::array<u16, (1u << kLookupBits)> lookup{};
+   std::array<u8, 17> counts{};
+   std::array<u16, 17> firstCodes{};
+   std::array<u16, 17> symbolOffsets{};
+@@ -187,6 +206,16 @@ s32 parse_huffman_tables(const u8* data, size_t size, DecodeContext& context) no
+       code = (code + count) << 1;
+       symbolOffset = static_cast<u16>(symbolOffset + count);
+     }
++    for (size_t length = 1; length <= kLookupBits; ++length) {
++      for (u32 index = 0; index < table.counts[length]; ++index) {
++        const u32 code = table.firstCodes[length] + index;
++        const u16 entry = static_cast<u16>((length << 8) | table.symbols[table.symbolOffsets[length] + index]);
++        const u32 first = code << (kLookupBits - length);
++        for (u32 fill = 0; fill < (u32{1} << (kLookupBits - length)); ++fill) {
++          table.lookup[first + fill] = entry;
++        }
++      }
++    }
+     table.valid = true;
+     context.huffmanTables[id * 2 + tableClass] = table;
+   }
+@@ -303,42 +332,80 @@ s32 parse_headers(const void* file, size_t size, DecodeContext& context) noexcep
+   }
+ }
+ 
++// Bit reader with a 64 bit window. Reads past the end of the input yield zero bits and mark the stream as overrun
++// (a block fails exactly when it needs a bit at or beyond the end of the input, as with the former bit-at-a-time
++// reader).
+ class BitReader {
+ public:
+   BitReader(const u8* data, size_t size, size_t byteOffset) noexcept
+-  : mData{data}, mSize{size}, mBitPosition{byteOffset * 8} {}
+-
+-  bool good() const noexcept { return mGood; }
+-
+-  u32 read(u8 count) noexcept {
+-    u32 value = 0;
+-    for (u8 i = 0; i < count; ++i) {
+-      const size_t bytePosition = mBitPosition >> 3;
+-      if (bytePosition >= mSize) { mGood = false; return 0; }
+-      value = (value << 1) | ((mData[bytePosition] >> (7 - (mBitPosition & 7))) & 1);
+-      ++mBitPosition;
+-    }
++  : mData{data}, mSize{size}, mPos{byteOffset},
++    mLimitBits{size > std::numeric_limits<size_t>::max() / 8 ? std::numeric_limits<size_t>::max() : size * 8} {}
++
++  // True when more bits were consumed than the input holds.
++  bool overrun() const noexcept { return mPos * 8 - static_cast<size_t>(mCount) > mLimitBits; }
++
++  void refill() noexcept {
++    if (mPos + 8 <= mSize) [[likely]] {
++      u64 raw;
++      std::memcpy(&raw, mData + mPos, 8);
++      raw = __builtin_bswap64(raw);
++      mBuf |= raw >> mCount;
++      mPos += (63 - mCount) >> 3;
++      mCount |= 56;
++      return;
++    }
++    while (mCount <= 56) {
++      const u64 byte = mPos < mSize ? mData[mPos] : 0;
++      mBuf |= byte << (56 - mCount);
++      ++mPos;
++      mCount += 8;
++    }
++  }
++
++  u32 peek16() const noexcept { return static_cast<u32>(mBuf >> 48); }
++  void drop(int count) noexcept {
++    mBuf <<= count;
++    mCount -= count;
++  }
++  int available() const noexcept { return mCount; }
++  // 1 <= count <= 16; callers refill first.
++  u32 take(int count) noexcept {
++    const u32 value = static_cast<u32>(mBuf >> 48) >> (16 - count);
++    drop(count);
+     return value;
+   }
+ 
+-  void byte_align() noexcept { mBitPosition = (mBitPosition + 7) & ~size_t{7}; }
++  void byte_align() noexcept {
++    const size_t consumed = mPos * 8 - static_cast<size_t>(mCount);
++    mPos = (consumed + 7) >> 3;
++    mBuf = 0;
++    mCount = 0;
++  }
+ 
+ private:
+   const u8* mData;
+   size_t mSize;
+-  size_t mBitPosition;
+-  bool mGood = true;
++  size_t mPos;
++  size_t mLimitBits;
++  u64 mBuf = 0;
++  int mCount = 0;
+ };
+ 
++// Needs 16 valid bits in the reader. Same canonical code walk as before, shortest length first.
+ bool decode_huffman(BitReader& reader, const HuffmanTable& table, u8& symbol) noexcept {
+-  u32 code = 0;
+-  for (size_t length = 1; length <= 16; ++length) {
+-    code = (code << 1) | reader.read(1);
+-    if (!reader.good()) return false;
++  const u32 peek = reader.peek16();
++  if (const u16 entry = table.lookup[peek >> (16 - kLookupBits)]; entry != 0) [[likely]] {
++    reader.drop(entry >> 8);
++    symbol = static_cast<u8>(entry);
++    return true;
++  }
++  for (size_t length = kLookupBits + 1; length <= 16; ++length) {
++    const u32 code = peek >> (16 - length);
+     const u32 firstCode = table.firstCodes[length];
+     const u32 count = table.counts[length];
+     if (code >= firstCode && code - firstCode < count) {
+       symbol = table.symbols[table.symbolOffsets[length] + code - firstCode];
++      reader.drop(static_cast<int>(length));
+       return true;
+     }
+   }
+@@ -352,26 +419,33 @@ s32 extend_value(u32 value, u8 bitCount) noexcept {
+   return static_cast<s32>(value);
+ }
+ 
+-bool decode_block(BitReader& reader, DecodeContext& context, size_t componentIndex,
+-                  std::array<s16, 64>& block) noexcept {
+-  block.fill(0);
++// Decodes one block into coefficients (natural order). acPresent reports whether any AC coefficient was stored.
++bool decode_block(BitReader& reader, DecodeContext& context, size_t componentIndex, s16* block,
++                  bool& acPresent) noexcept {
++  std::memset(block, 0, 64 * sizeof(s16));
++  acPresent = false;
+   Component& component = context.components[componentIndex];
+   const HuffmanTable& dcTable = context.huffmanTables[component.dcTable * 2];
+   const HuffmanTable& acTable = context.huffmanTables[component.acTable * 2 + 1];
+ 
+   u8 bitCount = 0;
++  reader.refill();
+   if (!decode_huffman(reader, dcTable, bitCount) || bitCount > 16) {
+     return false;
+   }
+-  const u32 encodedDifference = reader.read(bitCount);
++  const u32 encodedDifference = bitCount != 0 ? reader.take(bitCount) : 0;
+   const s64 predicted = s64{component.predictedDc} + extend_value(encodedDifference, bitCount);
+-  if (!reader.good() || predicted < std::numeric_limits<s32>::min() ||
+-      predicted > std::numeric_limits<s32>::max()) return false;
++  if (predicted < std::numeric_limits<s32>::min() || predicted > std::numeric_limits<s32>::max()) {
++    return false;
++  }
+   component.predictedDc = static_cast<s32>(predicted);
+   block[0] = static_cast<s16>(component.predictedDc);
+ 
+   size_t coefficient = 1;
+   while (coefficient < 64) {
++    if (reader.available() < 32) {  // a code (<= 16 bits) plus its value (<= 15 bits)
++      reader.refill();
++    }
+     u8 runAndSize = 0;
+     if (!decode_huffman(reader, acTable, runAndSize)) {
+       return false;
+@@ -390,12 +464,12 @@ bool decode_block(BitReader& reader, DecodeContext& context, size_t componentInd
+     if (coefficient >= 64) {
+       return false;
+     }
+-    const u32 encodedValue = reader.read(bitCount);
+-    if (!reader.good()) return false;
++    const u32 encodedValue = reader.take(bitCount);
+     block[kNaturalOrder[coefficient]] = static_cast<s16>(extend_value(encodedValue, bitCount));
++    acPresent = true;
+     ++coefficient;
+   }
+-  return true;
++  return !reader.overrun();
+ }
+ 
+ using FloatRow = std::array<float, 8>;
+@@ -469,47 +543,75 @@ FloatRow transform_column(const FloatRow& x) noexcept {
+   return combine(even, odd);
+ }
+ 
+-size_t row_extent(const s16* coefficients) noexcept {
+-  size_t extent = 8;
+-  while (extent > 0 && coefficients[extent - 1] == 0) {
+-    --extent;
++
++void write_block(u8* output, u16 width, u16 height, u16 blockX, u16 blockY, const std::array<u8, 64>& pixels) noexcept {
++  const size_t tilesPerRow = (width + 7) / 8;
++  for (u16 row = 0; row < 8 && blockY + row < height; ++row) {
++    for (u16 column = 0; column < 8 && blockX + column < width; ++column) {
++      const u16 x = blockX + column;
++      const u16 y = blockY + row;
++      const size_t tile = static_cast<size_t>(y / 4) * tilesPerRow + x / 8;
++      const size_t offset = tile * 32 + static_cast<size_t>(y & 3) * 8 + (x & 7);
++      output[offset] = pixels[row * 8 + column];
++    }
+   }
+-  return extent;
+ }
+ 
+-std::array<u8, 64> inverse_dct(const std::array<s16, 64>& coefficients,
+-                               const QuantizationTable& quantization) noexcept {
+-  std::array<float, 64> workspace{};
+-  for (size_t row = 0; row < 8; ++row) {
+-    const s16* rowCoefficients = &coefficients[row * 8];
+-    const float* rowQuant = &quantization.values[row * 8];
+-    FloatRow transformed{};
+-    switch (row_extent(rowCoefficients)) {
+-    case 0:
+-    case 1:
+-      transformed.fill(static_cast<float>(rowCoefficients[0]) * rowQuant[0]);
+-      break;
+-    case 2:
+-      transformed = transform_row_dc_ac(static_cast<float>(rowCoefficients[0]) * rowQuant[0],
+-                                        static_cast<float>(rowCoefficients[1]) * rowQuant[1]);
+-      break;
+-    case 3:
+-    case 4: {
+-      FloatRow dequantized{};
+-      for (size_t column = 0; column < 4; ++column) {
+-        dequantized[column] = static_cast<float>(rowCoefficients[column]) * rowQuant[column];
+-      }
+-      transformed = transform_row_low4(dequantized);
+-      break;
+-    }
+-    default:
+-      transformed = transform_row(rowCoefficients, rowQuant);
+-      break;
++u8 clamp_pixel(float transformed) noexcept {
++  const float scaled = transformed * 0.125f;
++  return scaled <= 0.0f ? 0 : scaled >= 255.0f ? 255 : static_cast<u8>(scaled);
++}
++
++#if defined(__ARM_NEON)
++// The column pass, four columns per vector. Every lane performs exactly the scalar operations of
++// transform_column (vfmaq/vfmsq are the same single rounding fused multiply-adds as std::fma).
++void column_pass(const float* workspace, u8* pixels) noexcept {
++  const float32x4_t vSqrt2 = vdupq_n_f32(kSqrt2);
++  const float32x4_t vC2 = vdupq_n_f32(kC2);
++  const float32x4_t vC2MinusC6 = vdupq_n_f32(kC2MinusC6);
++  const float32x4_t vC2PlusC6 = vdupq_n_f32(kC2PlusC6);
++  const float32x4_t vBias = vdupq_n_f32(kOutputBias);
++  const float32x4_t vScale = vdupq_n_f32(0.125f);
++  const float32x4_t vZero = vdupq_n_f32(0.0f);
++  const float32x4_t vMax = vdupq_n_f32(255.0f);
++  for (int half = 0; half < 2; ++half) {
++    float32x4_t x[8];
++    for (int row = 0; row < 8; ++row) {
++      x[row] = vld1q_f32(workspace + row * 8 + half * 4);
++    }
++    const float32x4_t sum04 = vaddq_f32(vaddq_f32(x[0], x[4]), vBias);
++    const float32x4_t dif04 = vaddq_f32(vsubq_f32(x[0], x[4]), vBias);
++    const float32x4_t sum26 = vaddq_f32(x[2], x[6]);
++    const float32x4_t dif26 = vsubq_f32(x[2], x[6]);
++    const float32x4_t rotated = vfmaq_f32(vnegq_f32(sum26), dif26, vSqrt2);
++    const float32x4_t e0 = vaddq_f32(sum04, sum26);
++    const float32x4_t e1 = vaddq_f32(dif04, rotated);
++    const float32x4_t e2 = vsubq_f32(dif04, rotated);
++    const float32x4_t e3 = vsubq_f32(sum04, sum26);
++
++    const float32x4_t z10 = vsubq_f32(x[5], x[3]);
++    const float32x4_t z11 = vaddq_f32(x[1], x[7]);
++    const float32x4_t z12 = vsubq_f32(x[1], x[7]);
++    const float32x4_t z13 = vaddq_f32(x[5], x[3]);
++    const float32x4_t o7 = vaddq_f32(z11, z13);
++    const float32x4_t z5 = vmulq_f32(vaddq_f32(z10, z12), vC2);
++    const float32x4_t o6 = vsubq_f32(vfmsq_f32(z5, z10, vC2PlusC6), o7);
++    const float32x4_t o5 = vfmaq_f32(vnegq_f32(o6), vsubq_f32(z11, z13), vSqrt2);
++    const float32x4_t o4 = vsubq_f32(vfmsq_f32(z5, z12, vC2MinusC6), o5);
++
++    const float32x4_t out[8] = {vaddq_f32(e0, o7), vaddq_f32(e1, o6), vaddq_f32(e2, o5), vaddq_f32(e3, o4),
++                                vsubq_f32(e3, o4), vsubq_f32(e2, o5), vsubq_f32(e1, o6), vsubq_f32(e0, o7)};
++    for (int row = 0; row < 8; ++row) {
++      // scaled <= 0 -> 0, scaled >= 255 -> 255, otherwise truncation (all values are finite).
++      const float32x4_t scaled = vminq_f32(vmaxq_f32(vmulq_f32(out[row], vScale), vZero), vMax);
++      const uint16x4_t narrow16 = vmovn_u32(vcvtq_u32_f32(scaled));
++      const uint8x8_t narrow8 = vmovn_u16(vcombine_u16(narrow16, narrow16));
++      vst1_lane_u32(reinterpret_cast<uint32_t*>(pixels + row * 8 + half * 4), vreinterpret_u32_u8(narrow8), 0);
+     }
+-    std::copy(transformed.begin(), transformed.end(), workspace.begin() + row * 8);
+   }
+-
+-  std::array<u8, 64> output{};
++}
++#else
++void column_pass(const float* workspace, u8* pixels) noexcept {
+   for (size_t column = 0; column < 8; ++column) {
+     FloatRow input{};
+     for (size_t row = 0; row < 8; ++row) {
+@@ -517,47 +619,141 @@ std::array<u8, 64> inverse_dct(const std::array<s16, 64>& coefficients,
+     }
+     const FloatRow transformed = transform_column(input);
+     for (size_t row = 0; row < 8; ++row) {
+-      const float scaled = transformed[row] * 0.125f;
+-      output[row * 8 + column] = scaled <= 0.0f ? 0 : scaled >= 255.0f ? 255 : static_cast<u8>(scaled);
++      pixels[row * 8 + column] = clamp_pixel(transformed[row]);
+     }
+   }
+-  return output;
+ }
++#endif
+ 
+-void write_block(u8* output, u16 width, u16 height, u16 blockX, u16 blockY, const std::array<u8, 64>& pixels) noexcept {
+-  const size_t tilesPerRow = (width + 7) / 8;
+-  for (u16 row = 0; row < 8 && blockY + row < height; ++row) {
+-    for (u16 column = 0; column < 8 && blockX + column < width; ++column) {
+-      const u16 x = blockX + column;
+-      const u16 y = blockY + row;
+-      const size_t tile = static_cast<size_t>(y / 4) * tilesPerRow + x / 8;
+-      const size_t offset = tile * 32 + static_cast<size_t>(y & 3) * 8 + (x & 7);
+-      output[offset] = pixels[row * 8 + column];
++// Row transform of one row of s16 coefficients into workspace; the path depends on the highest nonzero coefficient
++// exactly as the reference does (the paths differ in rounding).
++inline void row_pass(const s16* rowCoefficients, const float* rowQuant, float* out) noexcept {
++  FloatRow transformed{};
++  if ((rowCoefficients[4] | rowCoefficients[5] | rowCoefficients[6] | rowCoefficients[7]) != 0) {
++    transformed = transform_row(rowCoefficients, rowQuant);
++  } else if ((rowCoefficients[2] | rowCoefficients[3]) != 0) {
++    FloatRow dequantized{};
++    for (size_t column = 0; column < 4; ++column) {
++      dequantized[column] = static_cast<float>(rowCoefficients[column]) * rowQuant[column];
++    }
++    transformed = transform_row_low4(dequantized);
++  } else if (rowCoefficients[1] != 0) {
++    transformed = transform_row_dc_ac(static_cast<float>(rowCoefficients[0]) * rowQuant[0],
++                                      static_cast<float>(rowCoefficients[1]) * rowQuant[1]);
++  } else {
++    transformed.fill(static_cast<float>(rowCoefficients[0]) * rowQuant[0]);
++  }
++  std::copy(transformed.begin(), transformed.end(), out);
++}
++
++void inverse_dct(const s16* coefficients, bool acPresent, const QuantizationTable& quantization,
++                 u8* pixels) noexcept {
++  if (!acPresent) {
++    // DC only: every column sees the same input {dc, 0 ... 0}, so one column transform serves all 64 pixels.
++    FloatRow input{};
++    input[0] = static_cast<float>(coefficients[0]) * quantization.values[0];
++    for (size_t row = 1; row < 8; ++row) {
++      input[row] = 0.0f;
++    }
++    const FloatRow transformed = transform_column(input);
++    for (size_t row = 0; row < 8; ++row) {
++      std::memset(pixels + row * 8, clamp_pixel(transformed[row]), 8);
+     }
++    return;
++  }
++  alignas(16) float workspace[64];
++  for (size_t row = 0; row < 8; ++row) {
++    row_pass(coefficients + row * 8, &quantization.values[row * 8], workspace + row * 8);
+   }
++  column_pass(workspace, pixels);
++}
++
++// Block (x, y) is a multiple of 8. Blocks inside the picture are stored as two 8x4 GX tiles.
++void write_block_fast(u8* output, u16 width, u16 height, u16 blockX, u16 blockY, const u8* pixels) noexcept {
++  if (blockX + 8 <= width && blockY + 8 <= height) {
++    const size_t tilesPerRow = (width + 7) / 8;
++    u8* upper = output + (static_cast<size_t>(blockY / 4) * tilesPerRow + blockX / 8) * 32;
++    u8* lower = upper + tilesPerRow * 32;
++    std::memcpy(upper, pixels, 32);
++    std::memcpy(lower, pixels + 32, 32);
++    return;
++  }
++  std::array<u8, 64> block;
++  std::memcpy(block.data(), pixels, 64);
++  write_block(output, width, height, blockX, blockY, block);
+ }
+ 
+ bool decode_and_write_block(BitReader& reader, DecodeContext& context, size_t component, u8* output, u16 width,
+                             u16 height, u16 x, u16 y) noexcept {
+-  std::array<s16, 64> coefficients{};
+-  if (!decode_block(reader, context, component, coefficients)) {
++  alignas(16) s16 coefficients[64];
++  bool acPresent = false;
++  if (!decode_block(reader, context, component, coefficients, acPresent)) {
+     return false;
+   }
+   const QuantizationTable& quantization = context.quantizationTables[context.components[component].quantizationTable];
+   if (!quantization.valid) {
+     return false;
+   }
+-  write_block(output, width, height, x, y, inverse_dct(coefficients, quantization));
++  alignas(16) u8 pixels[64];
++  inverse_dct(coefficients, acPresent, quantization, pixels);
++  write_block_fast(output, width, height, x, y, pixels);
+   return true;
+ }
+ } // namespace
+ 
++namespace {
++// Optional (MSCHARGED_THPSTATS=1) one line per second on stderr: frames, ms per frame, input MB/s.
++struct ThpStats {
++  std::atomic<u64> frames{}, ns{}, serviceNs{}, bytes{}, failures{};
++  std::atomic<u64> lastPrint{};
++};
++ThpStats g_thpStats;
++const bool g_thpStatsOn = [] {
++  const char* v = std::getenv("MSCHARGED_THPSTATS");
++  return v != nullptr && *v != '\0' && *v != '0';
++}();
++u64 now_ns() noexcept {
++  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                              std::chrono::steady_clock::now().time_since_epoch())
++                              .count());
++}
++void stats_tick(u64 now) noexcept {
++  u64 last = g_thpStats.lastPrint.load(std::memory_order_relaxed);
++  if (last == 0) {
++    g_thpStats.lastPrint.store(now, std::memory_order_relaxed);
++    return;
++  }
++  if (now - last < 1000000000ull ||
++      !g_thpStats.lastPrint.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
++    return;
++  }
++  const u64 frames = g_thpStats.frames.exchange(0);
++  const u64 ns = g_thpStats.ns.exchange(0);
++  const u64 serviceNs = g_thpStats.serviceNs.exchange(0);
++  const u64 bytes = g_thpStats.bytes.exchange(0);
++  const u64 failures = g_thpStats.failures.exchange(0);
++  const double dt = static_cast<double>(now - last) / 1e9;
++  if (frames != 0) {
++    std::fprintf(stderr,
++                 "[thpstats] dt=%.2fs frames=%llu ms_per_frame=%.3f decode_ms_per_frame=%.3f service_ms_per_frame=%.3f "
++                 "in_MB_s=%.2f failures=%llu\n",
++                 dt, static_cast<unsigned long long>(frames), static_cast<double>(ns) / 1e6 / static_cast<double>(frames),
++                 static_cast<double>(ns - serviceNs) / 1e6 / static_cast<double>(frames),
++                 static_cast<double>(serviceNs) / 1e6 / static_cast<double>(frames),
++                 static_cast<double>(bytes) / 1e6 / dt, static_cast<unsigned long long>(failures));
++  }
++}
++
++#ifndef AURORA_THP_SERVICE_STRIDE
++#define AURORA_THP_SERVICE_STRIDE 1
++#endif
++} // namespace
++
+ extern "C" {
+ BOOL THPInit(void) { return TRUE; }
+ 
+-static s32 decode_video(const void* file, size_t fileSize,
+-                        void* tileY, size_t sizeY, void* tileU, size_t sizeU, void* tileV, size_t sizeV,
+-                        u32 expectedWidth, u32 expectedHeight) {
++static s32 decode_video_impl(const void* file, size_t fileSize, void* tileY, size_t sizeY, void* tileU, size_t sizeU,
++                             void* tileV, size_t sizeV, u32 expectedWidth, u32 expectedHeight, u64& serviceNs) {
+   if (file == nullptr) {
+     return kNoInput;
+   }
+@@ -588,23 +784,26 @@ static s32 decode_video(const void* file, size_t fileSize,
+   BitReader bits{static_cast<const uint8_t*>(file), fileSize, context.scanOffset};
+   const u16 mcuColumns = static_cast<u16>((context.width + 15) / 16);
+   const u16 mcuRows = static_cast<u16>((context.height + 15) / 16);
++  u8* const planeY = static_cast<uint8_t*>(tileY);
++  u8* const planeU = static_cast<uint8_t*>(tileU);
++  u8* const planeV = static_cast<uint8_t*>(tileV);
+   u32 restartCount = 0;
++  u32 sinceService = 0;
+   for (u16 mcuY = 0; mcuY < mcuRows; ++mcuY) {
+     for (u16 mcuX = 0; mcuX < mcuColumns; ++mcuX) {
+       const u16 lumaX = static_cast<u16>(mcuX * 16);
+       const u16 lumaY = static_cast<u16>(mcuY * 16);
+-      if (!decode_and_write_block(bits, context, 0, static_cast<uint8_t*>(tileY), context.width, context.height, lumaX,
+-                                  lumaY) ||
+-          !decode_and_write_block(bits, context, 0, static_cast<uint8_t*>(tileY), context.width, context.height,
++      if (!decode_and_write_block(bits, context, 0, planeY, context.width, context.height, lumaX, lumaY) ||
++          !decode_and_write_block(bits, context, 0, planeY, context.width, context.height,
+                                   static_cast<u16>(lumaX + 8), lumaY) ||
+-          !decode_and_write_block(bits, context, 0, static_cast<uint8_t*>(tileY), context.width, context.height, lumaX,
++          !decode_and_write_block(bits, context, 0, planeY, context.width, context.height, lumaX,
+                                   static_cast<u16>(lumaY + 8)) ||
+-          !decode_and_write_block(bits, context, 0, static_cast<uint8_t*>(tileY), context.width, context.height,
++          !decode_and_write_block(bits, context, 0, planeY, context.width, context.height,
+                                   static_cast<u16>(lumaX + 8), static_cast<u16>(lumaY + 8)) ||
+-          !decode_and_write_block(bits, context, 1, static_cast<uint8_t*>(tileU), chromaWidth, chromaHeight,
+-                                  static_cast<u16>(mcuX * 8), static_cast<u16>(mcuY * 8)) ||
+-          !decode_and_write_block(bits, context, 2, static_cast<uint8_t*>(tileV), chromaWidth, chromaHeight,
+-                                  static_cast<u16>(mcuX * 8), static_cast<u16>(mcuY * 8))) {
++          !decode_and_write_block(bits, context, 1, planeU, chromaWidth, chromaHeight, static_cast<u16>(mcuX * 8),
++                                  static_cast<u16>(mcuY * 8)) ||
++          !decode_and_write_block(bits, context, 2, planeV, chromaWidth, chromaHeight, static_cast<u16>(mcuX * 8),
++                                  static_cast<u16>(mcuY * 8))) {
+         return kBadSyntax;
+       }
+ 
+@@ -613,7 +812,16 @@ static s32 decode_video(const void* file, size_t fileSize,
+       // A completed MCU is a stable boundary between entropy/IDCT/output work;
+       // the host endpoint preserves owner, mask and reentrancy rules. No codec
+       // state, equations, source playback decisions or callback are replaced.
+-      aurora_service_hardware_interrupts();
++      if (++sinceService >= AURORA_THP_SERVICE_STRIDE) {
++        sinceService = 0;
++        if (g_thpStatsOn) {
++          const u64 before = now_ns();
++          aurora_service_hardware_interrupts();
++          serviceNs += now_ns() - before;
++        } else {
++          aurora_service_hardware_interrupts();
++        }
++      }
+ #endif
+ 
+       if (context.restartInterval != 0 && ++restartCount == context.restartInterval) {
+@@ -628,6 +836,31 @@ static s32 decode_video(const void* file, size_t fileSize,
+   return 0;
+ }
+ 
++static s32 decode_video(const void* file, size_t fileSize, void* tileY, size_t sizeY, void* tileU, size_t sizeU,
++                        void* tileV, size_t sizeV, u32 expectedWidth, u32 expectedHeight) {
++  if (!g_thpStatsOn) {
++    u64 unused = 0;
++    return decode_video_impl(file, fileSize, tileY, sizeY, tileU, sizeU, tileV, sizeV, expectedWidth, expectedHeight,
++                             unused);
++  }
++  u64 serviceNs = 0;
++  const u64 start = now_ns();
++  const s32 result = decode_video_impl(file, fileSize, tileY, sizeY, tileU, sizeU, tileV, sizeV, expectedWidth,
++                                       expectedHeight, serviceNs);
++  const u64 end = now_ns();
++  g_thpStats.frames.fetch_add(1, std::memory_order_relaxed);
++  g_thpStats.ns.fetch_add(end - start, std::memory_order_relaxed);
++  g_thpStats.serviceNs.fetch_add(serviceNs, std::memory_order_relaxed);
++  if (fileSize != std::numeric_limits<size_t>::max()) {
++    g_thpStats.bytes.fetch_add(fileSize, std::memory_order_relaxed);
++  }
++  if (result != 0) {
++    g_thpStats.failures.fetch_add(1, std::memory_order_relaxed);
++  }
++  stats_tick(end);
++  return result;
++}
++
+ s32 THPVideoDecode(const void* file, void* tileY, void* tileU, void* tileV, void*) {
+   constexpr size_t unlimited = std::numeric_limits<size_t>::max();
+   return decode_video(file, unlimited, tileY, unlimited, tileU, unlimited, tileV, unlimited, 0, 0);

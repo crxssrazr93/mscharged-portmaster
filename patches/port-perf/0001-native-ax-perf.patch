@@ -26,6 +26,17 @@ index 97fcbb2b..49317edc 100644
  if(BUILD_TESTING AND TARGET native_ax_active_source_fixture)
      add_executable(native_ax_functional_tests tests/native_ax_functional.cpp
          src/platform/os.cpp src/platform/os_version.cpp)
+diff --git a/cmake/NativeThpDecoder.cmake b/cmake/NativeThpDecoder.cmake
+index ebfd253e..ba93904a 100644
+--- a/cmake/NativeThpDecoder.cmake
++++ b/cmake/NativeThpDecoder.cmake
+@@ -8,4 +8,5 @@ add_dependencies(charged_thp_decoder verify_prepared)
+ target_link_libraries(charged_thp_decoder PUBLIC aurora::core)
+ target_compile_features(charged_thp_decoder PUBLIC cxx_std_20)
+ target_compile_definitions(charged_thp_decoder PRIVATE AURORA_THP_PRESERVE_QUARTER_IDCT=1
+-    AURORA_THP_HARDWARE_SAFE_POINTS=1)
++    AURORA_THP_HARDWARE_SAFE_POINTS=1
++    AURORA_THP_SERVICE_STRIDE=16)
 diff --git a/src/platform/ax_active_voice.cpp b/src/platform/ax_active_voice.cpp
 index ef8fe8bd..f328d9f7 100644
 --- a/src/platform/ax_active_voice.cpp
