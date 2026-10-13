@@ -1,6 +1,6 @@
 #!/bin/bash
 # One deterministic capture run, fully offscreen.
-# Usage: tests/compare/run.sh <gles|vk> <out dir> <frames list> [exit frame]
+# Usage: tests/compare/run.sh <gles|glesgpu|vk> <out dir> <frames list> [exit frame]
 # Environment: INPUT (script file), SIZE (default 640x480), INI (default tests/compare/compare.ini),
 #   TRACE=1 (per frame virtual time/retrace trace), TIMEOUT (seconds, default 3000), ASPECT (4:3|16:9).
 # GLES runs under Xvfb (Mesa). Vulkan cannot present on Xvfb, so it runs in a headless gamescope.
@@ -11,6 +11,8 @@ W="$(cd "$(dirname "$0")/../.." && pwd)"
 SIZE=${SIZE:-640x480}; INI=${INI:-$W/tests/compare/compare.ini}; TIMEOUT=${TIMEOUT:-3000}
 rm -rf "$O"; mkdir -p "$O/home" "$O/cap"
 BIN_DIR=$W/upstream/build/$([ "$KIND" = vk ] && echo vk-cmp || echo gles-cmp)
+# KIND glesgpu: the GLES build on the Intel GPU (Mesa iris) inside the same headless gamescope as Vulkan.
+[ -n "${INPUT:-}" ] && INPUT=$(readlink -f "$INPUT")
 CFG="$O/mscharged.ini"; sed "s#^width = .*#width = ${SIZE%x*}#; s#^height = .*#height = ${SIZE#*x}#" "$INI" > "$CFG"
 [ -n "${ASPECT:-}" ] && sed -i "s#^aspect = .*#aspect = $ASPECT#" "$CFG"
 cat > "$O/inner.sh" <<IN
@@ -21,7 +23,7 @@ export AURORA_GL_DEBUG=\${AURORA_GL_DEBUG:-}
 exec setarch \$(uname -m) -R ./mscharged --config "$CFG" --disc "$W/disc/R4QE01.rvz" --window --size $SIZE > "$O/game.log" 2>&1
 IN
 chmod +x "$O/inner.sh"
-if [ "$KIND" = vk ]; then
+if [ "$KIND" = vk ] || [ "$KIND" = glesgpu ]; then
   env -u WAYLAND_DISPLAY -u DISPLAY timeout -s KILL "$TIMEOUT" gamescope --backend headless -W 1920 -H 1080 -w 1920 -h 1080 -- bash "$O/inner.sh" > "$O/gamescope.log" 2>&1
 else
   N=$((300 + RANDOM % 600))
