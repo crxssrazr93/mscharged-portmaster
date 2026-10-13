@@ -1,9 +1,9 @@
 #!/bin/bash
 # Deterministic offscreen run of the GPU build through menus into a match (virtual clock, frame exact scripted input from
 # tests/compare/match.input), with the census on. Usage: tests/pc/gpu_match_run.sh <name> [exit frame, default 8300]
-# Environment: extra AURORA_* variables pass through; BUILD overrides the build dir.
+# Needs the test build (tests/compare/build_cmp.sh gles). Environment: extra AURORA_* variables pass through; BUILD overrides the build dir.
 W="$(cd "$(dirname "$0")/../.." && pwd)"
-N=$1; EXIT=${2:-8300}; O=$W/work/gpu-runs/$N; B=${BUILD:-$W/work/xbuild-gpu/build/pc-gpu}
+N=$1; EXIT=${2:-8300}; O=$W/work/gpu-runs/$N; B=${BUILD:-${XTEST:-$W/work/xbuild-test}/build/gles-cmp}
 rm -rf "$O" "$B/logs"; mkdir -p "$O/home" "$O/cap"
 sed "s#^disc = .*#disc = $W/disc/R4QE01.rvz#" "$W/tests/compare/compare.ini" > "$O/mscharged.ini"
 P=$((300 + RANDOM % 600))

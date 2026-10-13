@@ -9,7 +9,7 @@ GLES build, same disc, same scripted input, same virtual clock. PC only, fully o
   count alone, and port hooks (CMake option `MSCHARGED_TEST_CAPTURE`) replay a scripted input file and save the
   presented frame as PNG at chosen frame numbers (`CAPTURE_FRAMES`, `CAPTURE_INPUT`, `CAPTURE_EXIT_FRAME`).
   Shipped builds never contain it.
-* `build_cmp.sh` builds `upstream/build/vk-cmp` (Vulkan) and `upstream/build/gles-cmp` (GLES). The GLES Aurora is
+* `build_cmp.sh` builds `work/xbuild-test/build/vk-cmp` (Vulkan) and `work/xbuild-test/build/gles-cmp` (GLES). The GLES Aurora is
   assembled by `tools/aurora_series.sh` from `patches/aurora-gles`, then `patches/aurora-glesfix`, then the virtual
   clock patch. `TAG=_x` additionally copies the binary to `mscharged_x`, and `GLESFIX=0` leaves the fix series out,
   so a baseline and a fixed binary can both be kept.
@@ -125,8 +125,8 @@ rasterizer rounds differently, that is the only reason for the gap to the GPU co
 ## Open issues
 
 1. The hologram and glow row pattern (EFB copy and blur chain) above is the main remaining render difference
-   (29 to 41 dB). Next step: dump the converted copy (the dropped `AURORA_GL_COPYDUMP` aid in
-   `patches/aurora-gles-wip/0003`) at one hologram frame for Vulkan and GLES and compare source against destination.
+   (29 to 41 dB). Next step: dump the converted copy (a debugging aid named `AURORA_GL_COPYDUMP` that was dropped
+   with the removed wip series, so it has to be written again) at one hologram frame for Vulkan and GLES and compare source against destination.
 2. The vertex ring overflow frame at startup needs a check that no visible draw is dropped (and a per frame growth or
    larger ring if it is).
 3. Intro movie and save prompt were compared on the GPU only; on llvmpipe they were not repeated after the fix.

@@ -22,7 +22,14 @@ fi
 # Marker matches: nothing to do. No marker and a clean tracked tree: apply the series. Anything else
 # (patches changed, or hand edits in the tree): refuse, unless RESET=1 which rebuilds from the pinned commit
 # (this discards uncommitted edits in the checkout, so turn them into patches first).
-SERIES_PATCHES=("$W"/patches/port-gles/*.patch "$W"/patches/port-pm/*.patch "$W"/patches/port-perf/*.patch "$W"/patches/decomp-pm/*.patch)
+# TEST_CAPTURE=1 (with XSRC set to another directory) prepares a test tree instead: no handheld patch, plus the test only
+# frame capture and scripted input (patches/test-capture/port), for tools/test_build.sh.
+if [ "${TEST_CAPTURE:-0}" = 1 ]; then
+  PORT_SERIES=("$W"/patches/port-gles "$W"/patches/port-pm "$W"/patches/port-perf "$W"/patches/test-capture/port)
+else
+  PORT_SERIES=("$W"/patches/port-gles "$W"/patches/port-pm "$W"/patches/port-perf "$W"/patches/port-handheld)
+fi
+SERIES_PATCHES=(); for d in "${PORT_SERIES[@]}"; do SERIES_PATCHES+=("$d"/*.patch); done; SERIES_PATCHES+=("$W"/patches/decomp-pm/*.patch)
 MARK="$(git rev-parse --git-path mscharged-series.sha)"
 SERIES_HASH=$(cat "${SERIES_PATCHES[@]}" | sha256sum | cut -d' ' -f1)
 if [ -f "$MARK" ] && [ "$(cat "$MARK")" = "$SERIES_HASH" ]; then
@@ -33,8 +40,8 @@ else
   elif [ -f "$MARK" ] || [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "checkout has a different or unrecorded patch state; commit your edits as patches and rerun with RESET=1" >&2; exit 1
   fi
-  for p in "$W"/patches/port-gles/*.patch "$W"/patches/port-pm/*.patch "$W"/patches/port-perf/*.patch; do
-    git apply "$p"; echo "applied $(basename "$p")"
+  for d in "${PORT_SERIES[@]}"; do
+    for p in "$d"/*.patch; do git apply "$p"; echo "applied $(basename "$p")"; done
   done
   # Decomp host adaptations (appended to the port's own decomp series).
   for p in "$W"/patches/decomp-pm/*.patch; do

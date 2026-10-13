@@ -1,0 +1,527 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6919a91a..b2ccf736 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -56,6 +56,22 @@ if(MSCHARGED_GRAPHICS_BACKEND STREQUAL "gles")
+     add_compile_definitions(MSCHARGED_GRAPHICS_GLES=1)
+     message(STATUS "Graphics backend: GLES (Aurora extra patches: ${MSCHARGED_AURORA_EXTRA_PATCH_DIR})")
+ endif()
++option(MSCHARGED_HANDHELD "Handheld game only build: no launcher UI, Wii Remote HID, Dolphin save import, ImGui, diagnostics or tests" OFF)
++if(MSCHARGED_HANDHELD)
++    if(NOT MSCHARGED_GLES)
++        message(FATAL_ERROR "MSCHARGED_HANDHELD requires MSCHARGED_GRAPHICS_BACKEND=gles")
++    endif()
++    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
++    # One section per function and datum, so the linker's --gc-sections (already used for the game) also drops
++    # the unreferenced parts of the static libraries.
++    add_compile_options(-ffunction-sections -fdata-sections)
++    add_link_options(-Wl,--gc-sections)
++    option(MSCHARGED_HANDHELD_LTO "Link time optimization of the handheld build" OFF)
++    if(MSCHARGED_HANDHELD_LTO)
++        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
++    endif()
++    message(STATUS "Handheld build: game runtime only")
++endif()
+ option(MSCHARGED_BUILD_LAUNCHER "Build the graphical launcher" ON)
+ option(MSCHARGED_BUILD_AURORA_HOST "Build the Aurora core initialization check (no GX rendering)" OFF)
+ option(MSCHARGED_BUILD_GAME_STARTUP "Build the experimental original-game startup path (not playable)" OFF)
+@@ -247,13 +263,17 @@ add_library(charged_host STATIC
+     src/bootstrap/config.cpp
+     src/bootstrap/launch_options.cpp
+     src/platform/disc.cpp
+-    src/platform/save_import.cpp
+ )
++if(NOT MSCHARGED_HANDHELD)
++    target_sources(charged_host PRIVATE src/platform/save_import.cpp)
++endif()
+ target_include_directories(charged_host PUBLIC src)
+ target_compile_features(charged_host PUBLIC cxx_std_17)
+ target_link_libraries(charged_host PRIVATE nod::nod)
+-add_executable(mscharged-bootstrap src/bootstrap/main.cpp)
+-target_link_libraries(mscharged-bootstrap PRIVATE charged_foundation charged_host)
++if(NOT MSCHARGED_HANDHELD)
++    add_executable(mscharged-bootstrap src/bootstrap/main.cpp)
++    target_link_libraries(mscharged-bootstrap PRIVATE charged_foundation charged_host)
++endif()
+ configure_file(assets/launcher/header.png assets/launcher/header.png COPYONLY)
+ set(MSCHARGED_VERSION_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/mscharged")
+ add_custom_target(update_build_version
+@@ -273,7 +293,9 @@ target_include_directories(mscharged_build_info INTERFACE "${CMAKE_CURRENT_BINAR
+ target_compile_definitions(mscharged_build_info INTERFACE
+     MSCHARGED_BUILD_CONFIG="$<CONFIG>"
+     MSCHARGED_DECOMP_REVISION="${MSCHARGED_DECOMP_REVISION}")
+-target_link_libraries(mscharged-bootstrap PRIVATE mscharged_build_info)
++if(TARGET mscharged-bootstrap)
++    target_link_libraries(mscharged-bootstrap PRIVATE mscharged_build_info)
++endif()
+ 
+ if(MSCHARGED_BUILD_LAUNCHER OR MSCHARGED_BUILD_AURORA_HOST)
+     include(cmake/SDL.cmake)
+diff --git a/CMakePresets.json b/CMakePresets.json
+index 96cd8e16..41b1845c 100644
+--- a/CMakePresets.json
++++ b/CMakePresets.json
+@@ -104,6 +104,16 @@
+         "MSCHARGED_GRAPHICS_BACKEND": "gles"
+       }
+     },
++    {
++      "name": "gles-handheld",
++      "inherits": "gles-release",
++      "displayName": "Handheld game only build on the GLES graphics backend (no launcher UI, Wii Remote HID, save import, ImGui, diagnostics)",
++      "binaryDir": "${sourceDir}/build/gles-handheld",
++      "cacheVariables": {
++        "MSCHARGED_HANDHELD": true,
++        "BUILD_TESTING": false
++      }
++    },
+     {
+       "name": "launcher",
+       "inherits": "optimized",
+diff --git a/cmake/AppIcon.cmake b/cmake/AppIcon.cmake
+index 01397f87..4d12d12c 100644
+--- a/cmake/AppIcon.cmake
++++ b/cmake/AppIcon.cmake
+@@ -1,3 +1,10 @@
++if(MSCHARGED_HANDHELD)
++    # No window icon: no embedded PNG and no PNG decoder in the handheld build.
++    add_library(charged_app_icon STATIC src/platform/app_icon_none.cpp)
++    target_include_directories(charged_app_icon PUBLIC src)
++    target_link_libraries(charged_app_icon PRIVATE SDL3::SDL3)
++    return()
++endif()
+ # Embed the original PNG so launcher and direct game startup share one icon.
+ # Keep image conversion out of the user's build prerequisites.
+ set(_app_icon "${CMAKE_CURRENT_SOURCE_DIR}/assets/launcher/icon.png")
+diff --git a/cmake/AuroraHost.cmake b/cmake/AuroraHost.cmake
+index fcdb85ac..11a7d641 100644
+--- a/cmake/AuroraHost.cmake
++++ b/cmake/AuroraHost.cmake
+@@ -78,6 +78,8 @@ function(mscharged_add_aurora_host)
+     set(AURORA_WII_LIGHTING ON)
+     set(AURORA_ENABLE_NATIVE_VIDEO ${MSCHARGED_NATIVE_VIDEO})
+     set(AURORA_ENABLE_RMLUI OFF)
++    # Handheld: no ImGui overlay, no PNG screenshots, no texture replacement (patches/aurora-handheld).
++    set(AURORA_LEAN ${MSCHARGED_HANDHELD})
+     set(AURORA_ENABLE_TESTS OFF)
+     set(AURORA_ENABLE_EXAMPLES OFF)
+     add_subdirectory("${MSCHARGED_AURORA_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/aurora" EXCLUDE_FROM_ALL)
+@@ -122,12 +124,18 @@ if(MSCHARGED_BUILD_GX_CHECK)
+     else()
+         mscharged_verify_targets("${MSCHARGED_DAWN_PREPARED}")
+     endif()
+-    foreach(directory IN ITEMS "${MSCHARGED_zlib_ng_PREPARED}" "${MSCHARGED_libpng_PREPARED}"
+-            "${MSCHARGED_freetype_PREPARED}" "${MSCHARGED_zstd_PREPARED}/build/cmake")
+-        mscharged_verify_targets("${directory}")
+-    endforeach()
++    if(MSCHARGED_HANDHELD)
++        mscharged_verify_targets("${MSCHARGED_zstd_PREPARED}/build/cmake")
++    else()
++        foreach(directory IN ITEMS "${MSCHARGED_zlib_ng_PREPARED}" "${MSCHARGED_libpng_PREPARED}"
++                "${MSCHARGED_freetype_PREPARED}" "${MSCHARGED_zstd_PREPARED}/build/cmake")
++            mscharged_verify_targets("${directory}")
++        endforeach()
++    endif()
+     add_dependencies(sqlite3 verify_prepared)
+-    add_dependencies(imgui imgui_backends verify_prepared)
++    if(NOT MSCHARGED_HANDHELD)
++        add_dependencies(imgui imgui_backends verify_prepared)
++    endif()
+     include(cmake/GraphicsCheck.cmake)
+ else()
+     mscharged_verify_targets("${MSCHARGED_ABSEIL_PREPARED}")
+diff --git a/cmake/GraphicsCheck.cmake b/cmake/GraphicsCheck.cmake
+index 3bfe1af1..2687b477 100644
+--- a/cmake/GraphicsCheck.cmake
++++ b/cmake/GraphicsCheck.cmake
+@@ -1,8 +1,10 @@
+-add_executable(mscharged-gx-check src/runtime/gx_check.cpp)
+-target_include_directories(mscharged-gx-check PRIVATE src "${MSCHARGED_AURORA_PREPARED}/lib")
+-target_compile_features(mscharged-gx-check PRIVATE cxx_std_20)
+-target_link_libraries(mscharged-gx-check PRIVATE aurora::gx aurora::mtx aurora::os
+-    aurora::vi aurora::core mscharged_build_info)
++if(NOT MSCHARGED_HANDHELD)
++    add_executable(mscharged-gx-check src/runtime/gx_check.cpp)
++    target_include_directories(mscharged-gx-check PRIVATE src "${MSCHARGED_AURORA_PREPARED}/lib")
++    target_compile_features(mscharged-gx-check PRIVATE cxx_std_20)
++    target_link_libraries(mscharged-gx-check PRIVATE aurora::gx aurora::mtx aurora::os
++        aurora::vi aurora::core mscharged_build_info)
++endif()
+ 
+ # Real GPU tests require a desktop and driver. Keep the portable tests runnable
+ # without a GPU; register this explicit gate only when requested.
+diff --git a/cmake/GraphicsProviders.cmake b/cmake/GraphicsProviders.cmake
+index 31201ff7..647bfa02 100644
+--- a/cmake/GraphicsProviders.cmake
++++ b/cmake/GraphicsProviders.cmake
+@@ -1,8 +1,17 @@
+-foreach(name IN ITEMS zlib-ng libpng freetype sqlite zstd)
++if(MSCHARGED_HANDHELD)
++    # Aurora is built lean (AURORA_LEAN): no ImGui overlay and no PNG screenshots, so no zlib, libpng,
++    # FreeType or ImGui.
++    set(MSCHARGED_GRAPHICS_DEPENDENCIES sqlite zstd)
++else()
++    set(MSCHARGED_GRAPHICS_DEPENDENCIES zlib-ng libpng freetype sqlite zstd)
++endif()
++foreach(name IN LISTS MSCHARGED_GRAPHICS_DEPENDENCIES)
+     string(REPLACE "-" "_" variable "${name}")
+     mscharged_prepare_dependency("${name}" "MSCHARGED_${variable}_PREPARED")
+ endforeach()
+-mscharged_prepare_dependency(imgui MSCHARGED_IMGUI_PREPARED)
++if(NOT MSCHARGED_HANDHELD)
++    mscharged_prepare_dependency(imgui MSCHARGED_IMGUI_PREPARED)
++endif()
+ find_package(Threads REQUIRED)
+ 
+ find_program(MSCHARGED_SQLITE_MAKE NAMES gmake make REQUIRED)
+@@ -24,27 +33,29 @@ add_dependencies(verify_prepared verify_sqlite_generated)
+ function(mscharged_add_graphics_providers)
+     set(BUILD_SHARED_LIBS OFF)
+     set(BUILD_TESTING OFF)
+-    set(ZLIB_COMPAT ON)
+-    set(ZLIB_INSTALL OFF)
+-    add_subdirectory("${MSCHARGED_zlib_ng_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/zlib" EXCLUDE_FROM_ALL)
+-    get_target_property(zlib_target zlibstatic ALIASED_TARGET)
+-    add_library(ZLIB::ZLIB ALIAS ${zlib_target})
+-    # libpng's FindZLIB must use the already configured pinned target.
+-    file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/ZLIBConfig.cmake"
+-        "set(ZLIB_FOUND TRUE)\nset(ZLIB_INCLUDE_DIRS \"${MSCHARGED_zlib_ng_PREPARED};${CMAKE_CURRENT_BINARY_DIR}/extern/zlib\")\n")
+-    set(PNG_SHARED OFF)
+-    set(PNG_STATIC ON)
+-    set(PNG_TESTS OFF)
+-    set(PNG_TOOLS OFF)
+-    add_subdirectory("${MSCHARGED_libpng_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/png" EXCLUDE_FROM_ALL)
+-    add_library(PNG::PNG ALIAS png_static)
+-    set(FT_DISABLE_BROTLI ON)
+-    set(FT_DISABLE_HARFBUZZ ON)
+-    set(FT_DISABLE_PNG ON)
+-    set(FT_DISABLE_ZLIB ON)
+-    set(FT_DISABLE_BZIP2 ON)
+-    add_subdirectory("${MSCHARGED_freetype_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/freetype" EXCLUDE_FROM_ALL)
+-    add_library(Freetype::Freetype ALIAS freetype)
++    if(NOT MSCHARGED_HANDHELD)
++        set(ZLIB_COMPAT ON)
++        set(ZLIB_INSTALL OFF)
++        add_subdirectory("${MSCHARGED_zlib_ng_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/zlib" EXCLUDE_FROM_ALL)
++        get_target_property(zlib_target zlibstatic ALIASED_TARGET)
++        add_library(ZLIB::ZLIB ALIAS ${zlib_target})
++        # libpng's FindZLIB must use the already configured pinned target.
++        file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/ZLIBConfig.cmake"
++            "set(ZLIB_FOUND TRUE)\nset(ZLIB_INCLUDE_DIRS \"${MSCHARGED_zlib_ng_PREPARED};${CMAKE_CURRENT_BINARY_DIR}/extern/zlib\")\n")
++        set(PNG_SHARED OFF)
++        set(PNG_STATIC ON)
++        set(PNG_TESTS OFF)
++        set(PNG_TOOLS OFF)
++        add_subdirectory("${MSCHARGED_libpng_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/png" EXCLUDE_FROM_ALL)
++        add_library(PNG::PNG ALIAS png_static)
++        set(FT_DISABLE_BROTLI ON)
++        set(FT_DISABLE_HARFBUZZ ON)
++        set(FT_DISABLE_PNG ON)
++        set(FT_DISABLE_ZLIB ON)
++        set(FT_DISABLE_BZIP2 ON)
++        add_subdirectory("${MSCHARGED_freetype_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/freetype" EXCLUDE_FROM_ALL)
++        add_library(Freetype::Freetype ALIAS freetype)
++    endif()
+     set(ZSTD_BUILD_PROGRAMS OFF)
+     set(ZSTD_BUILD_TESTS OFF)
+     set(ZSTD_BUILD_SHARED OFF)
+@@ -59,42 +70,44 @@ function(mscharged_add_graphics_providers)
+         # string functions, a guarded strlen); SQLite itself is unchanged.
+         target_compile_options(sqlite3 PRIVATE -Wno-discarded-qualifiers -Wno-stringop-overread)
+     endif()
+-    add_library(imgui STATIC
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui_draw.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui_tables.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui_widgets.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/misc/cpp/imgui_stdlib.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/misc/freetype/imgui_freetype.cpp")
+-    target_include_directories(imgui PUBLIC "${MSCHARGED_IMGUI_PREPARED}")
+-    target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE)
+-    target_compile_features(imgui PRIVATE cxx_std_20)
+-    target_link_libraries(imgui PRIVATE Freetype::Freetype)
+-    if(MSCHARGED_GLES)
+-        # Aurora's GLES renderer draws ImGui through imgui_impl_opengl3 on its
+-        # OpenGL ES 3 context (core ES3 entry points from libGLESv2, no desktop
+-        # GL loader). sdlrenderer3 stays for the launcher and the headless path.
+-        add_library(imgui_backends STATIC
+-            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
+-            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
+-            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_opengl3.cpp")
+-        target_compile_features(imgui_backends PRIVATE cxx_std_20)
+-        target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
+-        find_library(MSCHARGED_GLESV2_LIBRARY GLESv2)
+-        if(NOT MSCHARGED_GLESV2_LIBRARY)
+-            set(MSCHARGED_GLESV2_LIBRARY GLESv2)  # the linker's own -lGLESv2 search
++    if(NOT MSCHARGED_HANDHELD)
++        add_library(imgui STATIC
++            "${MSCHARGED_IMGUI_PREPARED}/imgui.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/imgui_draw.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/imgui_tables.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/imgui_widgets.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/misc/cpp/imgui_stdlib.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/misc/freetype/imgui_freetype.cpp")
++        target_include_directories(imgui PUBLIC "${MSCHARGED_IMGUI_PREPARED}")
++        target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_FREETYPE)
++        target_compile_features(imgui PRIVATE cxx_std_20)
++        target_link_libraries(imgui PRIVATE Freetype::Freetype)
++        if(MSCHARGED_GLES)
++            # Aurora's GLES renderer draws ImGui through imgui_impl_opengl3 on its
++            # OpenGL ES 3 context (core ES3 entry points from libGLESv2, no desktop
++            # GL loader). sdlrenderer3 stays for the launcher and the headless path.
++            add_library(imgui_backends STATIC
++                "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
++                "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
++                "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_opengl3.cpp")
++            target_compile_features(imgui_backends PRIVATE cxx_std_20)
++            target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
++            find_library(MSCHARGED_GLESV2_LIBRARY GLESv2)
++            if(NOT MSCHARGED_GLESV2_LIBRARY)
++                set(MSCHARGED_GLESV2_LIBRARY GLESv2)  # the linker's own -lGLESv2 search
++            endif()
++            target_link_libraries(imgui_backends PRIVATE imgui SDL3::SDL3 "${MSCHARGED_GLESV2_LIBRARY}")
++        else()
++            add_library(imgui_backends STATIC
++                "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
++                "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
++                "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_wgpu.cpp")
++            target_compile_features(imgui_backends PRIVATE cxx_std_20)
++            target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
++            target_link_libraries(imgui_backends PRIVATE imgui SDL3::SDL3 dawn::webgpu_dawn)
+         endif()
+-        target_link_libraries(imgui_backends PRIVATE imgui SDL3::SDL3 "${MSCHARGED_GLESV2_LIBRARY}")
+-    else()
+-        add_library(imgui_backends STATIC
+-            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
+-            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
+-            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_wgpu.cpp")
+-        target_compile_features(imgui_backends PRIVATE cxx_std_20)
+-        target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
+-        target_link_libraries(imgui_backends PRIVATE imgui SDL3::SDL3 dawn::webgpu_dawn)
++        target_link_libraries(imgui PUBLIC imgui_backends)
+     endif()
+-    target_link_libraries(imgui PUBLIC imgui_backends)
+ endfunction()
+ 
+ mscharged_add_graphics_providers()
+diff --git a/cmake/Launcher.cmake b/cmake/Launcher.cmake
+index d907938d..860aa106 100644
+--- a/cmake/Launcher.cmake
++++ b/cmake/Launcher.cmake
+@@ -1,27 +1,29 @@
+-if(TARGET imgui)
+-    # A single ImGui implementation serves Aurora/WGPU and the SDL launcher.
+-    add_library(charged_launcher_ui INTERFACE)
+-    target_link_libraries(charged_launcher_ui INTERFACE imgui SDL3::SDL3)
+-    target_include_directories(charged_launcher_ui INTERFACE
+-        "${MSCHARGED_IMGUI_PREPARED}/backends" "${MSCHARGED_IMGUI_PREPARED}/misc/cpp")
+-else()
+-    mscharged_prepare_dependency(imgui MSCHARGED_IMGUI_PREPARED)
++if(NOT MSCHARGED_HANDHELD)
++    if(TARGET imgui)
++        # A single ImGui implementation serves Aurora/WGPU and the SDL launcher.
++        add_library(charged_launcher_ui INTERFACE)
++        target_link_libraries(charged_launcher_ui INTERFACE imgui SDL3::SDL3)
++        target_include_directories(charged_launcher_ui INTERFACE
++            "${MSCHARGED_IMGUI_PREPARED}/backends" "${MSCHARGED_IMGUI_PREPARED}/misc/cpp")
++    else()
++        mscharged_prepare_dependency(imgui MSCHARGED_IMGUI_PREPARED)
+ 
+-    add_library(charged_launcher_ui STATIC
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui_draw.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui_tables.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/imgui_widgets.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/misc/cpp/imgui_stdlib.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
+-        "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
+-    )
+-    add_dependencies(charged_launcher_ui verify_prepared)
+-    target_include_directories(charged_launcher_ui PUBLIC
+-        "${MSCHARGED_IMGUI_PREPARED}" "${MSCHARGED_IMGUI_PREPARED}/backends"
+-        "${MSCHARGED_IMGUI_PREPARED}/misc/cpp")
+-    target_link_libraries(charged_launcher_ui PUBLIC SDL3::SDL3)
++        add_library(charged_launcher_ui STATIC
++            "${MSCHARGED_IMGUI_PREPARED}/imgui.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/imgui_draw.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/imgui_tables.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/imgui_widgets.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/misc/cpp/imgui_stdlib.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdl3.cpp"
++            "${MSCHARGED_IMGUI_PREPARED}/backends/imgui_impl_sdlrenderer3.cpp"
++        )
++        add_dependencies(charged_launcher_ui verify_prepared)
++        target_include_directories(charged_launcher_ui PUBLIC
++            "${MSCHARGED_IMGUI_PREPARED}" "${MSCHARGED_IMGUI_PREPARED}/backends"
++            "${MSCHARGED_IMGUI_PREPARED}/misc/cpp")
++        target_link_libraries(charged_launcher_ui PUBLIC SDL3::SDL3)
+ 
++    endif()
+ endif()
+ 
+ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WiimoteScan.cmake")
+@@ -34,12 +36,19 @@ if(NOT WIN32 AND NOT APPLE)
+     # dladdr names the module of each crash stack frame.
+     target_link_libraries(charged_session_log PRIVATE ${CMAKE_DL_LIBS})
+ endif()
+-if(NOT WIN32)
++if(NOT WIN32 AND NOT MSCHARGED_HANDHELD)
+     add_executable(session_log_tests tests/session_log_tests.cpp)
+     target_compile_features(session_log_tests PRIVATE cxx_std_20)
+     target_link_libraries(session_log_tests PRIVATE charged_session_log)
+     add_test(NAME session_log COMMAND session_log_tests)
+ endif()
++if(MSCHARGED_HANDHELD)
++    # The game only: no launcher UI, ImGui or settings pages.
++    add_executable(mscharged src/launcher/handheld_main.cpp)
++    target_link_libraries(mscharged PRIVATE charged_host charged_app_icon mscharged_build_info
++        charged_wiimote_scan charged_session_log)
++    return()
++endif()
+ add_executable(mscharged src/launcher/main.cpp src/launcher/ui_kit.cpp)
+ target_link_libraries(mscharged PRIVATE charged_host charged_launcher_ui charged_app_icon mscharged_build_info
+     charged_wiimote_scan charged_session_log)
+diff --git a/cmake/NativeWpad.cmake b/cmake/NativeWpad.cmake
+index b20a2122..4897c81d 100644
+--- a/cmake/NativeWpad.cmake
++++ b/cmake/NativeWpad.cmake
+@@ -5,8 +5,13 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WiimoteScan.cmake")
+ 
+ # Native hardware SDK interfaces underneath the original game/KPAD code.
+ # Owner servicing is explicit; no alternate pad manager or device readiness.
++if(MSCHARGED_HANDHELD)
++    set(MSCHARGED_WIIMOTE_HID_SOURCE src/platform/wiimote_hid_none.cpp)
++else()
++    set(MSCHARGED_WIIMOTE_HID_SOURCE src/platform/wiimote_hid.cpp)
++endif()
+ add_library(charged_native_wpad STATIC EXCLUDE_FROM_ALL
+-    src/platform/wpad_sdl.cpp src/platform/wiimote_hid.cpp src/platform/os_version.cpp)
++    src/platform/wpad_sdl.cpp ${MSCHARGED_WIIMOTE_HID_SOURCE} src/platform/os_version.cpp)
+ add_dependencies(charged_native_wpad verify_prepared)
+ target_include_directories(charged_native_wpad PUBLIC src PRIVATE
+     "${MSCHARGED_PREPARED}/include"
+diff --git a/cmake/OriginalMainCreditsDiagnostic.cmake b/cmake/OriginalMainCreditsDiagnostic.cmake
+index 68613b04..686e839e 100644
+--- a/cmake/OriginalMainCreditsDiagnostic.cmake
++++ b/cmake/OriginalMainCreditsDiagnostic.cmake
+@@ -403,9 +403,11 @@ function(mscharged_link_original_main_credits target)
+         "WHOLE_ARCHIVE,aurora_gx,aurora_mtx,aurora_os")
+ endfunction()
+ 
+-add_executable(mscharged-original-main-credits-check
+-    tests/diagnostics/original_main_credits_window.cpp)
+-mscharged_link_original_main_credits(mscharged-original-main-credits-check)
++if(NOT MSCHARGED_HANDHELD)
++    add_executable(mscharged-original-main-credits-check
++        tests/diagnostics/original_main_credits_window.cpp)
++    mscharged_link_original_main_credits(mscharged-original-main-credits-check)
++endif()
+ 
+ # The user opts into this combined executable by enabling both existing options.
+ # The graphics preset's ordinary launcher-OFF preference is never changed here.
+diff --git a/cmake/WiimoteScan.cmake b/cmake/WiimoteScan.cmake
+index ba09e8f9..9d43929b 100644
+--- a/cmake/WiimoteScan.cmake
++++ b/cmake/WiimoteScan.cmake
+@@ -2,8 +2,14 @@ include_guard(GLOBAL)
+ 
+ # Wii Remote / DolphinBar HID detection, camera helpers, keyboard and gamepad bindings
+ # shared by the launcher and the native input drivers; needs only SDL.
+-add_library(charged_wiimote_scan STATIC src/platform/wiimote_scan.cpp src/platform/wiimote_ir.cpp
+-    src/platform/wiimote_bluetooth.cpp src/platform/key_bindings.cpp src/platform/gamepad_bindings.cpp)
++if(MSCHARGED_HANDHELD)
++    # Only the keyboard and gamepad bindings and the pointer helpers: no Wii Remote scan or Bluetooth.
++    add_library(charged_wiimote_scan STATIC src/platform/wiimote_ir.cpp src/platform/key_bindings.cpp
++        src/platform/gamepad_bindings.cpp)
++else()
++    add_library(charged_wiimote_scan STATIC src/platform/wiimote_scan.cpp src/platform/wiimote_ir.cpp
++        src/platform/wiimote_bluetooth.cpp src/platform/key_bindings.cpp src/platform/gamepad_bindings.cpp)
++endif()
+ target_include_directories(charged_wiimote_scan PUBLIC src)
+ target_compile_features(charged_wiimote_scan PRIVATE cxx_std_20)
+ target_link_libraries(charged_wiimote_scan PUBLIC SDL3::SDL3)
+diff --git a/src/launcher/handheld_main.cpp b/src/launcher/handheld_main.cpp
+new file mode 100644
+index 00000000..03247853
+--- /dev/null
++++ b/src/launcher/handheld_main.cpp
+@@ -0,0 +1,48 @@
++// Handheld entry point (MSCHARGED_HANDHELD=ON): starts the original game runtime directly with the launch
++// settings (--config, --disc, --fullscreen, --size, ...). There is no launcher UI, settings editor or disc picker;
++// the PortMaster script supplies the disc and the settings file.
++#include <SDL3/SDL_main.h>
++
++#include "bootstrap/launch_options.h"
++#include "mscharged/build_version.h"
++#include "platform/session_log.h"
++#include "runtime/original_main_credits.h"
++
++#include <exception>
++#include <iostream>
++#include <string>
++
++int main(int argc, char** argv)
++{
++    using namespace mscharged;
++    try
++    {
++        LaunchOptions options;
++        for (int i = 1; i < argc; ++i)
++        {
++            if (ParseLaunchOption(argc, argv, i, options)) continue;
++            const std::string arg = argv[i];
++            if (arg == "--version")
++            {
++                std::cout << "mscharged " << build::version << " (" << MSCHARGED_BUILD_CONFIG << "; handheld)\n";
++                return 0;
++            }
++            if (arg == "--help")
++            {
++                std::cout << "Usage: mscharged [launch settings] [--version]\n" << LaunchOptionsHelp
++                          << "Handheld build: the game starts directly, there is no launcher.\n";
++                return 0;
++            }
++            std::cerr << "Unknown or incomplete argument: " << arg << ". Use --help.\n";
++            return 2;
++        }
++        platform::StartSessionLog(build::version, argc, argv);
++        const std::string title = std::string("MSCharged Port ") + build::version;
++        return RunOriginalMainCredits(argc, argv, nullptr, false, OriginalMainScene::FrontendSequence, title.c_str());
++    }
++    catch (const std::exception& error)
++    {
++        platform::ReportFatalError(std::string("Startup failed: ") + error.what());
++        return 1;
++    }
++}
+diff --git a/src/platform/app_icon_none.cpp b/src/platform/app_icon_none.cpp
+new file mode 100644
+index 00000000..9a16d669
+--- /dev/null
++++ b/src/platform/app_icon_none.cpp
+@@ -0,0 +1,7 @@
++// Handheld build: the window has no icon (no embedded PNG, no PNG decoder).
++#include "platform/app_icon.h"
++
++namespace mscharged::platform
++{
++void SetApplicationIcon(SDL_Window*) {}
++}
+diff --git a/src/platform/wiimote_hid_none.cpp b/src/platform/wiimote_hid_none.cpp
+new file mode 100644
+index 00000000..77802071
+--- /dev/null
++++ b/src/platform/wiimote_hid_none.cpp
+@@ -0,0 +1,12 @@
++// Handheld build: no Wii Remote HID driver (no Bluetooth or DolphinBar remotes). Same interface as
++// wiimote_hid.cpp for the game's input owner, with no devices ever present.
++#include "platform/wiimote_hid.h"
++
++namespace mscharged::platform {
++void InitializeWiimoteHid(WiimoteHidSettings) {}
++void ServiceWiimoteHid() {}
++void SetWiimoteHidChannels(std::map<std::string, int>) {}
++void ShutdownWiimoteHid() {}
++WiimoteHidStatus GetWiimoteHidStatus() { return {}; }
++bool WiimoteHidHasDevices() { return false; }
++} // namespace mscharged::platform

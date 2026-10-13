@@ -1,10 +1,10 @@
 #!/bin/bash
-# Offscreen run of the GLES build (upstream/build/gles-release) under Xvfb with Mesa, with screenshots.
+# Offscreen run of the GLES build (work/xbuild-src/build/pc-gles) under Xvfb with Mesa, with screenshots.
 # Nothing is shown on the desktop: Wayland is unset and the game uses a private X display.
 # Usage: tests/pc/gles_boot.sh <out dir> [seconds, default 60]
 # Host screenshots (key "p" in KEYS) are collected into <out dir>/host.
-# Environment: BUILD (build dir, default upstream/build/gles-release), BIN (executable name in it, default mscharged), INI (config file, default tests/pc/gles_mscharged.ini), EVERY (screenshot period, default 10),
-#   RSS_AT (second at which VmRSS/VmHWM of the game is written to <out dir>/rss.txt), ACTIONS (file with "<second> <xdotool args>" lines), KEYS ("<second>:<xdotool key> ...", e.g. "40:Return 50:x"), ARGS (extra mscharged arguments).
+# Environment: BUILD (build dir, default work/xbuild-src/build/pc-gles), BIN (executable name in it, default mscharged), INI (config file, default tests/pc/gles_mscharged.ini), EVERY (screenshot period, default 10),
+#   RSS_LOG=1 (VmRSS in kB every 2 s into <out dir>/rss_series.txt), RSS_AT (second at which VmRSS/VmHWM of the game is written to <out dir>/rss.txt), ACTIONS (file with "<second> <xdotool args>" lines), KEYS ("<second>:<xdotool key> ...", e.g. "40:Return 50:x"), ARGS (extra mscharged arguments).
 O=$(realpath -m "$1"); T=${2:-60}
 W="$(cd "$(dirname "$0")/../.." && pwd)"
 INI=${INI-$W/tests/pc/gles_mscharged.ini}; EVERY=${EVERY:-10}
@@ -12,7 +12,7 @@ rm -rf "$O"; mkdir -p "$O/home"
 N=$((300 + RANDOM % 600))
 Xvfb :$N -screen 0 640x480x24 > "$O/xvfb.log" 2>&1 & X=$!
 sleep 2
-cd "${BUILD:-$W/upstream/build/gles-release}"
+cd "${BUILD:-$W/work/xbuild-src/build/pc-gles}"
 env -u WAYLAND_DISPLAY DISPLAY=:$N SDL_VIDEODRIVER=x11 HOME="$O/home" \
   ./${BIN:-mscharged} ${INI:+--config "$INI"} --disc "$W/disc/R4QE01.rvz" --window --size 576x432 $ARGS \
   > "$O/game.log" 2>&1 & G=$!
@@ -27,6 +27,7 @@ if [ -n "$ACTIONS" ]; then   # file of "<second> <xdotool arguments>" lines
   done < "$ACTIONS"
 fi
 [ -n "$RSS_AT" ] && ( sleep "$RSS_AT"; grep -E "VmRSS|VmHWM" /proc/$G/status > "$O/rss.txt" ) &
+[ -n "$RSS_LOG" ] && ( while kill -0 $G 2>/dev/null; do echo "$((SECONDS-start)) $(awk '/VmRSS/{print $2}' /proc/$G/status 2>/dev/null)" >> "$O/rss_series.txt"; sleep 2; done ) &
 for t in $(seq $EVERY $EVERY $T); do
   sleep $EVERY
   env -u WAYLAND_DISPLAY DISPLAY=:$N import -window root "$O/shot_$(printf %04d $t).png" 2>/dev/null

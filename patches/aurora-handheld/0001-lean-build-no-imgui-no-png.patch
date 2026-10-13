@@ -1,0 +1,122 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 92682e8..201089c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,6 +14,7 @@ option(AURORA_ENABLE_THP "Enable THP decoder" ON)
+ option(AURORA_ENABLE_RMLUI "Enable HTML/CSS Based UI Library for use in end-user UI development." OFF)
+ option(AURORA_CACHE_USE_ZSTD "Compress WebGPU cache entries with zstd" ON)
+ option(AURORA_WII_CLOCK "Use Wii hardware clock units and an unpaused OS time base" OFF)
++option(AURORA_LEAN "Handheld build: no ImGui overlay and no PNG screenshots (no ImGui, FreeType, libpng or zlib)" OFF)
+ option(AURORA_WII_LIGHTING "Use the original Wii GX specular-light distance" OFF)
+ if(AURORA_WII_CLOCK)
+     add_compile_definitions(AURORA_WII_CLOCK=1)
+diff --git a/cmake/aurora_core.cmake b/cmake/aurora_core.cmake
+index 0ea8dd1..c0e894f 100644
+--- a/cmake/aurora_core.cmake
++++ b/cmake/aurora_core.cmake
+@@ -64,8 +64,12 @@ if (IOS)
+ endif ()
+ 
+ if (AURORA_ENABLE_GX)
+-    target_sources(aurora_core PRIVATE lib/imgui.cpp)
+-    target_link_libraries(aurora_core PUBLIC imgui)
++    if (AURORA_LEAN)
++        target_sources(aurora_core PRIVATE lib/imgui_none.cpp)
++    else ()
++        target_sources(aurora_core PRIVATE lib/imgui.cpp)
++        target_link_libraries(aurora_core PUBLIC imgui)
++    endif ()
+ endif ()
+ 
+ if (AURORA_ENABLE_RMLUI)
+diff --git a/cmake/aurora_gx.cmake b/cmake/aurora_gx.cmake
+index c09a560..beba23b 100644
+--- a/cmake/aurora_gx.cmake
++++ b/cmake/aurora_gx.cmake
+@@ -47,14 +47,20 @@ add_library(aurora_gx STATIC
+         lib/dolphin/gx/GXTransform.cpp
+         lib/dolphin/gx/GXVert.cpp
+         lib/dolphin/gx/GXAurora.cpp
+-        lib/gfx/png_io.cpp
+-        lib/gfx/png_io.hpp
+ )
++if (NOT AURORA_LEAN)
++    target_sources(aurora_gx PRIVATE lib/gfx/png_io.cpp lib/gfx/png_io.hpp)
++endif ()
+ add_library(aurora::gx ALIAS aurora_gx)
+ set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
+ 
+ target_link_libraries(aurora_gx PUBLIC aurora::core xxHash::xxhash)
+-target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient PNG::PNG)
++target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 Tracy::TracyClient)
++if (AURORA_LEAN)
++    target_compile_definitions(aurora_gx PRIVATE AURORA_LEAN)
++else ()
++    target_link_libraries(aurora_gx PRIVATE PNG::PNG)
++endif ()
+ # aurora_core (GL device layer) and aurora_gx reference one another; let CMake repeat both on static link lines.
+ set_property(TARGET aurora_core aurora_gx PROPERTY LINK_INTERFACE_MULTIPLICITY 3)
+ if (AURORA_WII_LIGHTING)
+diff --git a/extern/CMakeLists.txt b/extern/CMakeLists.txt
+index f2f20fb..92f7a72 100644
+--- a/extern/CMakeLists.txt
++++ b/extern/CMakeLists.txt
+@@ -110,6 +110,8 @@ if (NOT TARGET fmt::fmt)
+ endif ()
+ 
+ if (AURORA_ENABLE_GX)
++  # AURORA_LEAN (handheld): no PNG screenshots and no ImGui overlay, so no zlib, libpng, FreeType or ImGui.
++  if (NOT AURORA_LEAN)
+   if (NOT TARGET ZLIB::ZLIB)
+     aurora_find_package_global(ZLIB QUIET)
+   endif ()
+@@ -281,6 +283,8 @@ if (AURORA_ENABLE_GX)
+     target_link_libraries(imgui PRIVATE ${AURORA_SDL3_TARGET})
+   endif ()
+ 
++  endif ()
++
+   if (NOT TARGET sqlite3)
+     aurora_find_package_global(SQLite3)
+     if (TARGET SQLite3::SQLite3)
+diff --git a/lib/gfx/scanout.cpp b/lib/gfx/scanout.cpp
+index bc73995..2221f5d 100644
+--- a/lib/gfx/scanout.cpp
++++ b/lib/gfx/scanout.cpp
+@@ -6,7 +6,16 @@
+ #include "render_worker.hpp"
+ #include "recording.hpp"
+ #include "resources.hpp"
++#ifdef AURORA_LEAN
++#include <cstdint>
++#include <filesystem>
++// No PNG encoder in the handheld build: a requested host screenshot is reported as not written.
++namespace aurora::gfx::png {
++inline bool write_png_rgb8(const std::filesystem::path&, uint32_t, uint32_t, const uint8_t*) noexcept { return false; }
++} // namespace aurora::gfx::png
++#else
+ #include "png_io.hpp"
++#endif
+ #include "../window.hpp"
+ #include "../webgpu/gpu.hpp"
+ #include "../webgpu/sdl2shim_present.hpp"
+diff --git a/lib/imgui_none.cpp b/lib/imgui_none.cpp
+new file mode 100644
+index 0000000..9e7edaa
+--- /dev/null
++++ b/lib/imgui_none.cpp
+@@ -0,0 +1,14 @@
++// AURORA_LEAN: no Dear ImGui overlay. The overlay is a development aid; the game never draws through it.
++// Same interface as imgui.cpp, every call does nothing, so the frame loop and the window code are unchanged.
++#include "imgui.hpp"
++
++namespace aurora::imgui {
++void create_context() noexcept {}
++void initialize() noexcept {}
++void shutdown() noexcept {}
++void process_event(const SDL_Event&) noexcept {}
++void set_cursor_managed(bool) noexcept {}
++void new_frame(const AuroraWindowSize&) noexcept {}
++DrawData freeze() noexcept { return {}; }
++void render(gl::PassEncoder&, const DrawData&) noexcept {}
++} // namespace aurora::imgui

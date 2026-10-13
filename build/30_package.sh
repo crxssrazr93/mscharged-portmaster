@@ -2,7 +2,7 @@
 # Assembles port/mscharged (stripped binaries and libraries) and builds the release zip dist/mscharged.zip.
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
-B="$SRC/build/pm-aarch64"
+B="$SRC/build/pm-aarch64$([ "${HANDHELD:-1}" = 1 ] && echo -handheld)"   # HANDHELD=0 packages the full port build
 P="${PORT_DIR:-$W/port/mscharged}"   # override PORT_DIR to stage elsewhere (copy of port/mscharged)
 ZIP="${ZIP_NAME:-mscharged.zip}"
 mkdir -p "$P/libs.aarch64" "$P/libs.native" "$P/licenses" "$W/dist"

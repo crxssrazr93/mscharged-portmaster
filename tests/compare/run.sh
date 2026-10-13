@@ -10,7 +10,7 @@ KIND=$1; O=$(realpath -m "$2"); FR=$3; EXIT=${4:-}
 W="$(cd "$(dirname "$0")/../.." && pwd)"
 SIZE=${SIZE:-640x480}; INI=${INI:-$W/tests/compare/compare.ini}; TIMEOUT=${TIMEOUT:-3000}
 rm -rf "$O"; mkdir -p "$O/home" "$O/cap"
-BIN_DIR=$W/upstream/build/$([ "$KIND" = vk ] && echo vk-cmp || echo gles-cmp)
+BIN_DIR=${XTEST:-$W/work/xbuild-test}/build/$([ "$KIND" = vk ] && echo vk-cmp || echo gles-cmp)
 # KIND glesgpu: the GLES build on the Intel GPU (Mesa iris) inside the same headless gamescope as Vulkan.
 [ -n "${INPUT:-}" ] && INPUT=$(readlink -f "$INPUT")
 CFG="$O/mscharged.ini"; sed "s#^width = .*#width = ${SIZE%x*}#; s#^height = .*#height = ${SIZE#*x}#" "$INI" > "$CFG"
