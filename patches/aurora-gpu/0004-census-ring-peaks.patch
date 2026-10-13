@@ -36,7 +36,7 @@ index c7631c6..c7fca88 100644
    const uint64_t frameId = frame.frameId;
    end_pipeline_frame();
 diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
-index c2e2af6..0984ccb 100644
+index 198e618..b41c6a7 100644
 --- a/lib/gfx/recording.cpp
 +++ b/lib/gfx/recording.cpp
 @@ -11,6 +11,7 @@
