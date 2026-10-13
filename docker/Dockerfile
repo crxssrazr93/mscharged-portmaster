@@ -17,16 +17,17 @@ RUN printf '%s\n' \
       > /etc/apt/sources.list \
  && dpkg --add-architecture arm64 && apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git gnupg pkg-config build-essential make tcl ninja-build file xz-utils unzip zip \
-      software-properties-common \
       gcc-10 g++-10 gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu binutils-aarch64-linux-gnu \
       libc6-dev-arm64-cross \
       libgles-dev:arm64 libegl-dev:arm64 libdrm-dev:arm64 libgbm-dev:arm64 \
       libasound2-dev:arm64 libudev-dev:arm64 libdbus-1-dev:arm64 \
  && rm -rf /var/lib/apt/lists/*
-# The port needs Python 3.10 and CMake 3.25; Ubuntu 20.04 ships 3.8 and 3.16.
-RUN add-apt-repository -y ppa:deadsnakes/ppa && apt-get update \
- && apt-get install -y --no-install-recommends python3.10 && rm -rf /var/lib/apt/lists/* \
- && ln -sf /usr/bin/python3.10 /usr/local/bin/python3
+# The port needs Python 3.10 and CMake 3.25; Ubuntu 20.04 ships 3.8 and 3.16 (the host side tools below only
+# run the build scripts and do not influence the aarch64 binary).
+ARG PYTHON_TAG=20241016
+ARG PYTHON_VERSION=3.10.15
+RUN curl -fsSL https://github.com/astral-sh/python-build-standalone/releases/download/${PYTHON_TAG}/cpython-${PYTHON_VERSION}+${PYTHON_TAG}-x86_64-unknown-linux-gnu-install_only.tar.gz \
+    | tar xz -C /opt && ln -sf /opt/python/bin/python3.10 /usr/local/bin/python3 && ln -sf /opt/python/bin/python3.10 /usr/local/bin/python3.10
 ARG CMAKE_VERSION=3.31.6
 RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz \
     | tar xz -C /opt && ln -s /opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/* /usr/local/bin/

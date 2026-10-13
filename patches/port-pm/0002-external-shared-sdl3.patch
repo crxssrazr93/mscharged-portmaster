@@ -1,0 +1,51 @@
+diff --git a/cmake/SDL.cmake b/cmake/SDL.cmake
+--- a/cmake/SDL.cmake
++++ b/cmake/SDL.cmake
+@@ -1,4 +1,18 @@
+ mscharged_prepare_dependency(sdl MSCHARGED_SDL_PREPARED)
++
++# PortMaster build: link the prebuilt shared libSDL3.so.0 (MSCHARGED_SDL3_LIBRARY) instead of building the
++# pinned SDL as a static library. The headers still come from the pinned, prepared SDL source. SDL3's ABI is
++# stable, so the same binary runs against the SDL2-delegating shim or against a native KMSDRM build of SDL3.
++function(mscharged_add_external_sdl)
++    add_library(SDL3-shared SHARED IMPORTED GLOBAL)
++    set_target_properties(SDL3-shared PROPERTIES IMPORTED_LOCATION "${MSCHARGED_SDL3_LIBRARY}"
++        IMPORTED_SONAME libSDL3.so.0 INTERFACE_INCLUDE_DIRECTORIES "${MSCHARGED_SDL_PREPARED}/include")
++    add_library(SDL3::SDL3 ALIAS SDL3-shared)
++    add_library(SDL3-static INTERFACE IMPORTED GLOBAL)
++    target_link_libraries(SDL3-static INTERFACE SDL3-shared)
++    add_library(SDL3::SDL3-static ALIAS SDL3-static)
++    add_custom_target(verify_sdl_headers DEPENDS verify_prepared)
++endfunction()
+ 
+ function(mscharged_add_sdl)
+     # This SDL pin deliberately adds extra escapes for legacy macro evaluation.
+@@ -14,5 +28,10 @@
+     set(SDL_INSTALL OFF)
+     add_subdirectory("${MSCHARGED_SDL_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/sdl" EXCLUDE_FROM_ALL)
+ endfunction()
+-mscharged_add_sdl()
+-add_dependencies(SDL3-static verify_prepared)
++if(MSCHARGED_SDL3_LIBRARY)
++    mscharged_add_external_sdl()
++    set(AURORA_SDL3_LINKAGE shared CACHE STRING "" FORCE)
++else()
++    mscharged_add_sdl()
++    add_dependencies(SDL3-static verify_prepared)
++endif()
+diff --git a/cmake/AuroraHost.cmake b/cmake/AuroraHost.cmake
+--- a/cmake/AuroraHost.cmake
++++ b/cmake/AuroraHost.cmake
+@@ -51,7 +51,11 @@
+     # All providers exist before Aurora configures. Prevent incidental downloads.
+     set(FETCHCONTENT_FULLY_DISCONNECTED ON)
+     set(AURORA_SDL3_PROVIDER vendor)
+-    set(AURORA_SDL3_LINKAGE static)
++    if(MSCHARGED_SDL3_LIBRARY)
++        set(AURORA_SDL3_LINKAGE shared)
++    else()
++        set(AURORA_SDL3_LINKAGE static)
++    endif()
+     set(AURORA_ENABLE_GX ${MSCHARGED_BUILD_GX_CHECK})
+     if(NOT MSCHARGED_GLES)
+         # The GLES Aurora renders through OpenGL ES 3 and has no Dawn provider.

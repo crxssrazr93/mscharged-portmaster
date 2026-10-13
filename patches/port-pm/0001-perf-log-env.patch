@@ -1,0 +1,83 @@
+diff --git a/src/runtime/frame_timing_log.cpp b/src/runtime/frame_timing_log.cpp
+index 465b90ba..9a075e4d 100644
+--- a/src/runtime/frame_timing_log.cpp
++++ b/src/runtime/frame_timing_log.cpp
+@@ -68,7 +68,15 @@ FrameTimingLog* g_environment_log = nullptr;
+ std::unique_ptr<FrameTimingLog> FrameTimingLog::FromEnvironment()
+ {
+     const char* path = std::getenv("MSCHARGED_FRAME_LOG");
+-    if (!path || !*path) return nullptr;
++    if (!path || !*path) {
++        const char* perf = std::getenv("MSCHARGED_PERF_LOG");
++        if (!perf || !*perf || perf[0] == '0') return nullptr;
++        std::fprintf(stderr, "Performance log: one [perf] line per second\n");
++        auto log = std::make_unique<FrameTimingLog>(nullptr, std::string());
++        log->perf_ = true;
++        g_environment_log = log.get();
++        return log;
++    }
+     std::FILE* file = std::fopen(path, "w");
+     if (!file) {
+         std::fprintf(stderr, "Frame timing log: cannot open %s\n", path);
+@@ -164,8 +172,34 @@ void FrameTimingLog::EndFrame(const FrameTimingCounters& counters)
+     pending_valid_ = true;
+ }
+ 
++void FrameTimingLog::PerfAccumulate(const FrameTimingRecord& record)
++{
++    if (perf_frames_ == 0) perf_window_start_ns_ = record.start_ns;
++    ++perf_frames_;
++    perf_presents_ += record.presents;
++    perf_vi_ += record.vi_fields;
++    perf_sum_ns_ += record.duration_ns;
++    perf_game_sum_ns_ += record.game_ns;
++    if (record.duration_ns > perf_max_ns_) perf_max_ns_ = record.duration_ns;
++    const std::int64_t elapsed = record.start_ns + record.duration_ns - perf_window_start_ns_;
++    if (elapsed < 1000000000) return;
++    const double seconds = static_cast<double>(elapsed) / 1e9;
++    std::fprintf(stderr,
++                 "[perf] fps=%.1f frame_ms_avg=%.2f frame_ms_max=%.2f game_ms_avg=%.2f presents_per_s=%.1f "
++                 "vi_per_s=%.1f frames=%" PRIu64 "\n",
++                 perf_frames_ / seconds, Ms(perf_sum_ns_) / perf_frames_, Ms(perf_max_ns_),
++                 Ms(perf_game_sum_ns_) / perf_frames_, perf_presents_ / seconds, perf_vi_ / seconds, record.index + 1);
++    std::fflush(stderr);
++    perf_frames_ = perf_presents_ = perf_vi_ = 0;
++    perf_sum_ns_ = perf_max_ns_ = perf_game_sum_ns_ = 0;
++}
++
+ void FrameTimingLog::Add(const FrameTimingRecord& record)
+ {
++    if (perf_) {
++        PerfAccumulate(record);
++        return;
++    }
+     if (records_.size() < kMaxRecords) records_.push_back(record);
+     if (!file_) return;
+     const std::int64_t origin = records_.empty() ? record.start_ns : records_.front().start_ns;
+diff --git a/src/runtime/frame_timing_log.h b/src/runtime/frame_timing_log.h
+index 498ae4dd..8f2c4271 100644
+--- a/src/runtime/frame_timing_log.h
++++ b/src/runtime/frame_timing_log.h
+@@ -39,6 +39,9 @@ struct FrameTimingRecord {
+ // Opt-in per-frame timing log: MSCHARGED_FRAME_LOG=frames.csv writes one CSV
+ // row per original game frame and, on exit, a summary of the frame-interval
+ // distribution and the longest frames (frames.csv.summary.txt and stdout).
++// MSCHARGED_PERF_LOG=1 prints one line per second instead (frames per second,
++// average and worst frame time, average time inside the game frame, Presents
++// per second), without storing anything.
+ // Bookkeeping only: it never waits, paces frames or touches game state.
+ class FrameTimingLog {
+ public:
+@@ -68,6 +71,12 @@ public:
+ private:
+     std::FILE* file_;
+     std::string path_;
++    // MSCHARGED_PERF_LOG=1: one "[perf]" line per second, nothing is stored.
++    bool perf_ = false;
++    std::int64_t perf_window_start_ns_ = 0;
++    std::uint64_t perf_frames_ = 0, perf_presents_ = 0, perf_vi_ = 0;
++    std::int64_t perf_sum_ns_ = 0, perf_max_ns_ = 0, perf_game_sum_ns_ = 0;
++    void PerfAccumulate(const FrameTimingRecord& record);
+     bool finished_ = false;
+     std::vector<FrameTimingRecord> records_;
+     std::uint64_t next_index_ = 0;
