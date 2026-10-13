@@ -10,9 +10,10 @@ set -euo pipefail
 S=aarch64-linux-gnu-strip
 \$S --strip-unneeded -o $P/mscharged.aarch64 $B/mscharged
 for m in original_frontend original_main_credits; do \$S --strip-unneeded -o $P/mscharged_\${m}_module.so $B/mscharged_\${m}_module.so; done
-\$S --strip-unneeded -o $P/libs.aarch64/libSDL3.so.0 $OUT/sdl-shim/libSDL3.so.0.5.0
 \$S --strip-unneeded -o $P/libs.native/libSDL3.so.0 $OUT/sdl-native/libSDL3.so.0.4.10
 "
+# The working SDL3 shim is a committed prebuilt file; copy it unchanged.
+cp "$W/vendor/sdl3-shim/libSDL3.so.0" "$P/libs.aarch64/libSDL3.so.0"
 # Licenses of what is shipped
 cp "$SRC/LICENSE" "$P/licenses/LICENSE.mscharged-port.txt"
 cp "$SRC/extern/sdl/LICENSE.txt" "$P/licenses/LICENSE.SDL3.txt"
