@@ -3931,11 +3931,12 @@ index 0000000000000000000000000000000000000000..89200127e8b3667c8cf7f26ed70ea9a9
 +} // namespace aurora::gl
 diff --git a/lib/gl/textures.cpp b/lib/gl/textures.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..6f984694a565803712855a19a8679c9799d35f91
+index 0000000000000000000000000000000000000000..73c6b40e266b00b01a5ade662b7f7e3a5cd63c73
 --- /dev/null
 +++ b/lib/gl/textures.cpp
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,260 @@
 +#include "textures.hpp"
++#include "fbo_cache.hpp"
 +
 +#include "census.hpp"
 +#include "../internal.hpp"
@@ -4160,6 +4161,9 @@ index 0000000000000000000000000000000000000000..6f984694a565803712855a19a8679c97
 +void destroy_texture(Texture& texture) noexcept {
 +  if (texture.id != 0) {
 +    census::textures.sub(texture_gpu_bytes(texture.format, texture.size, texture.mips));
++    // GL reuses texture names: a cached FBO still keyed by this id would silently attach to the next texture
++    // that gets the same name (and render nowhere), so drop it with the texture.
++    invalidate_framebuffers_for(texture.id);
 +    gl.DeleteTextures(1, &texture.id);
 +    texture.id = 0;
 +  }

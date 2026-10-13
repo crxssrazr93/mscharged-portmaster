@@ -5334,7 +5334,7 @@ index 3fdc0eeb1d5038050b20c447f7368a2af3c97f03..4cd5f2ae6eb97c50e2eca52fb8eb9c9b
 +// file that includes the gfx types sees them (the Dawn-era common.hpp provided them to everyone).
  } // namespace aurora::gfx
 diff --git a/lib/gfx/scanout.cpp b/lib/gfx/scanout.cpp
-index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806127776e3 100644
+index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..c2a7b81cf5c819b4ed9ce7a759bc391442bfaf49 100644
 --- a/lib/gfx/scanout.cpp
 +++ b/lib/gfx/scanout.cpp
 @@ -3,9 +3,18 @@
@@ -5578,8 +5578,8 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
 +  vec3 lower = mix(texelFetch(tex, clamp(ivec2(first.x, last.y), minimum, maximum), 0).rgb,
 +      texelFetch(tex, clamp(last, minimum, maximum), 0).rgb, weight.x);
 +  out_color = vec4(mix(upper, lower, weight.y), 1.0);
-+}
-+)";
+ }
+ )";
 +// Window blit of the top-down desktop signal. NDC bottom (window row 0) shows
 +// the bottom row of the picture, so v runs from 1 down to 0.
 +constexpr auto PresentVertexShader = R"(#version 300 es
@@ -5589,8 +5589,8 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
 +  const vec2 uvs[3] = vec2[3](vec2(0.0, 1.0), vec2(2.0, 1.0), vec2(0.0, -1.0));
 +  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
 +  v_uv = uvs[gl_VertexID];
- }
- )";
++}
++)";
 +constexpr auto PresentFragmentShader = R"(#version 300 es
 +precision highp float;
 +precision highp sampler2D;
@@ -5681,7 +5681,7 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
 +  if (clear) {
 +    const gl::GLfloat black[4]{0.f, 0.f, 0.f, 1.f};
 +    gl::gl.ClearBufferfv(gl::GL_COLOR, 0, black);
-+  }
+   }
 +  gl::reset_state_cache();
 +  gl::set_viewport_gl(0, 0, static_cast<gl::GLsizei>(width), static_cast<gl::GLsizei>(height), 0.f, 1.f);
 +  gl::apply_baked_state(opaque_state());
@@ -5747,7 +5747,7 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
 +    gl::bind_texture_unit(0, texture->sampleTextureView.id, programs.linear.id);
 +    gl::bind_vertex_array(0);
 +    gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
-   }
++  }
 +  end_pass();
 +}
 +
@@ -5996,17 +5996,38 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
    uint8_t picture;
    {
      std::lock_guard lock(state.mutex); RequireOwner(state);
-@@ -382,8 +484,7 @@ void service(void*) {
+@@ -382,16 +484,20 @@ void service(void*) {
      scanout = state.display_enabled ? state.committed : state.disabled_scanout;
      snapshot = state.display_enabled ? state.committed_snapshot : nullptr; widescreen = state.widescreen;
      picture = state.desktop_picture;
 -    layout = state.layout; pipeline = state.pipeline; desktopPipeline = state.desktop_pipeline;
 -    scaledPipeline = state.scaled_pipeline; signal = state.signal;
-+    programs = state.programs; signal = state.signal;
-     if (!signal || signal->size.width != scanout.active_width || signal->size.height != scanout.active_height)
-       state.signal = signal = new_signal(scanout.active_width, scanout.active_height);
-     // Keep physical sampling untouched in both interlaced and progressive modes.
-@@ -399,15 +500,17 @@ void service(void*) {
+-    if (!signal || signal->size.width != scanout.active_width || signal->size.height != scanout.active_height)
+-      state.signal = signal = new_signal(scanout.active_width, scanout.active_height);
+-    // Keep physical sampling untouched in both interlaced and progressive modes.
+-    if (picture == AURORA_DESKTOP_SIGNAL &&
+-        (!state.desktop || state.desktop == signal || state.desktop->size.width != scanout.active_width ||
+-         state.desktop->size.height != scanout.active_height))
+-      state.desktop = new_signal(scanout.active_width, scanout.active_height);
+-    desktop = state.desktop;
++    programs = state.programs; signal = state.signal; desktop = state.desktop;
++  }
++  // Texture creation marshals to the render worker and waits, which services owner hardware callbacks that
++  // query this output again. Never hold state.mutex across it (self-deadlock).
++  if (!signal || signal->size.width != scanout.active_width || signal->size.height != scanout.active_height) {
++    signal = new_signal(scanout.active_width, scanout.active_height);
++    std::lock_guard lock(state.mutex); state.signal = signal;
++  }
++  // Keep physical sampling untouched in both interlaced and progressive modes.
++  if (picture == AURORA_DESKTOP_SIGNAL &&
++      (!desktop || desktop == signal || desktop->size.width != scanout.active_width ||
++       desktop->size.height != scanout.active_height)) {
++    desktop = new_signal(scanout.active_width, scanout.active_height);
++    std::lock_guard lock(state.mutex); state.desktop = desktop;
+   }
+   // The render worker owns presentation once it is queued. At most one present
+   // is in flight; a later commit stays pending for the next owner service.
+@@ -399,127 +505,105 @@ void service(void*) {
      Output& state; bool queued = false;
      ~Active() { if (queued) return; std::lock_guard lock(state.mutex); state.servicing = false; }
    } active{state};
@@ -6028,8 +6049,18 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
        shaped ? aspectWidth * view.active_width * scanout.active_height : aspectWidth,
        shaped ? aspectHeight * view.active_height * scanout.active_width : aspectHeight);
    if (picture != AURORA_DESKTOP_SIGNAL) {
-@@ -421,105 +524,82 @@ void service(void*) {
-     desktop = state.desktop;
+     // Smooth and sharp pictures are drawn at the window viewport's own size.
+     const auto width = std::max(1u, static_cast<uint32_t>(viewport.width));
+     const auto height = std::max(1u, static_cast<uint32_t>(viewport.height));
+-    std::lock_guard lock(state.mutex);
+-    if (!state.desktop || state.desktop == signal || state.desktop->size.width != width ||
+-        state.desktop->size.height != height)
+-      state.desktop = new_signal(width, height);
+-    desktop = state.desktop;
++    if (!desktop || desktop == signal || desktop->size.width != width || desktop->size.height != height) {
++      desktop = new_signal(width, height);
++      std::lock_guard lock(state.mutex); state.desktop = desktop;
++    }
    }
    // Capture SDL event-coordinate identity on the owner before worker dispatch.
 -  // Surface dimensions below come from the actually acquired texture.
@@ -6184,7 +6215,7 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
    });
    // The source owner continues after queueing; it does not wait for the
    // desktop surface, its vsync or GPU completion of the presented passes.
-@@ -549,9 +629,11 @@ void set_display_enabled(void*, bool enabled, const AuroraVIScanout* scanout) {
+@@ -549,9 +633,11 @@ void set_display_enabled(void*, bool enabled, const AuroraVIScanout* scanout) {
    // Keep source/XFB/IRQ owners and snapshot leases live. Drain any older
    // queued item after latching its output gate, then perform the real black
    // output before returning to the original terminal STM ioctl.
@@ -6198,7 +6229,7 @@ index b1aa7bf2d4c783ffbfbd6485420e3b819f080f60..5b5f33c15e303f0f70816d9b71562806
    const bool presentable = window::is_presentable();
    std::lock_guard lock(state.mutex);
    if (presentable && (state.presentations == previousPresentations || !state.presented.black))
-@@ -559,61 +641,44 @@ void set_display_enabled(void*, bool enabled, const AuroraVIScanout* scanout) {
+@@ -559,61 +645,44 @@ void set_display_enabled(void*, bool enabled, const AuroraVIScanout* scanout) {
  }
  void shutdown(void*) {
    // Retire any queued presentation before releasing its owner state.
@@ -10448,11 +10479,15 @@ index 940d599b8bf31ff792c991f5b0319e25848fa217..9a1960dfc2a5e27932af2b78beef019d
 +void bind_pipeline(const gl::Pipeline& pipeline, gl::PassEncoder& pass);
  } // namespace aurora::gfx
 diff --git a/lib/gfx/xfb.cpp b/lib/gfx/xfb.cpp
-index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0a77f4219 100644
+index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..7082b28a51ca82a5e9991b1148d96fb534c69a82 100644
 --- a/lib/gfx/xfb.cpp
 +++ b/lib/gfx/xfb.cpp
-@@ -1,7 +1,14 @@
+@@ -1,7 +1,18 @@
  #include "xfb.hpp"
++#include <aurora/gl.hpp>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
  
  #include "recording.hpp"
 +#include "render_worker.hpp"
@@ -10466,7 +10501,7 @@ index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0
  #include "../gx/gx.hpp"
  #include "../webgpu/gpu.hpp"
  
-@@ -16,8 +23,11 @@
+@@ -16,8 +27,11 @@
  namespace aurora::gfx::xfb {
  namespace {
  constexpr Module Log{"aurora::gx::xfb"};
@@ -10480,7 +10515,7 @@ index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0
  std::mutex g_mutex;
  std::atomic<bool> g_flickerFilter{true};
  std::unordered_map<uint32_t, std::shared_ptr<Snapshot>> g_snapshots;
-@@ -34,67 +44,71 @@ struct alignas(16) CopyUniforms {
+@@ -34,67 +48,71 @@ struct alignas(16) CopyUniforms {
  };
  static_assert(sizeof(CopyUniforms) == 48);
  
@@ -10598,7 +10633,7 @@ index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0
  }
  )";
  
-@@ -103,35 +117,17 @@ uint32_t field(uint32_t word, uint32_t shift, uint32_t bits) {
+@@ -103,35 +121,17 @@ uint32_t field(uint32_t word, uint32_t shift, uint32_t bits) {
  }
  
  TextureHandle new_packed_texture(uint32_t pairs, uint32_t height) {
@@ -10642,7 +10677,7 @@ index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0
    snapshot->gpuComplete.store(true, std::memory_order_release);
    std::lock_guard lock{g_mutex};
    auto& completed = g_completed[snapshot->physical];
-@@ -144,65 +140,46 @@ Snapshot::~Snapshot() {
+@@ -144,65 +144,46 @@ Snapshot::~Snapshot() {
  }
  
  void initialize() {
@@ -10744,7 +10779,7 @@ index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0
  }
  
  void copy_from_bp(uint32_t flags) {
-@@ -279,32 +256,37 @@ void copy_from_bp(uint32_t flags) {
+@@ -279,32 +260,71 @@ void copy_from_bp(uint32_t flags) {
  
  void set_flicker_filter(bool enabled) { g_flickerFilter.store(enabled, std::memory_order_relaxed); }
  
@@ -10774,6 +10809,39 @@ index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0
 -  pass.SetBindGroup(0, group);
 -  pass.Draw(3);
 -  pass.End();
++namespace {
++// AURORA_GL_DUMP=<directory> writes the EFB and the encoded YUYV texture of every 120th display copy
++// as PPM files (development aid for finding where a picture is lost).
++void write_ppm(const std::string& path, const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height) {
++  if (FILE* f = std::fopen(path.c_str(), "wb")) {
++    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
++    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
++      std::fwrite(&rgba[i * 4], 1, 3, f);
++    }
++    std::fclose(f);
++  }
++}
++
++void debug_dump(const gl::Texture& source, const TextureHandle& destination) {
++  static const char* dir = std::getenv("AURORA_GL_DUMP");
++  static uint32_t count = 0;
++  if (dir == nullptr || *dir == '\0' || (count++ % 120) != 1) return;
++  const auto efbWidth = webgpu::g_frameBuffer.size.width;
++  const auto efbHeight = webgpu::g_frameBuffer.size.height;
++  std::vector<uint8_t> pixels(static_cast<size_t>(efbWidth) * efbHeight * 4);
++  if (gl_public::read_texture_rgba8(source.id, efbHeight, 0, 0, efbWidth, efbHeight, pixels.data(), pixels.size())) {
++    write_ppm(fmt::format("{}/efb_{:04}.ppm", dir, count), pixels, efbWidth, efbHeight);
++  }
++  const auto width = destination->size.width;
++  const auto height = destination->size.height;
++  pixels.assign(static_cast<size_t>(width) * height * 4, 0);
++  if (gl_public::read_texture_rgba8(destination->attachmentTextureView.id, height, 0, 0, width, height, pixels.data(),
++                                    pixels.size())) {
++    write_ppm(fmt::format("{}/xfb_{:04}.ppm", dir, count), pixels, width, height);
++  }
++}
++} // namespace
++
 +void encode(const gl::Texture& efbColorSource, const uint8_t* uniforms, size_t uniformBytes,
 +            const TextureHandle& destination) {
 +  // Runs on the render worker with the GL context current.
@@ -10805,6 +10873,7 @@ index 6d62e97ab73cc7a6edab70b45e6640d28e90cecc..b8cddcacbd6f80fb3fbb2a76827a88d0
 +  gl::bind_vertex_array(0);
 +  gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
 +  gl::gl.Enable(gl::GL_SCISSOR_TEST);
++  debug_dump(efbColorSource, destination);
  }
  
  std::shared_ptr<const Snapshot> find(const void* originalDestination) {
