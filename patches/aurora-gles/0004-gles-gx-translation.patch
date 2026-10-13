@@ -1528,7 +1528,7 @@ index c4859264530e9c3baa42f48205ad15d8e0bffec0..d19787c84c369df7d5819684ed49e1af
 +} // namespace aurora::gx::fifo
 \ No newline at end of file
 diff --git a/lib/gx/draw_dump.cpp b/lib/gx/draw_dump.cpp
-index 8e8496a2ca18a92e5d65db84e9f22f4ac9f6ac16..2b05d33f18a5d95644273bd40628ad12e95c737a 100644
+index 8e8496a2ca18a92e5d65db84e9f22f4ac9f6ac16..c4295111249b026a7d13999eea54f679ba9d4fb3 100644
 --- a/lib/gx/draw_dump.cpp
 +++ b/lib/gx/draw_dump.cpp
 @@ -9,6 +9,7 @@
@@ -1539,7 +1539,7 @@ index 8e8496a2ca18a92e5d65db84e9f22f4ac9f6ac16..2b05d33f18a5d95644273bd40628ad12
  #include <mutex>
  #include <string>
  
-@@ -29,7 +30,31 @@ std::string vec3(const Vec4<float>& v) { return fmt::format("{:.6g} {:.6g} {:.6g
+@@ -29,7 +30,39 @@ std::string vec3(const Vec4<float>& v) { return fmt::format("{:.6g} {:.6g} {:.6g
  
  bool draw_dump_active() noexcept { return s_file != nullptr; }
  
@@ -1547,13 +1547,18 @@ index 8e8496a2ca18a92e5d65db84e9f22f4ac9f6ac16..2b05d33f18a5d95644273bd40628ad12
 +// last display copy lies in [lo, hi); the rest are not recorded. The ordinals match the draw dump.
 +namespace {
 +uint32_t s_ordinal = 0;
-+struct Window { uint32_t lo = 0, hi = UINT32_MAX; };
++struct Window { uint32_t lo[8], hi[8]; unsigned count = 0; };
 +const Window& window() {
 +  static const Window w = [] {
 +    Window r;
 +    if (const char* e = std::getenv("AURORA_GL_DRAW_WINDOW")) {
-+      unsigned lo = 0, hi = 0;
-+      if (std::sscanf(e, "%u:%u", &lo, &hi) == 2) { r.lo = lo; r.hi = hi; }
++      // "lo:hi,lo:hi,..." (up to 8 ranges)
++      while (*e && r.count < 8) {
++        unsigned lo = 0, hi = 0; int used = 0;
++        if (std::sscanf(e, "%u:%u%n", &lo, &hi, &used) != 2) break;
++        r.lo[r.count] = lo; r.hi[r.count++] = hi; e += used;
++        if (*e == ',') ++e;
++      }
 +    }
 +    return r;
 +  }();
@@ -1563,7 +1568,10 @@ index 8e8496a2ca18a92e5d65db84e9f22f4ac9f6ac16..2b05d33f18a5d95644273bd40628ad12
 +bool draw_filtered_out() noexcept {
 +  const auto& w = window();
 +  const uint32_t n = s_ordinal++;
-+  return n < w.lo || n >= w.hi;
++  if (w.count == 0) return false;
++  for (unsigned i = 0; i < w.count; ++i)
++    if (n >= w.lo[i] && n < w.hi[i]) return false;
++  return true;
 +}
 +
  void draw_dump_display_copy() noexcept {
