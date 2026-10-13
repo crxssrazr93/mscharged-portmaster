@@ -16,7 +16,7 @@ CFG="$O/mscharged.ini"; sed "s#^width = .*#width = ${SIZE%x*}#; s#^height = .*#h
 cat > "$O/inner.sh" <<IN
 cd "$BIN_DIR"
 export HOME="$O/home" XDG_CONFIG_HOME="$O/home/.config" XDG_DATA_HOME="$O/home/.local/share" SDL_AUDIODRIVER=dummy
-export CAPTURE_VTIME=1 CAPTURE_DIR="$O/cap" CAPTURE_FRAMES="$FR" CAPTURE_EXIT_FRAME="$EXIT" ${TRACE:+CAPTURE_TRACE=$TRACE} ${INPUT:+CAPTURE_INPUT="$INPUT"}
+export CAPTURE_VTIME=1 CAPTURE_DIR="$O/cap" CAPTURE_FRAMES="$FR" CAPTURE_EXIT_FRAME="$EXIT" ${DUMP:+CAPTURE_DUMP="$DUMP"} ${TRACE:+CAPTURE_TRACE=$TRACE} ${INPUT:+CAPTURE_INPUT="$INPUT"}
 export AURORA_GL_DEBUG=\${AURORA_GL_DEBUG:-}
 exec setarch \$(uname -m) -R ./mscharged --config "$CFG" --disc "$W/disc/R4QE01.rvz" --window --size $SIZE > "$O/game.log" 2>&1
 IN
