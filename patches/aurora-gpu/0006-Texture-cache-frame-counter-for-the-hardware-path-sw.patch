@@ -1,16 +1,46 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sajid Ahamed <crxssrazr93@gmail.com>
-Date: Tue, 13 Oct 2026 16:17:36 +0530
-Subject: [PATCH] Video textures: private streaming texture updated in place,
- 48 MiB content cache, 240 idle frames
+Date: Tue, 13 Oct 2026 17:15:22 +0530
+Subject: [PATCH] Texture cache: frame counter for the hardware path (sweeps
+ never ran, the THP texture leak), streaming planes updated in place, 48 MiB
+ content budget
 
 ---
- lib/gfx/texture.cpp | 40 ++++++++++++++++++++++++++
- lib/gfx/texture.hpp |  7 +++++
- lib/gx/texture.cpp  | 70 +++++++++++++++++++++++++++++++++++++++++++--
- lib/gx/texture.hpp  |  8 ++++--
- 4 files changed, 121 insertions(+), 4 deletions(-)
+ lib/gfx/frame.cpp   |  3 ++
+ lib/gfx/texture.cpp | 40 +++++++++++++++++++
+ lib/gfx/texture.hpp |  7 ++++
+ lib/gx/texture.cpp  | 96 ++++++++++++++++++++++++++++++++++++++++++++-
+ lib/gx/texture.hpp  | 11 +++++-
+ 5 files changed, 153 insertions(+), 4 deletions(-)
 
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index c7fca88..e873986 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -18,6 +18,7 @@
+ #include "../gl/context.hpp"
+ #include "../gl/gl_core.hpp"
+ #include "../gx/gx.hpp"
++#include "../gx/texture.hpp"
+ #ifdef AURORA_ENABLE_RMLUI
+ #include "../rmlui/pipeline.hpp"
+ #endif
+@@ -675,6 +676,7 @@ void gpu_synchronize() {
+ }
+ 
+ void submit_hardware_frame_and_wait() {
++  gx::texture::advance_frame();
+   gl::trace::bump(gl::trace::HardwareSubmits);
+   if (gl::trace::report_due()) {
+     gl::trace::report();
+@@ -688,6 +690,7 @@ void submit_hardware_frame_and_wait() {
+ }
+ 
+ void submit_draw_done_and_wait() {
++  gx::texture::advance_frame();
+   // Called by the FIFO worker at the exact finish opcode. Everything recorded so far is sealed and
+   // already queued to the render worker (sealed passes execute in order, uploading their ring
+   // ranges); recording continues in the same frame on a Load continuation, so the ring buffers need
 diff --git a/lib/gfx/texture.cpp b/lib/gfx/texture.cpp
 index cb8f1df..fd57250 100644
 --- a/lib/gfx/texture.cpp
@@ -95,7 +125,7 @@ index e66e35b..93edcb5 100644
  TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
  void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
 diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
-index 72ec7fb..2e5bfe4 100644
+index 72ec7fb..9ef12a1 100644
 --- a/lib/gx/texture.cpp
 +++ b/lib/gx/texture.cpp
 @@ -16,6 +16,7 @@
@@ -140,58 +170,77 @@ index 72ec7fb..2e5bfe4 100644
  namespace texture {
  size_t texture_source_size(u32 format, u32 width, u32 height, u32 mipCount) noexcept {
    if (width == 0 || height == 0 || mipCount == 0) {
-@@ -593,6 +605,50 @@ void invalidate_replacement(uint64_t replacementId) noexcept {
+@@ -593,6 +605,69 @@ void invalidate_replacement(uint64_t replacementId) noexcept {
    }
  }
  
-+// Data that changes every frame (THP video planes) must not pile up as one cached GL texture per frame. Called when a
-+// texture object's data is new to the content cache: after the object missed on three consecutive frames (one miss
-+// per frame at most, so objects reused for many textures within a frame never qualify), it gets one private
-+// texture that is refreshed in place. Returns that texture, or null for the normal path.
++// Data that changes every frame (THP video planes) must not pile up as one cached GL texture per frame. The game
++// makes a new texture object per frame for the same plane buffer, so planes are recognized by where their data
++// lives (address, size, format). Called when texture data is new to the content cache: after it missed on three
++// consecutive frames (one miss per frame at most, so a buffer reused for several textures within a frame never
++// qualifies), the plane gets one private texture that is refreshed in place. Returns that texture, or null for the
++// normal path.
++struct StreamKey {
++  const void* data = nullptr;
++  u32 width = 0, height = 0, format = 0, mips = 0;
++  bool operator==(const StreamKey&) const = default;
++  template <typename H>
++  friend H AbslHashValue(H h, const StreamKey& k) {
++    return H::combine(std::move(h), k.data, k.width, k.height, k.format, k.mips);
++  }
++};
++struct StreamSlot {
++  gfx::TextureHandle handle; // set once streaming
++  uint64_t lastChangeFrame = 0;
++  uint64_t lastUsedFrame = 0;
++  uint32_t streak = 0;
++};
++absl::flat_hash_map<StreamKey, StreamSlot> s_streamSlots;
++
++void sweep_stream_slots() {
++  for (auto it = s_streamSlots.begin(); it != s_streamSlots.end();) {
++    if (s_frameCount > it->second.lastUsedFrame && s_frameCount - it->second.lastUsedFrame > 120) {
++      s_streamSlots.erase(it++);
++    } else {
++      ++it;
++    }
++  }
++}
++
 +gfx::TextureHandle try_streaming_update(const GXTexObj_& obj) {
-+  if (obj.texObjId == 0 || !obj.has_data() || is_palette_format(obj.format())) {
++  if (!obj.has_data() || is_palette_format(obj.format()) || obj.width() == 0 || obj.height() == 0) {
 +    return {};
 +  }
-+  const auto it = s_textureObjectCaches.find(obj.texObjId);
-+  if (it == s_textureObjectCaches.end()) {
-+    return {};
-+  }
-+  auto& entry = it->second;
-+  const auto& h = entry.handle;
-+  if (!h || entry.tlutObjId != 0 || entry.replacementId != 0 || h->gxFormat != obj.format() ||
-+      h->size.width != std::max(obj.width(), 1u) || h->size.height != std::max(obj.height(), 1u)) {
-+    entry.changeStreak = 0;
-+    return {};
-+  }
-+  if (!h->streaming) {
-+    if (entry.lastChangeFrame == s_frameCount) {
-+      entry.changeStreak = 0; // several different textures through one object in one frame: not video
++  const StreamKey key{obj.data, obj.width(), obj.height(), obj.format(), obj.mip_count()};
++  auto [it, inserted] = s_streamSlots.try_emplace(key);
++  auto& slot = it->second;
++  slot.lastUsedFrame = s_frameCount;
++  if (!slot.handle) {
++    if (!inserted && slot.lastChangeFrame == s_frameCount) {
++      slot.streak = 0; // the same buffer holding several textures within one frame: not video
 +      return {};
 +    }
-+    entry.changeStreak = (s_frameCount - entry.lastChangeFrame <= 4) ? entry.changeStreak + 1 : 1;
-+    entry.lastChangeFrame = s_frameCount;
-+    if (entry.changeStreak < 3) {
++    slot.streak = (!inserted && s_frameCount - slot.lastChangeFrame <= 4) ? slot.streak + 1 : 1;
++    slot.lastChangeFrame = s_frameCount;
++    if (slot.streak < 3) {
 +      return {};
 +    }
++    Log.info("[texture] {}x{} format {} data at {} changes every frame: one private texture, updated in place",
++             obj.width(), obj.height(), obj.format(), obj.data);
++    slot.handle = gfx::new_streaming_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
++                                                "GX Streaming Texture");
 +  }
 +  const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
-+  const ArrayRef<uint8_t> source{static_cast<const uint8_t*>(obj.data), sourceBytes};
-+  if (!h->streaming) {
-+    Log.info("[texture] texture object {} ({}x{} format {}) changes every frame: one private texture, updated in place",
-+             obj.texObjId, obj.width(), obj.height(), obj.format());
-+    entry.handle = gfx::new_streaming_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
-+                                                 "GX Streaming Texture");
-+  }
-+  gfx::write_texture(*entry.handle, source);
++  gfx::write_texture(*slot.handle, {static_cast<const uint8_t*>(obj.data), sourceBytes});
 +  ++s_stats.streamingUpdates;
-+  s_stats.uploadBytes += texture_handle_size(entry.handle);
-+  return entry.handle;
++  s_stats.uploadBytes += texture_handle_size(slot.handle);
++  return slot.handle;
 +}
 +
  gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
    ZoneScoped;
  
-@@ -623,6 +679,16 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
+@@ -623,6 +698,16 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
      }
      handle = find_content_texture(keys->contentKey);
      if (!handle) {
@@ -208,7 +257,21 @@ index 72ec7fb..2e5bfe4 100644
  #if DEBUG
        const auto name = gfx::texture_replacement::build_texture_replacement_name(*keys->sourceKey);
        const auto nameStr = name.c_str();
-@@ -733,7 +799,7 @@ void shutdown() noexcept {
+@@ -723,6 +808,13 @@ void end_frame() noexcept {
+   ++s_frameCount;
+   apply_pending_invalidations();
+   sweep_object_caches();
++  sweep_stream_slots();
++}
++
++void advance_frame() noexcept {
++  ++s_frameCount;
++  sweep_object_caches();
++  sweep_stream_slots();
+ }
+ 
+ void shutdown() noexcept {
+@@ -733,7 +825,7 @@ void shutdown() noexcept {
    s_contentLru.clear();
    s_sourceKeyCache.clear();
    s_contentCacheBytes = 0;
@@ -218,7 +281,7 @@ index 72ec7fb..2e5bfe4 100644
    s_bindGeneration = 1;
    s_pendingInvalidations.store(0, std::memory_order_release);
 diff --git a/lib/gx/texture.hpp b/lib/gx/texture.hpp
-index c933121..b3e24a6 100644
+index c933121..bc1a7e1 100644
 --- a/lib/gx/texture.hpp
 +++ b/lib/gx/texture.hpp
 @@ -20,13 +20,17 @@ struct TextureStats {
@@ -241,3 +304,13 @@ index c933121..b3e24a6 100644
  constexpr bool AsyncTextureReplacements = true;
  constexpr uint32_t ReplacementThumbnailDim = 64;
  constexpr uint64_t ReplacementPublishBudgetBytes = 12ull * 1024ull * 1024ull;
+@@ -38,6 +42,9 @@ void invalidate_bindings() noexcept;
+ uint64_t current_bind_generation() noexcept;
+ void invalidate_replacement(uint64_t replacementId) noexcept;
+ void end_frame() noexcept;
++// Frame boundary for the native hardware path (draw done / hardware submit), where aurora::end_frame never runs:
++// advances the frame counter that the cache sweeps and the streaming texture detection rely on.
++void advance_frame() noexcept;
+ void shutdown() noexcept;
+ void set_content_cache_budget_for_testing(uint64_t bytes) noexcept;
+ 
