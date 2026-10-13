@@ -2,7 +2,7 @@
 # One deterministic capture run, fully offscreen.
 # Usage: tests/compare/run.sh <gles|glesgpu|vk> <out dir> <frames list> [exit frame]
 # Environment: INPUT (script file), SIZE (default 640x480), INI (default tests/compare/compare.ini),
-#   TRACE=1 (per frame virtual time/retrace trace), TIMEOUT (seconds, default 3000), ASPECT (4:3|16:9).
+#   TAG (runs ./mscharged$TAG, see build_cmp.sh), TRACE=1 (per frame virtual time/retrace trace), TIMEOUT (seconds, default 3000), ASPECT (4:3|16:9).
 # GLES runs under Xvfb (Mesa). Vulkan cannot present on Xvfb, so it runs in a headless gamescope.
 # Prints the game's PID file path; kills everything it started.
 set -u
@@ -20,7 +20,7 @@ cd "$BIN_DIR"
 export HOME="$O/home" XDG_CONFIG_HOME="$O/home/.config" XDG_DATA_HOME="$O/home/.local/share" SDL_AUDIODRIVER=dummy
 export CAPTURE_VTIME=1 CAPTURE_DIR="$O/cap" CAPTURE_FRAMES="$FR" CAPTURE_EXIT_FRAME="$EXIT" ${DUMP:+CAPTURE_DUMP="$DUMP"} ${TRACE:+CAPTURE_TRACE=$TRACE} ${INPUT:+CAPTURE_INPUT="$INPUT"}
 export AURORA_GL_DEBUG=\${AURORA_GL_DEBUG:-}
-exec setarch \$(uname -m) -R ./mscharged --config "$CFG" --disc "$W/disc/R4QE01.rvz" --window --size $SIZE > "$O/game.log" 2>&1
+exec setarch \$(uname -m) -R ./mscharged${TAG:-} --config "$CFG" --disc "$W/disc/R4QE01.rvz" --window --size $SIZE > "$O/game.log" 2>&1
 IN
 chmod +x "$O/inner.sh"
 if [ "$KIND" = vk ] || [ "$KIND" = glesgpu ]; then
