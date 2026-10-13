@@ -41,6 +41,7 @@ The launcher settings are in `ports/mscharged/launch.cfg`. Remove the leading # 
 | ANTIALIASING | off, 4x | Edge smoothing of the 3D picture. off is the default. |
 | ASPECT | auto, 4:3, 16:9 | Game layout. auto follows the shape of the screen. |
 | PERF_LOG | 0, 1 | With 1 the game prints one line per second with the frames per second and the frame times into `ports/mscharged/log.txt`. |
+| MOVIE_ZOOM | 0, 1 | On a 4:3 screen the game shows its widescreen movies in a box with bars above and below. With 1 the movie fills the screen height and the sides are cropped. 0 (default) keeps the original look. |
 | SDL_BACKEND | shim, native | How SDL3 reaches the screen, see below. |
 
 More settings (volume, controller layouts, optional game tweaks such as skipping the intro) are in `ports/mscharged/mscharged.ini`, which is created on the first start. Delete it to get the defaults back. RESOLUTION, ANTIALIASING and ASPECT from `launch.cfg` are applied on every start and replace the same keys in the INI file.

@@ -1,0 +1,71 @@
+From: mscharged-portmaster
+Subject: Opt-in movie zoom for 4:3 layouts (MSCHARGED_MOVIE_ZOOM=1)
+Upstream-base: 7a6bf165d9f1c5914181c079c7d4bfa7204f3509
+Classification: host option; apply after 0690. Default off, the original presentation is unchanged.
+
+The 4:3 slides place the movie in a 16:9 box (the video frames themselves are full frame, not letterboxed).
+With the option set, the box is scaled about its centre to the full screen height; the sides are cropped.
+
+diff --git a/src/Game/FE/feRender.cpp b/src/Game/FE/feRender.cpp
+index bd6ad2e..4319abe 100644
+--- a/src/Game/FE/feRender.cpp
++++ b/src/Game/FE/feRender.cpp
+@@ -1,4 +1,6 @@
+ #include "Game/FE/feRender.h"
++#include <stdlib.h>
++#include "Game/Render/RLViewLayers.h"
+ 
+ #include "Game/SharedStaticStorage.h"
+ #include "Game/FE/fePackage.h"
+@@ -30,6 +32,18 @@ RenderImageCallback g_pfnRenderImage;
+ static const unsigned long grabTex = nlStringLowerHash("target/grab_texture");
+ static const unsigned long movieTex = nlStringLowerHash("movie");
+ 
++// Opt-in (launcher MOVIE_ZOOM=1 -> MSCHARGED_MOVIE_ZOOM=1): on a 4:3 layout the authored movie box is 16:9 and
++// leaves bars above and below. Scale it about its centre until it fills the 480 unit screen height (the sides
++// are cropped). Off by default, which stays faithful to the original presentation.
++static bool MovieZoomEnabled()
++{
++    static const bool enabled = []() {
++        const char* value = getenv("MSCHARGED_MOVIE_ZOOM");
++        return value != 0 && value[0] == '1';
++    }();
++    return enabled;
++}
++
+ void FERender::CalculateCurrentAssetColour(const TLInstance* instance)
+ {
+     for (unsigned long i = 0; i < 4; i++)
+@@ -280,6 +294,32 @@ unsigned char FERender::RenderImageInstance(const TLImageInstance* pTLImageInsta
+     matTM.m41 += view.m41;
+     matTM.m42 += view.m42;
+     matTM.m43 += view.m43;
++    if (textureHandle == movieTex && MovieZoomEnabled() && !IsWidescreen())
++    {
++        float minX = 1e30f, maxX = -1e30f, minY = 1e30f, maxY = -1e30f;
++        for (int i = 0; i < 4; ++i)
++        {
++            const float x = s_quadPositions[i].x * matTM.e[0] + s_quadPositions[i].y * matTM.e[4] + matTM.e[12];
++            const float y = s_quadPositions[i].x * matTM.e[1] + s_quadPositions[i].y * matTM.e[5] + matTM.e[13];
++            minX = x < minX ? x : minX;
++            maxX = x > maxX ? x : maxX;
++            minY = y < minY ? y : minY;
++            maxY = y > maxY ? y : maxY;
++        }
++        const float height = maxY - minY;
++        if (height > 300.0f && height < 479.0f)
++        {
++            const float scale = 480.0f / height;
++            const float centreX = (minX + maxX) * 0.5f;
++            const float centreY = (minY + maxY) * 0.5f;
++            matTM.e[0] *= scale;
++            matTM.e[1] *= scale;
++            matTM.e[4] *= scale;
++            matTM.e[5] *= scale;
++            matTM.e[12] = centreX + (matTM.e[12] - centreX) * scale;
++            matTM.e[13] = centreY + (matTM.e[13] - centreY) * scale;
++        }
++    }
+     glMatrixHandle matrixHandle = glAllocMatrix();
+     if (matrixHandle != GL_INVALID_MATRIX)
+     {

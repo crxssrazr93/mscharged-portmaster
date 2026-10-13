@@ -28,6 +28,7 @@ RESOLUTION=native
 ANTIALIASING=off
 ASPECT=auto
 PERF_LOG=0
+MOVIE_ZOOM=0
 [ -f "$GAMEDIR/launch.cfg" ] && source "$GAMEDIR/launch.cfg"
 
 # The game disc: your own USA disc (R4QE01), as .rvz or .iso, in this folder or in game/.
@@ -72,6 +73,10 @@ fi
 # Performance log: one "[perf]" line per second (fps and frame times) in log.txt.
 [ "$PERF_LOG" = "1" ] && export MSCHARGED_PERF_LOG=1
 export MSCHARGED_PERF_LOG="${MSCHARGED_PERF_LOG:-0}"
+
+# Movies on a 4:3 screen: the game shows its 16:9 movies in a box with bars above and below. MOVIE_ZOOM=1 fills the
+# screen height instead (the sides are cropped).
+[ "$MOVIE_ZOOM" = "1" ] && export MSCHARGED_MOVIE_ZOOM=1
 
 # Exit hotkey only (Select + Start); the game reads the controller directly.
 $GPTOKEYB "mscharged.aarch64" -c "$GAMEDIR/mscharged.gptk" &
