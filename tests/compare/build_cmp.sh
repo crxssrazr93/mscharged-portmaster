@@ -9,7 +9,7 @@ set -e
 W="$(cd "$(dirname "$0")/../.." && pwd)"
 WHAT=${1:-both}
 TAG=${TAG:-}
-S=$W/work/cmp; X=${XTEST:-$W/work/xbuild-test}
+S=${CMPDIR:-$W/work/cmp}; X=${XTEST:-$W/work/xbuild-test}
 if [ "$WHAT" != vk ]; then
   # One build directory (build/gles-cmp, incremental). TAG names a copy of the binary (mscharged$TAG next to it) so a
   # baseline (GLESFIX=0: without patches/aurora-glesfix) and a fixed build can both be run later.
