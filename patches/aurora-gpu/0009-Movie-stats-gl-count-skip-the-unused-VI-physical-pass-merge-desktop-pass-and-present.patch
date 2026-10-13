@@ -1,0 +1,339 @@
+diff --git a/lib/dolphin/thp/THPAudio.cpp b/lib/dolphin/thp/THPAudio.cpp
+--- a/lib/dolphin/thp/THPAudio.cpp	2026-10-13 20:50:09.067680027 +0530
++++ b/lib/dolphin/thp/THPAudio.cpp	2026-10-13 20:50:09.093304414 +0530
+@@ -6,6 +6,10 @@
+ #include <array>
+ #include <limits>
+ 
++#include <atomic>
++static std::atomic<u64> g_audioSamples{0};
++u64 aurora_thp_audio_samples_take() noexcept { return g_audioSamples.exchange(0, std::memory_order_relaxed); }
++
+ namespace {
+ constexpr size_t kHeaderSize = 80;
+ 
+@@ -115,6 +119,7 @@
+     decode_channel(rightOutput, stride, leftData + header.nextChannelOffset, header.sampleCount, header.rightCoeffs,
+                    header.rightYn1, header.rightYn2);
+   }
++  g_audioSamples.fetch_add(header.sampleCount, std::memory_order_relaxed);
+   return header.sampleCount;
+ }
+ 
+diff --git a/lib/dolphin/thp/THPDec.cpp b/lib/dolphin/thp/THPDec.cpp
+--- a/lib/dolphin/thp/THPDec.cpp	2026-10-13 20:50:09.067680027 +0530
++++ b/lib/dolphin/thp/THPDec.cpp	2026-10-13 20:50:09.093678791 +0530
+@@ -1,4 +1,5 @@
+ #include "dolphin/thp.h"
++#include <ctime>
+ 
+ #if defined(AURORA_THP_HARDWARE_SAFE_POINTS) && AURORA_THP_HARDWARE_SAFE_POINTS
+ #include <aurora/hardware.h>
+@@ -701,10 +702,12 @@
+ }
+ } // namespace
+ 
++u64 aurora_thp_audio_samples_take() noexcept;
+ namespace {
+ // Optional (MSCHARGED_THPSTATS=1) one line per second on stderr: frames, ms per frame, input MB/s.
+ struct ThpStats {
+   std::atomic<u64> frames{}, ns{}, serviceNs{}, bytes{}, failures{};
++  std::atomic<u64> cpuNs{}, cpuServiceNs{}, maxGapNs{}, lateFrames{}, lastEnd{};
+   std::atomic<u64> lastPrint{};
+ };
+ ThpStats g_thpStats;
+@@ -712,6 +715,11 @@
+   const char* v = std::getenv("MSCHARGED_THPSTATS");
+   return v != nullptr && *v != '\0' && *v != '0';
+ }();
++u64 thread_cpu_ns() noexcept {
++  timespec ts{};
++  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++  return static_cast<u64>(ts.tv_sec) * 1000000000ull + static_cast<u64>(ts.tv_nsec);
++}
+ u64 now_ns() noexcept {
+   return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+@@ -732,6 +740,11 @@
+   const u64 serviceNs = g_thpStats.serviceNs.exchange(0);
+   const u64 bytes = g_thpStats.bytes.exchange(0);
+   const u64 failures = g_thpStats.failures.exchange(0);
++  const u64 cpuNs = g_thpStats.cpuNs.exchange(0);
++  const u64 cpuServiceNs = g_thpStats.cpuServiceNs.exchange(0);
++  const u64 maxGapNs = g_thpStats.maxGapNs.exchange(0);
++  const u64 lateFrames = g_thpStats.lateFrames.exchange(0);
++  const u64 audioSamples = aurora_thp_audio_samples_take();
+   const double dt = static_cast<double>(now - last) / 1e9;
+   if (frames != 0) {
+     std::fprintf(stderr,
+@@ -741,6 +754,16 @@
+                  static_cast<double>(ns - serviceNs) / 1e6 / static_cast<double>(frames),
+                  static_cast<double>(serviceNs) / 1e6 / static_cast<double>(frames),
+                  static_cast<double>(bytes) / 1e6 / dt, static_cast<unsigned long long>(failures));
++    // Per second movie line. cpu_* are thread CPU times (independent of machine load); gap is the wall time between
++    // the end of one video decode and the end of the next, late counts gaps over 60 ms (a 30 fps movie asks for 33 ms);
++    // audio_samples is what THPAudioDecode produced (a 32 kHz movie needs 32000 per second).
++    std::fprintf(stderr,
++                 "[thp] fps=%.1f cpu_decode_ms=%.2f cpu_service_ms=%.2f max_gap_ms=%.0f late=%llu audio_samples_s=%.0f\n",
++                 static_cast<double>(frames) / dt,
++                 static_cast<double>(cpuNs - cpuServiceNs) / 1e6 / static_cast<double>(frames),
++                 static_cast<double>(cpuServiceNs) / 1e6 / static_cast<double>(frames),
++                 static_cast<double>(maxGapNs) / 1e6, static_cast<unsigned long long>(lateFrames),
++                 static_cast<double>(audioSamples) / dt);
+   }
+ }
+ 
+@@ -753,7 +776,8 @@
+ BOOL THPInit(void) { return TRUE; }
+ 
+ static s32 decode_video_impl(const void* file, size_t fileSize, void* tileY, size_t sizeY, void* tileU, size_t sizeU,
+-                             void* tileV, size_t sizeV, u32 expectedWidth, u32 expectedHeight, u64& serviceNs) {
++                             void* tileV, size_t sizeV, u32 expectedWidth, u32 expectedHeight, u64& serviceNs,
++                             u64& cpuServiceNs) {
+   if (file == nullptr) {
+     return kNoInput;
+   }
+@@ -816,8 +840,10 @@
+         sinceService = 0;
+         if (g_thpStatsOn) {
+           const u64 before = now_ns();
++          const u64 cpuBefore = thread_cpu_ns();
+           aurora_service_hardware_interrupts();
+           serviceNs += now_ns() - before;
++          cpuServiceNs += thread_cpu_ns() - cpuBefore;
+         } else {
+           aurora_service_hardware_interrupts();
+         }
+@@ -839,15 +865,27 @@
+ static s32 decode_video(const void* file, size_t fileSize, void* tileY, size_t sizeY, void* tileU, size_t sizeU,
+                         void* tileV, size_t sizeV, u32 expectedWidth, u32 expectedHeight) {
+   if (!g_thpStatsOn) {
+-    u64 unused = 0;
++    u64 unused = 0, unusedCpu = 0;
+     return decode_video_impl(file, fileSize, tileY, sizeY, tileU, sizeU, tileV, sizeV, expectedWidth, expectedHeight,
+-                             unused);
++                             unused, unusedCpu);
+   }
+-  u64 serviceNs = 0;
++  u64 serviceNs = 0, cpuServiceNs = 0;
+   const u64 start = now_ns();
++  const u64 cpuStart = thread_cpu_ns();
+   const s32 result = decode_video_impl(file, fileSize, tileY, sizeY, tileU, sizeU, tileV, sizeV, expectedWidth,
+-                                       expectedHeight, serviceNs);
++                                       expectedHeight, serviceNs, cpuServiceNs);
+   const u64 end = now_ns();
++  g_thpStats.cpuNs.fetch_add(thread_cpu_ns() - cpuStart, std::memory_order_relaxed);
++  g_thpStats.cpuServiceNs.fetch_add(cpuServiceNs, std::memory_order_relaxed);
++  if (const u64 lastEnd = g_thpStats.lastEnd.exchange(end, std::memory_order_relaxed); lastEnd != 0) {
++    const u64 gap = end - lastEnd;
++    u64 maxGap = g_thpStats.maxGapNs.load(std::memory_order_relaxed);
++    while (gap > maxGap && !g_thpStats.maxGapNs.compare_exchange_weak(maxGap, gap, std::memory_order_relaxed)) {
++    }
++    if (gap > 60000000ull && gap < 2000000000ull) {
++      g_thpStats.lateFrames.fetch_add(1, std::memory_order_relaxed);
++    }
++  }
+   g_thpStats.frames.fetch_add(1, std::memory_order_relaxed);
+   g_thpStats.ns.fetch_add(end - start, std::memory_order_relaxed);
+   g_thpStats.serviceNs.fetch_add(serviceNs, std::memory_order_relaxed);
+diff --git a/lib/gfx/scanout.cpp b/lib/gfx/scanout.cpp
+--- a/lib/gfx/scanout.cpp	2026-10-13 20:50:09.077601800 +0530
++++ b/lib/gfx/scanout.cpp	2026-10-13 20:50:20.868974377 +0530
+@@ -1,4 +1,5 @@
+ #include "scanout.hpp"
++#include <cstdlib>
+ #include "scanout_geometry.hpp"
+ #include <SDL3/SDL_video.h>
+ #include "xfb.hpp"
+@@ -112,7 +113,9 @@
+ void main() {
+   // A desktop picture at the window's size maps back to signal pixels; the
+   // signal-sized picture uses them directly (outp.xy = 1).
+-  vec2 signal_position = gl_FragCoord.xy * outp.xy;
++  // geom.w != 0: drawn straight into the window framebuffer (bottom up), geom.w is its height.
++  vec2 frag = vec2(gl_FragCoord.x, geom.w != 0u ? float(geom.w) - gl_FragCoord.y : gl_FragCoord.y);
++  vec2 signal_position = frag * outp.xy;
+   uvec2 at = uvec2(signal_position);
+   if (any(lessThan(at, sig.zw)) || any(greaterThanEqual(at, sig.zw + disp.xy))) {
+     out_color = vec4(0.0, 0.0, 0.0, 1.0);
+@@ -140,7 +143,8 @@
+ )";
+ constexpr auto ScaledMain = R"(
+ void main() {
+-  vec2 signal_position = gl_FragCoord.xy * outp.xy;
++  vec2 frag = vec2(gl_FragCoord.x, geom.w != 0u ? float(geom.w) - gl_FragCoord.y : gl_FragCoord.y);
++  vec2 signal_position = frag * outp.xy;
+   uvec2 at = uvec2(signal_position);
+   if (any(lessThan(at, sig.zw)) || any(greaterThanEqual(at, sig.zw + disp.xy))) {
+     out_color = vec4(0.0, 0.0, 0.0, 1.0);
+@@ -463,18 +467,17 @@
+   return std::make_shared<TextureRef>(texture, texture, texture, size, gl::TextureFormat::RGBA8Unorm, 1, GX_TF_RGBA8);
+ }
+ // Render worker only. `uniformSlot` selects the uniform buffer range.
+-void encode_signal(const Programs& programs, uint32_t uniformSlot, const TextureHandle& destination,
+-    const AuroraVIScanout& scanout, const std::shared_ptr<const xfb::Snapshot>& snapshot, bool physicalField,
+-    uint8_t picture = AURORA_DESKTOP_SIGNAL) {
+-  const gl::GLuint fbo = gl::get_framebuffer(destination->attachmentTextureView);
++void encode_signal_to(const Programs& programs, uint32_t uniformSlot, gl::GLuint fbo, uint32_t targetWidth,
++    uint32_t targetHeight, uint32_t flipHeight, const AuroraVIScanout& scanout,
++    const std::shared_ptr<const xfb::Snapshot>& snapshot, bool physicalField, uint8_t picture) {
+   const bool clear = scanout.black || !physicalField;
+-  begin_pass(fbo, clear, destination->size.width, destination->size.height);
++  begin_pass(fbo, clear, targetWidth, targetHeight);
+   if (!scanout.black) {
+     AURORA_ASSERT(snapshot && snapshot->gpuComplete.load(std::memory_order_acquire), "VI selected a noncompleted GX XFB");
+     std::array<float, 4> output{1.0f, 1.0f, 0.0f, 0.0f};
+     if (!physicalField && picture != AURORA_DESKTOP_SIGNAL) {
+-      output[0] = static_cast<float>(scanout.active_width) / static_cast<float>(destination->size.width);
+-      output[1] = static_cast<float>(scanout.active_height) / static_cast<float>(destination->size.height);
++      output[0] = static_cast<float>(scanout.active_width) / static_cast<float>(targetWidth);
++      output[1] = static_cast<float>(scanout.active_height) / static_cast<float>(targetHeight);
+       if (picture == AURORA_DESKTOP_SHARP && scanout.pan_width && scanout.pan_height) {
+         output[2] = static_cast<float>(scanout.vi_width) / static_cast<float>(scanout.pan_width) / output[0];
+         output[3] = static_cast<float>(scanout.vi_height) / static_cast<float>(scanout.pan_height) / output[1];
+@@ -482,7 +485,8 @@
+     }
+     const Uniforms values{{scanout.active_width, scanout.active_height, scanout.x_origin, scanout.y_origin},
+         {scanout.vi_width, scanout.vi_height, scanout.pan_x, scanout.pan_y},
+-        {scanout.pan_width, scanout.pan_height, scanout.field, physicalField && (scanout.tv_mode & 3u) == VI_INTERLACE},
++        {scanout.pan_width, scanout.pan_height, scanout.field,
++         physicalField ? static_cast<uint32_t>((scanout.tv_mode & 3u) == VI_INTERLACE) : flipHeight},
+         output};
+     // Desktop pictures of a scaled EFB use its full-detail copy.
+     const bool detail = !physicalField && picture != AURORA_DESKTOP_SIGNAL &&
+@@ -505,6 +509,12 @@
+   }
+   end_pass();
+ }
++void encode_signal(const Programs& programs, uint32_t uniformSlot, const TextureHandle& destination,
++    const AuroraVIScanout& scanout, const std::shared_ptr<const xfb::Snapshot>& snapshot, bool physicalField,
++    uint8_t picture = AURORA_DESKTOP_SIGNAL) {
++  encode_signal_to(programs, uniformSlot, gl::get_framebuffer(destination->attachmentTextureView),
++      destination->size.width, destination->size.height, 0, scanout, snapshot, physicalField, picture);
++}
+ bool prepare(void*, const AuroraVIScanout* scanout) {
+   auto& state = State(); std::lock_guard lock(state.mutex); RequireOwner(state);
+   state.prepared_snapshot.reset();
+@@ -612,8 +622,30 @@
+       effective.black = effective.black || !state.display_enabled;
+     }
+     // Preserve the exact physical field history independently from desktop output.
+-    encode_signal(programs, 0, signal, effective, snapshot, true);
+-    encode_signal(programs, 1, desktop, desktop_view(effective, picture), snapshot, false, picture);
++    // The physical field picture (`signal`) is read by nobody on the handheld; its full resolution pass cost GPU time
++    // for every presented frame. AURORA_VI_SIGNAL=1 draws it again.
++    static const bool drawSignal = [] {
++      const char* env = std::getenv("AURORA_VI_SIGNAL");
++      return env != nullptr && env[0] == '1';
++    }();
++    if (drawSignal) {
++      encode_signal(programs, 0, signal, effective, snapshot, true);
++    }
++    // Smooth and sharp pictures at the window's full size are drawn straight into the window framebuffer instead of
++    // into the desktop texture that the present pass then copies (one full resolution pass less per presented
++    // frame). Screenshots read the desktop texture, so they keep the two pass path.
++    static const bool mergeAllowed = [] {
++      const char* env = std::getenv("AURORA_VI_MERGE");
++      return env == nullptr || env[0] != '0';
++    }();
++    const bool merge = mergeAllowed && picture != AURORA_DESKTOP_SIGNAL && screenshot.empty() && desktop &&
++        std::lround(viewport.left) == 0 && std::lround(viewport.top) == 0 &&
++        std::lround(viewport.width) == static_cast<long>(surfaceWidth) &&
++        std::lround(viewport.height) == static_cast<long>(surfaceHeight) && desktop->size.width == surfaceWidth &&
++        desktop->size.height == surfaceHeight;
++    if (!merge) {
++      encode_signal(programs, 1, desktop, desktop_view(effective, picture), snapshot, false, picture);
++    }
+     const bool deviceMode = webgpu::sdl2shim_present::active();
+     std::optional<webgpu::sdl2shim_present::AcquiredFrame> slot;
+     // The slot wait must not hold the display gate: the owner frees slots.
+@@ -631,7 +663,12 @@
+     bool presented = false;
+     if (window::is_presentable() && (!deviceMode || slot)) {
+       const gl::GLuint targetFbo = deviceMode ? slot->fbo : 0;
+-      draw_window_signal(programs, targetFbo, surfaceWidth, surfaceHeight, viewport, desktop, effective.black);
++      if (merge) {
++        encode_signal_to(programs, 1, targetFbo, surfaceWidth, surfaceHeight, surfaceHeight,
++            desktop_view(effective, picture), snapshot, false, picture);
++      } else {
++        draw_window_signal(programs, targetFbo, surfaceWidth, surfaceHeight, viewport, desktop, effective.black);
++      }
+       if (shot_requested()) shot_capture(targetFbo, surfaceWidth, surfaceHeight);
+       // An unpresented frame keeps the request for the next successful Present.
+       if (!screenshot.empty()) take_screenshot(programs, viewport, desktop, effective.black, screenshot);
+diff --git a/lib/gl/census.cpp b/lib/gl/census.cpp
+--- a/lib/gl/census.cpp	2026-10-13 20:50:09.078336852 +0530
++++ b/lib/gl/census.cpp	2026-10-13 20:50:09.094473956 +0530
+@@ -31,6 +31,8 @@
+ std::atomic<int64_t> s_progBinaryUs{0};
+ std::atomic<int64_t> s_progMaxUs{0};
+ 
++std::atomic<int64_t> s_counts[CtCount];
++int64_t s_countsPrev[CtCount];
+ std::atomic<int64_t> s_timers[TmCount];
+ int64_t s_timersPrev[TmCount];
+ int64_t steady_ns() {
+@@ -152,6 +154,8 @@
+   s_tags[tag].equiv.fetch_sub(equivBytes, std::memory_order_relaxed);
+ }
+ 
++void count_add(Count count, int64_t n) noexcept { s_counts[count].fetch_add(n, std::memory_order_relaxed); }
++
+ void time_add(Timer timer, int64_t nanoseconds) noexcept {
+   s_timers[timer].fetch_add(nanoseconds, std::memory_order_relaxed);
+ }
+@@ -230,6 +234,14 @@
+       ms[i] = static_cast<double>(cur - s_timersPrev[i]) / 1.0e6 / secs;
+       s_timersPrev[i] = cur;
+     }
++    double cps[CtCount];
++    for (int i = 0; i < CtCount; ++i) {
++      const int64_t cur = s_counts[i].load(std::memory_order_relaxed);
++      cps[i] = static_cast<double>(cur - s_countsPrev[i]) / secs;
++      s_countsPrev[i] = cur;
++    }
++    head += fmt::format("\n[gl-count] per second: tex-new {:.1f} tex-stream {:.1f} tex-upload {:.2f} MB", cps[CtTexNew],
++                        cps[CtTexStream], cps[CtTexBytes] / 1.0e6);
+     head += fmt::format("\n[gl-time] ms per second: ops {:.0f} (upload {:.0f}) finish {:.0f} sync-wait {:.0f} "
+                         "drawdone-wait {:.0f} parse {:.0f} pipeline-wait {:.0f} slot-wait {:.0f} fence-wait {:.0f} present {:.0f}",
+                         ms[TmOps], ms[TmUpload], ms[TmFinish], ms[TmSyncWait], ms[TmDrawDone], ms[TmParse],
+diff --git a/lib/gl/census.hpp b/lib/gl/census.hpp
+--- a/lib/gl/census.hpp	2026-10-13 20:50:09.078566774 +0530
++++ b/lib/gl/census.hpp	2026-10-13 20:50:09.094626842 +0530
+@@ -88,6 +88,10 @@
+   TmOps, TmUpload, TmFinish, TmSyncWait, TmDrawDone, TmParse, TmPipeline, TmSlotWait, TmFenceWait, TmPresent, TmCount
+ };
+ void time_add(Timer timer, int64_t nanoseconds) noexcept;
++// Event counters shown per second in the [gl-time] line: textures created (new_static_texture_2d from game data),
++// in place streaming updates (video planes) and the bytes both uploaded.
++enum Count : uint8_t { CtTexNew, CtTexStream, CtTexBytes, CtCount };
++void count_add(Count count, int64_t n = 1) noexcept;
+ struct ScopedTimer {
+   Timer timer;
+   int64_t start;
+diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
+--- a/lib/gx/texture.cpp	2026-10-13 20:50:09.080149059 +0530
++++ b/lib/gx/texture.cpp	2026-10-13 20:50:09.094909298 +0530
+@@ -1,3 +1,4 @@
++#include "../gl/census.hpp"
+ #include "texture.hpp"
+ 
+ #include "../gfx/recording.hpp"
+@@ -673,6 +674,8 @@
+   const size_t sourceBytes = texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
+   gfx::write_texture(*slot.handle, {static_cast<const uint8_t*>(obj.data), sourceBytes});
+   ++s_stats.streamingUpdates;
++  gl::census::count_add(gl::census::CtTexStream);
++  gl::census::count_add(gl::census::CtTexBytes, static_cast<int64_t>(texture_handle_size(slot.handle)));
+   s_stats.uploadBytes += texture_handle_size(slot.handle);
+   return slot.handle;
+ }
+@@ -727,6 +730,8 @@
+       handle = gfx::new_static_texture_2d(obj.width(), obj.height(), obj.mip_count(), obj.format(),
+                                           {static_cast<const uint8_t*>(obj.data), sourceBytes}, false, nameStr);
+       ++s_stats.misses;
++      gl::census::count_add(gl::census::CtTexNew);
++      gl::census::count_add(gl::census::CtTexBytes, static_cast<int64_t>(texture_handle_size(handle)));
+       s_stats.uploadBytes += texture_handle_size(handle);
+       cache_content_texture(std::move(keys->contentKey), handle);
+     }
