@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 6919a91a..e5bec8ee 100644
+index 6919a91a..e31b406c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -56,6 +56,22 @@ if(MSCHARGED_GRAPHICS_BACKEND STREQUAL "gles")
@@ -57,20 +57,46 @@ index 6919a91a..e5bec8ee 100644
  
  if(MSCHARGED_BUILD_LAUNCHER OR MSCHARGED_BUILD_AURORA_HOST)
      include(cmake/SDL.cmake)
-@@ -374,6 +396,20 @@ endif()
+@@ -374,6 +396,46 @@ endif()
  
  message(STATUS "Configured development tools (launcher: ${MSCHARGED_BUILD_LAUNCHER}, experimental startup: ${MSCHARGED_BUILD_GAME_STARTUP}, independent GX check: ${MSCHARGED_BUILD_GX_CHECK}, static asset preview: ${MSCHARGED_BUILD_SCENE_PREVIEW}); playable game remains pending")
  
 +if(MSCHARGED_HANDHELD AND MSCHARGED_HANDHELD_LTO)
-+    # The decomp mixes 16 bit wchar_t (Wii) and 32 bit wchar_t sources, which LTO cannot merge into one module, and
-+    # the game modules link bitcode free objects. Everything built from the decomp (targets named
-+    # (m)charged_original_*, including the two game modules) stays an ordinary build; the host executable and the
-+    # native libraries are optimized across files.
-+    get_property(mscharged_all_targets DIRECTORY "${CMAKE_SOURCE_DIR}" PROPERTY BUILDSYSTEM_TARGETS)
-+    foreach(target IN LISTS mscharged_all_targets)
++    # The decomp mixes 16 bit wchar_t (Wii) and 32 bit wchar_t sources, which LTO cannot merge into one module, and a
++    # module links no bitcode. The two game modules and everything they link stay ordinary builds; the host
++    # executable and the native libraries it alone uses are optimized across files.
++    function(mscharged_without_lto target)
++        get_target_property(aliased ${target} ALIASED_TARGET)
++        if(aliased)
++            set(target ${aliased})
++        endif()
++        get_target_property(imported ${target} IMPORTED)
++        get_target_property(marked ${target} MSCHARGED_WITHOUT_LTO)
++        if(imported OR marked)
++            return()
++        endif()
++        set_property(TARGET ${target} PROPERTY MSCHARGED_WITHOUT_LTO TRUE)
 +        get_target_property(target_type ${target} TYPE)
-+        if(target MATCHES "^m?charged_original_" AND target_type MATCHES "LIBRARY|EXECUTABLE")
++        if(target_type MATCHES "LIBRARY|EXECUTABLE")
 +            set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
++        endif()
++        get_target_property(dependencies ${target} LINK_LIBRARIES)
++        foreach(dependency IN LISTS dependencies)
++            if(NOT dependency MATCHES "\\$<" AND TARGET ${dependency})
++                mscharged_without_lto(${dependency})
++            endif()
++        endforeach()
++        # Object libraries enter a module as $<TARGET_OBJECTS:name> sources.
++        get_target_property(object_sources ${target} SOURCES)
++        foreach(object_source IN LISTS object_sources)
++            if(object_source MATCHES "^\\$<TARGET_OBJECTS:([^>]+)>$")
++                mscharged_without_lto(${CMAKE_MATCH_1})
++            endif()
++        endforeach()
++    endfunction()
++    foreach(module IN ITEMS mscharged_original_frontend_module mscharged_original_main_credits_module)
++        if(TARGET ${module})
++            mscharged_without_lto(${module})
 +        endif()
 +    endforeach()
 +endif()
@@ -115,10 +141,22 @@ index 01397f87..4d12d12c 100644
  # Keep image conversion out of the user's build prerequisites.
  set(_app_icon "${CMAKE_CURRENT_SOURCE_DIR}/assets/launcher/icon.png")
 diff --git a/cmake/AuroraHost.cmake b/cmake/AuroraHost.cmake
-index fcdb85ac..11a7d641 100644
+index fcdb85ac..96ae1376 100644
 --- a/cmake/AuroraHost.cmake
 +++ b/cmake/AuroraHost.cmake
-@@ -78,6 +78,8 @@ function(mscharged_add_aurora_host)
+@@ -46,7 +46,11 @@ function(mscharged_add_aurora_host)
+     endif()
+     add_subdirectory("${MSCHARGED_FMT_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/fmt" EXCLUDE_FROM_ALL)
+     add_subdirectory("${MSCHARGED_XXHASH_PREPARED}/cmake_unofficial" "${CMAKE_CURRENT_BINARY_DIR}/extern/xxhash" EXCLUDE_FROM_ALL)
++    # With LTO on, Tracy embeds its objects in every consumer (duplicate definitions in the whole archive link).
++    set(MSCHARGED_IPO_SAVED "${CMAKE_INTERPROCEDURAL_OPTIMIZATION}")
++    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+     add_subdirectory("${MSCHARGED_TRACY_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/tracy" EXCLUDE_FROM_ALL)
++    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION "${MSCHARGED_IPO_SAVED}")
+ 
+     # All providers exist before Aurora configures. Prevent incidental downloads.
+     set(FETCHCONTENT_FULLY_DISCONNECTED ON)
+@@ -78,6 +82,8 @@ function(mscharged_add_aurora_host)
      set(AURORA_WII_LIGHTING ON)
      set(AURORA_ENABLE_NATIVE_VIDEO ${MSCHARGED_NATIVE_VIDEO})
      set(AURORA_ENABLE_RMLUI OFF)
@@ -127,7 +165,7 @@ index fcdb85ac..11a7d641 100644
      set(AURORA_ENABLE_TESTS OFF)
      set(AURORA_ENABLE_EXAMPLES OFF)
      add_subdirectory("${MSCHARGED_AURORA_PREPARED}" "${CMAKE_CURRENT_BINARY_DIR}/extern/aurora" EXCLUDE_FROM_ALL)
-@@ -122,12 +124,18 @@ if(MSCHARGED_BUILD_GX_CHECK)
+@@ -122,12 +128,18 @@ if(MSCHARGED_BUILD_GX_CHECK)
      else()
          mscharged_verify_targets("${MSCHARGED_DAWN_PREPARED}")
      endif()
