@@ -1,0 +1,2502 @@
+diff --git a/cmake/NativeAXFunctional.cmake b/cmake/NativeAXFunctional.cmake
+index 97fcbb2b..49317edc 100644
+--- a/cmake/NativeAXFunctional.cmake
++++ b/cmake/NativeAXFunctional.cmake
+@@ -14,6 +14,23 @@ target_link_libraries(charged_native_ax_functional PUBLIC charged_native_ax_boot
+     charged_native_ax_native_filter charged_native_ax_frame_commands charged_native_ai
+     charged_native_os_audio_registers)
+ 
++# Verification only: run the original, unoptimized AX frame preparation (src/platform/ax_reference) beside the
++# optimized one on every live frame and abort on the first differing byte (environment MSCHARGED_AXREF=1).
++option(MSCHARGED_AX_REFERENCE_CHECK "Build the AX reference frame comparison (verification builds only)" OFF)
++if(MSCHARGED_AX_REFERENCE_CHECK)
++    add_library(charged_native_ax_reference STATIC
++        src/platform/ax_reference/ax_adpcm_samples.cpp src/platform/ax_reference/ax_active_voice.cpp
++        src/platform/ax_reference/ax_command_service.cpp src/platform/ax_reference/ax_frame_commands.cpp)
++    add_dependencies(charged_native_ax_reference verify_prepared)
++    target_include_directories(charged_native_ax_reference PUBLIC src PRIVATE
++        "${MSCHARGED_PREPARED}/include" "${MSCHARGED_PREPARED}/libs/RVL_SDK/include")
++    target_compile_definitions(charged_native_ax_reference PRIVATE MSCHARGED_NATIVE=1)
++    target_compile_features(charged_native_ax_reference PUBLIC cxx_std_17)
++    target_link_libraries(charged_native_ax_reference PUBLIC charged_native_dsp_memory charged_native_ax_frame_commands)
++    target_link_libraries(charged_native_ax_functional PUBLIC charged_native_ax_reference)
++    target_compile_definitions(charged_native_ax_functional PRIVATE MSCHARGED_AX_REFERENCE_CHECK=1)
++endif()
++
+ if(BUILD_TESTING AND TARGET native_ax_active_source_fixture)
+     add_executable(native_ax_functional_tests tests/native_ax_functional.cpp
+         src/platform/os.cpp src/platform/os_version.cpp)
+diff --git a/src/platform/ax_active_voice.cpp b/src/platform/ax_active_voice.cpp
+index ef8fe8bd..f328d9f7 100644
+--- a/src/platform/ax_active_voice.cpp
++++ b/src/platform/ax_active_voice.cpp
+@@ -16,6 +16,12 @@ void PutHalf(unsigned char* p, std::uint16_t value) {
+ void PutWord(unsigned char* p, std::uint32_t value) {
+     PutHalf(p, static_cast<std::uint16_t>(value >> 16)); PutHalf(p + 2, static_cast<std::uint16_t>(value));
+ }
++// Floor division by a power of two is the arithmetic right shift (two's complement), bit for bit.
++static_assert((std::int64_t(-1)>>1)==-1 && (std::int64_t(-3)>>1)==-2,"arithmetic right shift is required");
++template<std::int64_t D> inline std::int64_t FloorDiv(std::int64_t value) {
++    static_assert(D>0&&(D&(D-1))==0,"power of two divisor");
++    return value>>(D==32768?15:16);
++}
+ std::int64_t Floor(std::int64_t value, std::int64_t divisor) {
+     return value >= 0 ? value / divisor : -((-value + divisor - 1) / divisor);
+ }
+@@ -33,11 +39,18 @@ std::int16_t Saturate(std::int64_t value) {
+ std::int16_t LowPass06AB(const std::array<std::int16_t, 96>& input, std::array<std::int16_t, 96>& output,
+                          std::int16_t history, std::uint16_t a0, std::uint16_t b0) {
+     for (std::size_t i = 0; i < 96; ++i) {
+-        history = Saturate(Floor(std::int64_t(input[i]) * a0 + std::int64_t(history) * b0, 32768));
++        history = Saturate(FloorDiv<32768>(std::int64_t(input[i]) * a0 + std::int64_t(history) * b0));
+         output[i] = history;
+     }
+     return history;
+ }
++// The two checks ParseNativeAXADPCMState makes before any other field, and its running decision.
++bool IsRunningPB(const unsigned char* wire) {
++    if (Half(wire + 0x70) != 0) throw std::logic_error("AX sample format is not DSP ADPCM");
++    const auto status = Half(wire + 0x10);
++    if (status > 1) throw std::logic_error("AX voice state is outside the qualified stop/run domain");
++    return status != 0;
++}
+ struct Bus { unsigned enabled, ramp, depop; };
+ constexpr std::array<Bus, 12> MixBuses{{
+     {0,2,0},{1,2,4},{16,18,1},{17,18,5},{21,23,2},{22,23,6},
+@@ -107,7 +120,7 @@ NativeAXRemoteVoice NativeAXProcessRemoteVoice(const std::array<std::int16_t, 96
+         const auto* taps = bank0.data() + ((position & 0xffff) >> 9) * 4;
+         std::int64_t product = 0;
+         for (std::size_t t = 0; t < 4; ++t) product += std::int64_t(window[index + t]) * taps[t] * 2;
+-        result.resampled[n] = Saturate(Floor(product, 65536));
++        result.resampled[n] = Saturate(FloorDiv<65536>(product));
+     }
+     const auto last = position >> 16;
+     PutHalf(pb + 0x10a, static_cast<std::uint16_t>(position));
+@@ -131,7 +144,7 @@ NativeAXRemoteVoice NativeAXProcessRemoteVoice(const std::array<std::int16_t, 96
+         const auto delta = Half(pb + 0xdc + ch * 4);
+         for (std::size_t i = 0; i < 18; ++i) {
+             result.channels[ch][i] =
+-                static_cast<std::int32_t>(Floor(std::int64_t(result.resampled[i]) * volume, 32768));
++                static_cast<std::int32_t>(FloorDiv<32768>(std::int64_t(result.resampled[i]) * volume));
+             if (handler >= 2) volume = static_cast<std::uint16_t>(volume + delta);
+         }
+         if (handler >= 2) PutHalf(pb + 0xda + ch * 4, volume);
+@@ -143,21 +156,40 @@ NativeAXRemoteVoice NativeAXProcessRemoteVoice(const std::array<std::int16_t, 96
+ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+     NativeDSPMemoryEndpoint endpoint, std::uint32_t address,
+     const NativeAXCoefficientView& coefficients) {
+-    NativeAXPreparedVoiceFrame result; result.parameter_address = address;
++    NativeAXPreparedVoiceFrame result;
++    PrepareNativeAXADPCMVoiceFrameInto(endpoint, address, coefficients, result, true);
++    return result;
++}
++void PrepareNativeAXADPCMVoiceFrameInto(NativeDSPMemoryEndpoint endpoint, std::uint32_t address,
++                                        const NativeAXCoefficientView& coefficients,
++                                        NativeAXPreparedVoiceFrame& result, bool verify_source_stability) {
++    // A reused slot keeps its stale working arrays; every field a consumer reads is (re)set below.
++    result.parameter_address = address;
++    result.was_running = false; result.mixed_buses = 0; result.decoded_samples = 0; result.loops = 0;
++    result.end_reached = false; result.remote_enabled = false;
+     DSPBackendReadMemory(endpoint, address, result.parameters_before.data(), result.parameters_before.size());
+     if (Word(result.parameters_before.data() + 4) != address)
+         Fail(NativeAXVoiceFailure::InvalidSelfAddress, "AX voice PB has no genuine self address");
+-    auto state = ReadNativeAXADPCMState(endpoint, address);
+-    // There is no whole-job lease in per-transfer DSP memory calls. Detect a
+-    // source mutation even during these two reads; the original device fence
+-    // must still exclude all CPU changes for this whole prepare/commit job.
+-    std::array<unsigned char, 320> verified{};
+-    DSPBackendReadMemory(endpoint, address, verified.data(), verified.size());
+-    if (verified != result.parameters_before)
+-        Fail(NativeAXVoiceFailure::SourceChanged, "AX source PB changed while preparing its device frame");
++    NativeAXADPCMState state;
++    if (verify_source_stability) {
++        state = ReadNativeAXADPCMState(endpoint, address);
++        // There is no whole-job lease in per-transfer DSP memory calls. Detect a
++        // source mutation even during these two reads; the original device fence
++        // must still exclude all CPU changes for this whole prepare/commit job.
++        std::array<unsigned char, 320> verified{};
++        DSPBackendReadMemory(endpoint, address, verified.data(), verified.size());
++        if (verified != result.parameters_before)
++            Fail(NativeAXVoiceFailure::SourceChanged, "AX source PB changed while preparing its device frame");
++    } else if (!IsRunningPB(result.parameters_before.data())) {
++        // A stopped voice needs none of the sample fields (IsRunningPB applied the same two format checks).
++        result.parameters_after = result.parameters_before;
++        return;
++    } else {
++        state = ParseNativeAXADPCMState(result.parameters_before.data());
++    }
+     result.parameters_after = result.parameters_before;
+     result.was_running = state.running;
+-    if (!state.running) return result;
++    if (!state.running) return;
+     if (state.src_select > 1)
+         Fail(NativeAXVoiceFailure::UnsupportedSRC,
+              ("AX active SRC selector=" + std::to_string(state.src_select) +
+@@ -186,6 +218,7 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+         Fail(NativeAXVoiceFailure::UnsupportedMixer, "AX DPL2/reserved mixer selection is outside this voice slice");
+ 
+     auto history = state.src_history;
++    NativeAXSampleWindow sample_bytes(endpoint);
+     std::uint32_t fraction = state.fraction;
+     auto* after = result.parameters_after.data();
+     // Original active voice processing clears12 main and8 remote depop cells
+@@ -199,12 +232,12 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+         for (std::uint32_t n = 0; n < count; ++n) {
+             std::int16_t sample = 0;
+             if (state.running) {
+-                const auto decoded = DecodeNativeAXRawADPCM(endpoint, state, 1);
+-                state = decoded.next;
+-                sample = decoded.samples[0];
+-                result.decoded_samples += decoded.samples_decoded;
+-                result.loops += decoded.loops;
+-                result.end_reached |= decoded.end_reached;
++                std::uint16_t loops = 0;
++                bool end_reached = false;
++                sample = StepNativeAXADPCMSample(sample_bytes, state, loops, end_reached);
++                result.decoded_samples += 1;
++                result.loops += loops;
++                result.end_reached |= end_reached;
+             }
+             // Original end IRQ F61..F71 switches AR2 to the initialized zero
+             // cell0CE9 for a nonloop voice; the rest of its96-sample FIR/VE
+@@ -218,7 +251,7 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+             for (std::size_t t = 0; t < 4; ++t) product += std::int64_t(history[t]) * taps[t] * 2;
+             // Firmware0744..074A: four signed products, ADDP, saturated AC1.M
+             // store in40-bit mode. No added rounding or float interpolation.
+-            result.resampled[i] = Saturate(Floor(product, 65536));
++            result.resampled[i] = Saturate(FloorDiv<65536>(product));
+         } else {
+             // Original076D..07AE selects unsigned low multiply operands and
+             // no product shift. The circular history pointer names its first
+@@ -227,8 +260,8 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+             // (65536-phase) and signedPCM * unsigned phase before AC1.M drops
+             // the low16 bits. This path neither reads nor substitutes DROM.
+             result.resampled[i] = fraction == 0 ? history[0] :
+-                Saturate(Floor(std::int64_t(history[0]) * (65536 - fraction) +
+-                               std::int64_t(history[1]) * fraction, 65536));
++                Saturate(FloorDiv<65536>(std::int64_t(history[0]) * (65536 - fraction) +
++                               std::int64_t(history[1]) * fraction));
+         }
+     }
+     state.fraction = static_cast<std::uint16_t>(fraction);
+@@ -246,7 +279,7 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+     for (std::size_t i = 0; i < 96; ++i) {
+         // Original034D..0374 makes96 unsigned16 VE values in16-bit mode,
+         // then signedPCM * unsignedVE in40-bit mode, with middle saturation.
+-        result.enveloped[i] = Saturate(Floor(std::int64_t(result.resampled[i]) * envelope, 32768));
++        result.enveloped[i] = Saturate(FloorDiv<32768>(std::int64_t(result.resampled[i]) * envelope));
+         envelope = static_cast<std::uint16_t>(envelope + delta);
+     }
+     PutHalf(after + 0x6a, envelope);
+@@ -260,11 +293,12 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+     for (std::size_t bus = 0; bus < MixBuses.size(); ++bus) {
+         const auto& selected = MixBuses[bus];
+         if (!(mixer & (std::uint32_t(1) << selected.enabled))) continue;
++        result.mixed_buses |= static_cast<std::uint16_t>(1u << bus);
+         auto volume = Half(before + 0x14 + bus * 4);
+         const auto volume_delta = Signed(Half(before + 0x16 + bus * 4));
+         const bool ramp = (mixer & (std::uint32_t(1) << selected.ramp)) != 0;
+         for (std::size_t i = 0; i < 96; ++i) {
+-            result.buses[bus][i] = static_cast<std::int32_t>(Floor(std::int64_t(result.filtered[i]) * volume, 32768));
++            result.buses[bus][i] = static_cast<std::int32_t>(FloorDiv<32768>(std::int64_t(result.filtered[i]) * volume));
+             if (ramp) volume = static_cast<std::uint16_t>(volume + volume_delta);
+         }
+         if (ramp) PutHalf(after + 0x14 + bus * 4, volume);
+@@ -277,7 +311,6 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+         result.remote = NativeAXProcessRemoteVoice(result.filtered, after, NativeAXRemoteCoefficientBank(coefficients));
+         result.remote_enabled = true;
+     }
+-    return result;
+ }
+ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+     NativeDSPMemoryEndpoint endpoint,std::uint32_t address,
+@@ -293,8 +326,8 @@ void ValidateNativeAXVoiceCommit(NativeDSPMemoryEndpoint endpoint,
+         Fail(NativeAXVoiceFailure::SourceChanged, "AX source PB changed before its original device completion boundary");
+ }
+ void CommitNativeAXVoiceFrame(NativeDSPMemoryEndpoint endpoint,
+-                             const NativeAXPreparedVoiceFrame& frame) {
+-    ValidateNativeAXVoiceCommit(endpoint, frame);
++                             const NativeAXPreparedVoiceFrame& frame, bool validate) {
++    if (validate) ValidateNativeAXVoiceCommit(endpoint, frame);
+     DSPBackendWriteMemory(endpoint, frame.parameter_address, frame.parameters_after.data(), frame.parameters_after.size());
+ }
+ } // namespace mscharged::platform
+diff --git a/src/platform/ax_active_voice.h b/src/platform/ax_active_voice.h
+index d986d628..f4b78c3b 100644
+--- a/src/platform/ax_active_voice.h
++++ b/src/platform/ax_active_voice.h
+@@ -93,6 +93,7 @@ struct NativeAXPreparedVoiceFrame {
+     std::uint32_t decoded_samples{};
+     std::uint16_t loops{};
+     bool was_running{}, end_reached{};
++    std::uint16_t mixed_buses{}; // bit per entry of buses written by this voice; others stay zero
+ };
+ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+     NativeDSPMemoryEndpoint endpoint, std::uint32_t parameter_address,
+@@ -102,8 +103,17 @@ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+ NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
+     NativeDSPMemoryEndpoint endpoint, std::uint32_t parameter_address,
+     const NativeAXCoefficientView& coefficients);
++// In-place form for a default-initialized `result` (no large copies). With
++// verify_source_stability the PB is read three times and compared, as the
++// by-value entries always do; without it the single transfer is used. The
++// device owner runs prepare and commit back to back with no other code between
++// them, so the repeated reads can only re-assert what that exclusion guarantees.
++void PrepareNativeAXADPCMVoiceFrameInto(NativeDSPMemoryEndpoint endpoint, std::uint32_t parameter_address,
++                                        const NativeAXCoefficientView& coefficients,
++                                        NativeAXPreparedVoiceFrame& result, bool verify_source_stability);
+ void ValidateNativeAXVoiceCommit(NativeDSPMemoryEndpoint endpoint,
+                                 const NativeAXPreparedVoiceFrame& frame);
++// validate=false skips ValidateNativeAXVoiceCommit (the write is still checked by the DSP bus).
+ void CommitNativeAXVoiceFrame(NativeDSPMemoryEndpoint endpoint,
+-                             const NativeAXPreparedVoiceFrame& frame);
++                             const NativeAXPreparedVoiceFrame& frame, bool validate = true);
+ } // namespace mscharged::platform
+diff --git a/src/platform/ax_adpcm_samples.cpp b/src/platform/ax_adpcm_samples.cpp
+index 07eac7df..626eb558 100644
+--- a/src/platform/ax_adpcm_samples.cpp
++++ b/src/platform/ax_adpcm_samples.cpp
+@@ -12,25 +12,6 @@ std::uint32_t Word(const unsigned char* p) {return (std::uint32_t(Half(p))<<16)|
+ std::int16_t SignedHalf(const unsigned char* p) {
+     const auto bits=Half(p);std::int16_t value;std::memcpy(&value,&bits,sizeof(value));return value;
+ }
+-// Accelerator sample bytes for one decode block, fetched in windows under one
+-// DSP memory lock each. Every byte equals DSPBackendReadSampleByte's; a byte
+-// outside the window is read afresh, so unavailable bytes fail as before.
+-class SampleBytes {
+-public:
+-    explicit SampleBytes(NativeDSPMemoryEndpoint endpoint) : endpoint_(endpoint) {}
+-    unsigned char operator()(std::uint32_t address) {
+-        if (address-start_>=count_) {
+-            count_=DSPBackendReadSampleBytes(endpoint_,address,window_.data(),window_.size());
+-            start_=address;
+-        }
+-        return window_[address-start_];
+-    }
+-private:
+-    NativeDSPMemoryEndpoint endpoint_;
+-    std::array<unsigned char,64> window_{};
+-    std::uint32_t start_=0;
+-    std::size_t count_=0;
+-};
+ std::int16_t DecodeSample(unsigned char nibble,const NativeAXADPCMState& state) {
+     const auto predictor=(state.predictor_scale>>4)&7;
+     const auto scale=state.predictor_scale&15;
+@@ -44,7 +25,7 @@ std::int16_t DecodeSample(unsigned char nibble,const NativeAXADPCMState& state)
+                                                state.history1,state.history2);
+     // Defined floor division is equivalent to the original arithmetic >>16,
+     // including negative rounded values, without a signed-shift assumption.
+-    const auto pcm=accumulator>=0?accumulator/65536:-((-accumulator+65535)/65536);
++    const auto pcm=std::int64_t(accumulator)>>16; // floor division by 65536 (arithmetic shift)
+     return static_cast<std::int16_t>(pcm);
+ }
+ std::string Hex(std::uint32_t value) {
+@@ -68,8 +49,16 @@ void Geometry(const NativeAXADPCMState& state) {
+         throw std::logic_error("AX ADPCM loop/type descriptor is outside the qualified source domain");
+ }
+ }
++void NativeAXSampleWindow::Fetch(std::uint32_t address) {
++    count_=DSPBackendReadSampleBytes(endpoint_,address,window_.data(),window_.size());
++    start_=address;
++}
+ NativeAXADPCMState ReadNativeAXADPCMState(NativeDSPMemoryEndpoint endpoint,std::uint32_t address) {
+     std::array<unsigned char,320> wire{};DSPBackendReadMemory(endpoint,address,wire.data(),wire.size());
++    return ParseNativeAXADPCMState(wire.data());
++}
++NativeAXADPCMState ParseNativeAXADPCMState(const unsigned char* wire_block) {
++    struct Wire {const unsigned char* p;const unsigned char* data() const {return p;}} wire{wire_block};
+     if(Half(wire.data()+0x70)!=0)
+         throw std::logic_error("AX sample format is not DSP ADPCM");
+     const auto status=Half(wire.data()+0x10);
+@@ -89,6 +78,51 @@ NativeAXADPCMState ReadNativeAXADPCMState(NativeDSPMemoryEndpoint endpoint,std::
+     result.loop_history1=SignedHalf(wire.data()+0xb6);result.loop_history2=SignedHalf(wire.data()+0xb8);
+     return result;
+ }
++namespace {
++// One decode iteration (the body of DecodeNativeAXRawADPCM's loop). `initial` only decorates range errors.
++std::int16_t Step(NativeAXSampleWindow& Byte,NativeAXADPCMState& state,std::uint16_t& loops,bool& end_reached) {
++    const auto at=state.current_nibble;
++    const auto packed=Byte(at/2);
++    const auto nibble=static_cast<unsigned char>(at&1?packed&15:packed>>4);
++    const auto decoded=DecodeSample(nibble,state);
++    state.history2=state.history1;state.history1=decoded;
++    const bool ended=at==state.end_nibble;
++    ++state.current_nibble;
++    // Header prefetch is a real accelerator boundary, including a payload
++    // end at nibble15: the next frame's header is read before the end
++    // check, past the allocation if the sample ends there. A looping voice
++    // then takes its loop pred/scale; a one-shot voice writes it back.
++    if((state.current_nibble&15)==0) {
++        state.predictor_scale=Byte(state.current_nibble/2)&0x7f;
++        state.current_nibble+=2;
++    }
++    if(ended) {
++        end_reached=true;state.current_nibble=state.loop_nibble;
++        if(state.loop_flag) {
++            state.predictor_scale=state.loop_predictor_scale;
++            if(state.voice_type!=1) {
++                state.history1=state.loop_history1;state.history2=state.loop_history2;
++            }
++            ++loops;
++        } else state.running=false;
++    }
++    return decoded;
++}
++struct Initial {std::uint32_t current,loop,end;std::uint16_t loop_flag,type;};
++[[noreturn]] void Rethrow(const std::out_of_range& error,const NativeAXADPCMState& state,const Initial& initial) {
++    throw std::out_of_range(std::string(error.what())+" during ADPCM decode at nibble "+Hex(state.current_nibble)+
++                            " (voice current="+Hex(initial.current)+" loop="+Hex(initial.loop)+
++                            " end="+Hex(initial.end)+" loopFlag="+std::to_string(initial.loop_flag)+
++                            " type="+std::to_string(initial.type)+")");
++}
++}
++std::int16_t StepNativeAXADPCMSample(NativeAXSampleWindow& bytes,NativeAXADPCMState& state,
++                                    std::uint16_t& loops,bool& end_reached) {
++    Geometry(state);state.predictor_scale&=0x7f;state.loop_predictor_scale&=0x7f;
++    const Initial initial{state.current_nibble,state.loop_nibble,state.end_nibble,state.loop_flag,state.voice_type};
++    try {return Step(bytes,state,loops,end_reached);}
++    catch(const std::out_of_range& error) {Rethrow(error,state,initial);}
++}
+ NativeAXRawADPCMBlock DecodeNativeAXRawADPCM(NativeDSPMemoryEndpoint endpoint,
+                                            const NativeAXADPCMState& input,std::size_t limit) {
+     if(!limit || limit>96)throw std::invalid_argument("AX raw ADPCM block must request 1..96 samples");
+@@ -96,42 +130,13 @@ NativeAXRawADPCMBlock DecodeNativeAXRawADPCM(NativeDSPMemoryEndpoint endpoint,
+     auto& state=result.next;
+     if(!state.running)return result;
+     Geometry(state);state.predictor_scale&=0x7f;state.loop_predictor_scale&=0x7f;
+-    const auto initial=state;
+-    SampleBytes Byte(endpoint);
++    const Initial initial{state.current_nibble,state.loop_nibble,state.end_nibble,state.loop_flag,state.voice_type};
++    NativeAXSampleWindow Byte(endpoint);
+     try {
+-    while(result.samples_decoded<limit && state.running) {
+-        const auto at=state.current_nibble;
+-        const auto packed=Byte(at/2);
+-        const auto nibble=static_cast<unsigned char>(at&1?packed&15:packed>>4);
+-        const auto decoded=DecodeSample(nibble,state);
+-        state.history2=state.history1;state.history1=decoded;
+-        result.samples[result.samples_decoded++]=decoded;
+-        const bool ended=at==state.end_nibble;
+-        ++state.current_nibble;
+-        // Header prefetch is a real accelerator boundary, including a payload
+-        // end at nibble15: the next frame's header is read before the end
+-        // check, past the allocation if the sample ends there. A looping voice
+-        // then takes its loop pred/scale; a one-shot voice writes it back.
+-        if((state.current_nibble&15)==0) {
+-            state.predictor_scale=Byte(state.current_nibble/2)&0x7f;
+-            state.current_nibble+=2;
+-        }
+-        if(ended) {
+-            result.end_reached=true;state.current_nibble=state.loop_nibble;
+-            if(state.loop_flag) {
+-                state.predictor_scale=state.loop_predictor_scale;
+-                if(state.voice_type!=1) {
+-                    state.history1=state.loop_history1;state.history2=state.loop_history2;
+-                }
+-                ++result.loops;
+-            } else state.running=false;
+-        }
+-    }
++    while(result.samples_decoded<limit && state.running)
++        result.samples[result.samples_decoded++]=Step(Byte,state,result.loops,result.end_reached);
+     } catch(const std::out_of_range& error) {
+-        throw std::out_of_range(std::string(error.what())+" during ADPCM decode at nibble "+Hex(state.current_nibble)+
+-                                " (voice current="+Hex(initial.current_nibble)+" loop="+Hex(initial.loop_nibble)+
+-                                " end="+Hex(initial.end_nibble)+" loopFlag="+std::to_string(initial.loop_flag)+
+-                                " type="+std::to_string(initial.voice_type)+")");
++        Rethrow(error,state,initial);
+     }
+     return result;
+ }
+diff --git a/src/platform/ax_adpcm_samples.h b/src/platform/ax_adpcm_samples.h
+index 83cb693a..c29e237f 100644
+--- a/src/platform/ax_adpcm_samples.h
++++ b/src/platform/ax_adpcm_samples.h
+@@ -18,6 +18,32 @@ struct NativeAXADPCMState {
+ };
+ NativeAXADPCMState ReadNativeAXADPCMState(NativeDSPMemoryEndpoint endpoint,
+                                        std::uint32_t parameter_block_address);
++// The same decode of an already transferred 320-byte wire parameter block
++// (ReadNativeAXADPCMState is one memory read followed by this).
++NativeAXADPCMState ParseNativeAXADPCMState(const unsigned char* wire_parameter_block);
++// Accelerator sample bytes fetched in windows, one DSP memory lock per window.
++// Every byte equals DSPBackendReadSampleByte's; a byte outside the window is read
++// afresh, so unavailable bytes fail exactly as before. A window is only valid
++// while the sample memory is unchanged, i.e. for one prepare job of one voice.
++class NativeAXSampleWindow {
++public:
++    explicit NativeAXSampleWindow(NativeDSPMemoryEndpoint endpoint) : endpoint_(endpoint) {}
++    unsigned char operator()(std::uint32_t address) {
++        if (address-start_>=count_) Fetch(address);
++        return window_[address-start_];
++    }
++private:
++    void Fetch(std::uint32_t address);
++    NativeDSPMemoryEndpoint endpoint_;
++    std::array<unsigned char,128> window_{};
++    std::uint32_t start_=0;
++    std::size_t count_=0;
++};
++// One raw sample of a running voice, advancing state in place exactly as one
++// iteration of DecodeNativeAXRawADPCM(state, 1) (geometry checks, loop and end
++// handling, header prefetch). loops and end_reached accumulate.
++std::int16_t StepNativeAXADPCMSample(NativeAXSampleWindow& bytes,NativeAXADPCMState& state,
++                                    std::uint16_t& loops,bool& end_reached);
+ struct NativeAXRawADPCMBlock {
+     std::array<std::int16_t,96> samples{};
+     NativeAXADPCMState next{};
+diff --git a/src/platform/ax_bootstrap_device.cpp b/src/platform/ax_bootstrap_device.cpp
+index d555cb29..83f2cf70 100644
+--- a/src/platform/ax_bootstrap_device.cpp
++++ b/src/platform/ax_bootstrap_device.cpp
+@@ -1,4 +1,5 @@
+ #include "platform/ax_bootstrap_device.h"
++#include "platform/ax_perf.h"
+ #include "platform/ax_command_service.h"
+ #include "platform/dsp_instruction_core.h"
+ #include "platform/dsp_control_abi.h"
+@@ -216,6 +217,7 @@ struct NativeAXBootstrapDevice::State {
+             // owners before stores. Unsupported work publishes no completion.
+             DSPBackendValidateMemory(memory,word,128,false);
+             NativeAXDeviceFrameResult result;
++            const auto perf_start=g_ax_perf_on?AXPerfNowNs():0;
+             if(native_process)result=native_process(native_context,memory,word,128);
+             else if(processor.process)result=processor.process(processor.context,memory,word,128);
+             else {
+@@ -223,6 +225,7 @@ struct NativeAXBootstrapDevice::State {
+                 result={zero.consumed_words,zero.stopped_voices,zero.stereo_frames,
+                         zero.remote_samples_per_channel,zero.written_bytes};
+             }
++            if(g_ax_perf_on){AXPerfAdd(g_ax_perf.frames);AXPerfAdd(g_ax_perf.frame_ns,AXPerfNowNs()-perf_start);AXPerfTick();}
+             frames.last_list_address=word;frames.written_bytes=result.written_bytes;
+             frames.stopped_voices=result.stopped_voices;
+             frames.stereo_frames=result.stereo_frames;
+@@ -264,6 +267,7 @@ struct NativeAXBootstrapDevice::State {
+         return false;
+     }
+     void Poll() {
++        AXPerfAdd(g_ax_perf.poll_calls);
+         RequireOwner();
+         if(servicing) {
+             // Original handlers synchronously wait for CONTINUE consumption.
+diff --git a/src/platform/ax_command_service.cpp b/src/platform/ax_command_service.cpp
+index 3f4a19f5..127480cd 100644
+--- a/src/platform/ax_command_service.cpp
++++ b/src/platform/ax_command_service.cpp
+@@ -61,6 +61,10 @@ NativeAXCommandList ReadNativeAXCommandList(NativeDSPMemoryEndpoint endpoint,
+         throw NativeAXCommandError(NativeAXFailure::InvalidListExtent,0,"AX command list must be an aligned bounded original128-byte slot");
+     std::array<unsigned char,128> wire{};
+     DSPBackendReadMemory(endpoint,address,wire.data(),bytes);
++    return ParseNativeAXCommandList(wire.data(),bytes);
++}
++NativeAXCommandList ParseNativeAXCommandList(const unsigned char* wire_bytes,std::size_t bytes) {
++    struct Wire {const unsigned char* p;const unsigned char* data() const {return p;}} wire{wire_bytes};
+     NativeAXCommandList result;
+     const auto available=bytes/2;
+     for(std::size_t at=0;at<available;) {
+diff --git a/src/platform/ax_command_service.h b/src/platform/ax_command_service.h
+index 141802b6..6c9332be 100644
+--- a/src/platform/ax_command_service.h
++++ b/src/platform/ax_command_service.h
+@@ -41,6 +41,8 @@ struct NativeAXCommandList {
+ };
+ NativeAXCommandList ReadNativeAXCommandList(NativeDSPMemoryEndpoint endpoint,
+                                           std::uint32_t address, std::size_t bytes);
++// ReadNativeAXCommandList minus the transfer: parses an already read list slot.
++NativeAXCommandList ParseNativeAXCommandList(const unsigned char* wire, std::size_t bytes);
+ struct NativeAXZeroFrameResult {
+     std::uint16_t consumed_words{}, stopped_voices{};
+     std::uint16_t stereo_frames{}, remote_samples_per_channel{};
+diff --git a/src/platform/ax_frame_commands.cpp b/src/platform/ax_frame_commands.cpp
+index 7eec8ba4..4b9ef3e0 100644
+--- a/src/platform/ax_frame_commands.cpp
++++ b/src/platform/ax_frame_commands.cpp
+@@ -1,4 +1,5 @@
+ #include "platform/ax_frame_commands.h"
++#include "platform/ax_perf.h"
+ #include "platform/ax_studio_depop.h"
+ #include <algorithm>
+ #include <cstdlib>
+@@ -21,13 +22,19 @@ std::int64_t SignedWidth(std::int64_t x,unsigned width) {
+     const auto bits=std::uint64_t(x)&mask;
+     return bits&(std::uint64_t(1)<<(width-1)) ? std::int64_t(bits)-std::int64_t(mask+1) : std::int64_t(bits);
+ }
++// Floor division by a power of two is the arithmetic right shift (two's complement), bit for bit.
++static_assert((std::int64_t(-1)>>1)==-1 && (std::int64_t(-3)>>1)==-2,"arithmetic right shift is required");
++template<std::int64_t D> inline std::int64_t FloorDiv(std::int64_t value) {
++    static_assert(D>0&&(D&(D-1))==0,"power of two divisor");
++    return value>>(D==32768?15:16);
++}
+ std::int64_t Floor(std::int64_t x,std::int64_t d) {return x>=0?x/d:-((-x+d-1)/d);}
+ std::int16_t Saturate(std::int64_t x) {return std::int16_t(std::max<std::int64_t>(-32768,std::min<std::int64_t>(32767,x)));}
+ std::int32_t StoreBus(std::int64_t x) {
+     // Literal40-bit mode stores saturated AC.M and the unchanged AC.L, not a
+     // generic s32 clamp. Preserve this source hardware overflow behavior.
+     const auto value=SignedWidth(x,40);
+-    const auto high=std::uint16_t(Saturate(Floor(value,65536)));
++    const auto high=std::uint16_t(Saturate(FloorDiv<65536>(value)));
+     return SignedWord((std::uint32_t(high)<<16)|(std::uint64_t(value)&65535));
+ }
+ [[noreturn]] void Fail(NativeAXFailure why,const NativeAXCommand& c,const char* message) {
+@@ -50,8 +57,11 @@ void Stage(NativeAXPreparedCommandFrame& f,NativeDSPMemoryEndpoint e,std::uint32
+     for(const auto& w:f.writes)
+         if(std::uint64_t(a)<std::uint64_t(w.address)+w.after.size() && w.address<end)
+             throw std::runtime_error("AX original output/AUX writable spans overlap");
+-    f.written_bytes+=after.size();f.writes.push_back({a,Read(e,a,after.size()),std::move(after)});
++    f.written_bytes+=after.size();
++    auto before=f.captured_before?Read(e,a,after.size()):std::vector<unsigned char>{};
++    f.writes.push_back({a,std::move(before),std::move(after)});
+ }
++void ValidateGeometry(const NativeAXPreparedCommandFrame& f,const NativeAXCommandHistory& history,bool voice_pairs);
+ bool IsZero(const std::vector<unsigned char>& bytes) {
+     return std::all_of(bytes.begin(),bytes.end(),[](unsigned char x){return x==0;});
+ }
+@@ -67,7 +77,7 @@ std::array<std::uint16_t,96> NativeAXCommandGainRamp(std::uint16_t before,std::u
+     constexpr int weight[3]={683,683,682};
+     for(unsigned i=0;i<95;++i) {
+         accumulator+=std::int64_t(delta)*weight[i%3];
+-        result[i]=std::uint16_t(Floor(accumulator,65536));
++        result[i]=std::uint16_t(FloorDiv<65536>(accumulator));
+     }
+     result.back()=requested;return result;
+ }
+@@ -76,7 +86,7 @@ NativeAXChannel96 NativeAXMixAuxReturn(const NativeAXChannel96& main,
+                                       const std::array<std::uint16_t,96>& gain) {
+     NativeAXChannel96 result{};
+     for(unsigned i=0;i<96;++i)
+-        result[i]=StoreBus(std::int64_t(main[i])+Floor(std::int64_t(returned[i])*gain[i],32768));
++        result[i]=StoreBus(std::int64_t(main[i])+FloorDiv<32768>(std::int64_t(returned[i])*gain[i]));
+     return result;
+ }
+ NativeAXStereo96 NativeAXPackStereo(const NativeAXChannel96& left,const NativeAXChannel96& right,
+@@ -85,8 +95,8 @@ NativeAXStereo96 NativeAXPackStereo(const NativeAXChannel96& left,const NativeAX
+     for(unsigned i=0;i<96;++i) {
+         // Actual0631..0655 interleaves right,left. LSL16 wraps the40-bit
+         // accumulator before its saturated middle store, including wide edges.
+-        result[i*2]=Saturate(SignedWidth(Floor(std::int64_t(right[i])*gain[i],32768),24));
+-        result[i*2+1]=Saturate(SignedWidth(Floor(std::int64_t(left[i])*gain[i],32768),24));
++        result[i*2]=Saturate(SignedWidth(FloorDiv<32768>(std::int64_t(right[i])*gain[i]),24));
++        result[i*2+1]=Saturate(SignedWidth(FloorDiv<32768>(std::int64_t(left[i])*gain[i]),24));
+     }
+     return result;
+ }
+@@ -96,7 +106,7 @@ std::int32_t NativeAXMixAccumulate(std::int32_t bus,std::int32_t contribution) {
+ std::array<std::int16_t,18> NativeAXRemoteOutput(const std::array<std::int32_t,18>& accumulator) {
+     std::array<std::int16_t,18> result{};
+     for(unsigned i=0;i<18;++i)
+-        result[i]=Saturate(Floor(SignedWidth(std::int64_t(accumulator[i])*65536,40),65536));
++        result[i]=Saturate(FloorDiv<65536>(SignedWidth(std::int64_t(accumulator[i])*65536,40)));
+     return result;
+ }
+ NativeAXCompressorDecision NativeAXCompressorStep(std::uint16_t counter,std::uint16_t threshold,
+@@ -120,18 +130,38 @@ std::int32_t NativeAXCompressSample(std::int32_t sample,std::uint16_t gain) {
+     // adds the doubled low product, ASR16 floors and SL/S store the halves.
+     auto accumulator=SignedWidth(2*high*gain*65536,40);
+     accumulator=SignedWidth(accumulator+2*low*std::int64_t(gain),40);
+-    return StoreBus(Floor(accumulator,65536));
++    return StoreBus(FloorDiv<65536>(accumulator));
+ }
+ NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
+     NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes,
+     const NativeAXCommandHistory& history,const NativeAXCoefficientView& coefficients) {
++    return PrepareNativeAXCommandFrame(memory,address,bytes,history,coefficients,true);
++}
++NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
++    NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes,
++    const NativeAXCommandHistory& history,const NativeAXCoefficientView& coefficients,bool verify) {
++    NativeAXPreparedCommandFrame f;
++    PrepareNativeAXCommandFrameInto(f,memory,address,bytes,history,coefficients,verify);
++    return f;
++}
++void PrepareNativeAXCommandFrameInto(NativeAXPreparedCommandFrame& f,
++    NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes,
++    const NativeAXCommandHistory& history,const NativeAXCoefficientView& coefficients,bool verify) {
+     if(!bytes || bytes>128 || bytes%2 || address%2)
+         throw NativeAXCommandError(NativeAXFailure::InvalidListExtent,0,"AX staged list must be an aligned original128-byte slot");
+-    NativeAXPreparedCommandFrame f;f.before=f.after=history;
++    f.before=f.after=history;f.captured_before=verify;
++    f.reads.clear();f.writes.clear();f.consumed_words=f.voice_count=f.active_voices=f.aux_commands=0;f.written_bytes=0;
+     const auto list_before=Capture(f,memory,address,bytes);
+-    const auto list=ReadNativeAXCommandList(memory,address,bytes);
+-    if(Read(memory,address,bytes)!=list_before)
+-        throw std::runtime_error("AX source command list changed while parsing");
++    NativeAXCommandList list;
++    if(verify) {
++        list=ReadNativeAXCommandList(memory,address,bytes);
++        if(Read(memory,address,bytes)!=list_before)
++            throw std::runtime_error("AX source command list changed while parsing");
++    } else {
++        if(bytes>std::numeric_limits<std::uint32_t>::max()-std::uint64_t(address)+1)
++            throw NativeAXCommandError(NativeAXFailure::InvalidListExtent,0,"AX command list must be an aligned bounded original128-byte slot");
++        list=ParseNativeAXCommandList(list_before.data(),bytes);
++    }
+     f.consumed_words=list.consumed_words;
+     std::size_t next=0;
+     auto Take=[&](NativeAXOpcode op)->const NativeAXCommand& {
+@@ -161,18 +191,26 @@ NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
+     if(!IsZero(Capture(f,memory,Address(surround),384)))
+         Fail(NativeAXFailure::NonzeroSurround,surround,"AX prior surround routing is not yet qualified");
+     const auto& process=Take(NativeAXOpcode::Process);
++    // PB addresses seen so far, kept sorted. They are pairwise disjoint 320-byte records, so a new record
++    // overlaps one of them only if it overlaps its predecessor or successor in address order.
+     std::array<std::uint32_t,96> seen{};auto voice_address=Address(process);
++    if(f.voices.capacity()<96)f.voices.reserve(96);
+     while(voice_address) {
+-        if(f.voice_count==96 || std::find(seen.begin(),seen.begin()+f.voice_count,voice_address)!=seen.begin()+f.voice_count)
++        const auto position=std::lower_bound(seen.begin(),seen.begin()+f.voice_count,voice_address);
++        if(f.voice_count==96 || (position!=seen.begin()+f.voice_count && *position==voice_address))
+             Fail(NativeAXFailure::InvalidVoiceChain,process,"AX source PB chain is cyclic or exceeds96 voices");
+-        for(unsigned i=0;i<f.voice_count;++i)
+-            if(Overlap(seen[i],320,voice_address,320))
+-                Fail(NativeAXFailure::InvalidVoiceChain,process,"AX distinct source PB records partially overlap");
+-        const auto voice=PrepareNativeAXADPCMVoiceFrame(memory,voice_address,coefficients);
+-        seen[f.voice_count++]=voice_address;
++        if((position!=seen.begin() && Overlap(*(position-1),320,voice_address,320)) ||
++           (position!=seen.begin()+f.voice_count && Overlap(*position,320,voice_address,320)))
++            Fail(NativeAXFailure::InvalidVoiceChain,process,"AX distinct source PB records partially overlap");
++        if(f.voices.size()<=f.voice_count)f.voices.emplace_back();
++        auto& voice=f.voices[f.voice_count];
++        PrepareNativeAXADPCMVoiceFrameInto(memory,voice_address,coefficients,voice,verify);
++        std::copy_backward(position,seen.begin()+f.voice_count,seen.begin()+f.voice_count+1);
++        *position=voice_address;++f.voice_count;
+         if(voice.was_running) {
+             ++f.active_voices;
+-            for(unsigned c=0;c<12;++c)for(unsigned i=0;i<96;++i)
++            // A bus the voice did not mix holds zeros, and StoreBus(x+0)==x for a stored bus word.
++            for(unsigned c=0;c<12;++c)if(voice.mixed_buses&(1u<<c))for(unsigned i=0;i<96;++i)
+                 buses[c][i]=StoreBus(std::int64_t(buses[c][i])+voice.buses[c][i]);
+             // 0CB3/0CD0 accumulate a voice's selected remote channels in place.
+             if(voice.remote_enabled)for(unsigned c=0;c<8;++c)if(voice.remote.mixed&(1u<<c))
+@@ -180,7 +218,7 @@ NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
+                     remote_buses[c][i]=NativeAXMixAccumulate(remote_buses[c][i],voice.remote.channels[c][i]);
+             f.written_bytes+=voice.parameters_after.size();
+         }
+-        voice_address=Word(voice.parameters_before.data());f.voices.push_back(voice);
++        voice_address=Word(voice.parameters_before.data());
+     }
+     if(f.voice_count!=96)
+         Fail(NativeAXFailure::InvalidVoiceChain,process,"AX staged frame requires the complete original96-PB owner");
+@@ -245,28 +283,53 @@ NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
+     std::vector<unsigned char> pcm(384);
+     for(unsigned i=0;i<192;++i)PutHalf(pcm.data()+i*2,std::uint16_t(packed[i]));
+     Stage(f,memory,Address(output,3),std::move(pcm));
+-    ValidateNativeAXCommandCommit(memory,f,history);return f;
++    if(verify)ValidateNativeAXCommandCommit(memory,f,history);
++    else ValidateGeometry(f,history,false);
+ }
+ NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
+     NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes,
+     const NativeAXCommandHistory& history,const NativeAXSuppliedCoefficientROM& coefficients) {
+     return PrepareNativeAXCommandFrame(memory,address,bytes,history,coefficients.View());
+ }
+-void ValidateNativeAXCommandCommit(NativeDSPMemoryEndpoint memory,const NativeAXPreparedCommandFrame& f,
+-                                  const NativeAXCommandHistory& history) {
++namespace {
++// The address-only part of the whole-frame commit validation: no memory is read.
++void ValidateGeometry(const NativeAXPreparedCommandFrame& f,const NativeAXCommandHistory& history,bool voice_pairs) {
+     if(!(history==f.before))throw std::runtime_error("AX device history changed before whole-frame commit");
+     // Typed memory transport permits interior byte transfers. It does not
+     // certify320-byte PB starts, so prove all participants disjoint explicitly
+-    // before validation/commit of any individual PB or output span.
++    // before validation/commit of any individual PB or output span. (Distinct
++    // voices were already proven disjoint while the PB chain was walked.)
+     for(std::size_t i=0;i<f.voices.size();++i) {
+         const auto& voice=f.voices[i];
+-        for(std::size_t j=0;j<i;++j)
++        if(voice_pairs)for(std::size_t j=0;j<i;++j)
+             if(Overlap(voice.parameter_address,320,f.voices[j].parameter_address,320))
+                 throw std::runtime_error("AX source PB records overlap before whole-frame commit");
+         for(const auto& r:f.reads)
+             if(Overlap(voice.parameter_address,320,r.address,r.before.size()))
+                 throw std::runtime_error("AX source PB aliases a command/contributor before whole-frame commit");
+     }
++    for(const auto& w:f.writes) {
++        for(std::size_t i=0;i<f.reads.size();++i) {
++            const auto& r=f.reads[i];const auto end=std::uint64_t(w.address)+w.after.size();
++            if(std::uint64_t(w.address)<std::uint64_t(r.address)+r.before.size() && r.address<end) {
++                // The original prior-surround operand is the same source
++                // in/out span. Original CL/Studio/AUX-return owners are not.
++                if(i!=2 || w.address!=r.address || w.after.size()!=r.before.size())
++                    throw std::runtime_error("AX output aliases an original readonly command contributor");
++            }
++        }
++        for(const auto& voice:f.voices) {
++            const auto end=std::uint64_t(w.address)+w.after.size();
++            if(std::uint64_t(w.address)<std::uint64_t(voice.parameter_address)+320 && voice.parameter_address<end)
++                throw std::runtime_error("AX output aliases its original parameter-block owner");
++        }
++    }
++}
++}
++void ValidateNativeAXCommandCommit(NativeDSPMemoryEndpoint memory,const NativeAXPreparedCommandFrame& f,
++                                  const NativeAXCommandHistory& history) {
++    ValidateGeometry(f,history,true);
++    if(!f.captured_before)return;
+     for(const auto& r:f.reads)
+         if(Read(memory,r.address,r.before.size())!=r.before)
+             throw std::runtime_error("AX source command/contributor changed before whole-frame commit");
+@@ -283,26 +346,16 @@ void ValidateNativeAXCommandCommit(NativeDSPMemoryEndpoint memory,const NativeAX
+         DSPBackendValidateMemory(memory,w.address,w.after.size(),true);
+         if(Read(memory,w.address,w.before.size())!=w.before)
+             throw std::runtime_error("AX source output/AUX owner changed before whole-frame commit");
+-        for(std::size_t i=0;i<f.reads.size();++i) {
+-            const auto& r=f.reads[i];const auto end=std::uint64_t(w.address)+w.after.size();
+-            if(std::uint64_t(w.address)<std::uint64_t(r.address)+r.before.size() && r.address<end) {
+-                // The original prior-surround operand is the same source
+-                // in/out span. Original CL/Studio/AUX-return owners are not.
+-                if(i!=2 || w.address!=r.address || w.after.size()!=r.before.size())
+-                    throw std::runtime_error("AX output aliases an original readonly command contributor");
+-            }
+-        }
+-        for(const auto& voice:f.voices) {
+-            const auto end=std::uint64_t(w.address)+w.after.size();
+-            if(std::uint64_t(w.address)<std::uint64_t(voice.parameter_address)+320 && voice.parameter_address<end)
+-                throw std::runtime_error("AX output aliases its original parameter-block owner");
+-        }
+     }
+ }
+ void CommitNativeAXCommandFrame(NativeDSPMemoryEndpoint memory,const NativeAXPreparedCommandFrame& f,
+                                NativeAXCommandHistory& history) {
+-    ValidateNativeAXCommandCommit(memory,f,history);
+-    for(const auto& voice:f.voices)if(voice.was_running)CommitNativeAXVoiceFrame(memory,voice);
++    CommitNativeAXCommandFrame(memory,f,history,true);
++}
++void CommitNativeAXCommandFrame(NativeDSPMemoryEndpoint memory,const NativeAXPreparedCommandFrame& f,
++                               NativeAXCommandHistory& history,bool validate) {
++    if(validate)ValidateNativeAXCommandCommit(memory,f,history);
++    for(const auto& voice:f.voices)if(voice.was_running)CommitNativeAXVoiceFrame(memory,voice,validate);
+     for(const auto& w:f.writes)DSPBackendWriteMemory(memory,w.address,w.after.data(),w.after.size());
+     history=f.after;
+ }
+diff --git a/src/platform/ax_frame_commands.h b/src/platform/ax_frame_commands.h
+index 16969009..0bf64290 100644
+--- a/src/platform/ax_frame_commands.h
++++ b/src/platform/ax_frame_commands.h
+@@ -62,6 +62,9 @@ struct NativeAXPreparedCommandFrame {
+     std::vector<NativeAXPreparedVoiceFrame> voices;
+     std::uint16_t consumed_words{}, voice_count{}, active_voices{}, aux_commands{};
+     std::uint32_t written_bytes{};
++    // False when prepared without source-stability verification: writes[].before is then empty and
++    // ValidateNativeAXCommandCommit only checks the address geometry.
++    bool captured_before{true};
+ };
+ // A staged normal-output hardware conformance slice. Genuine source order and
+ // source-owned AUX callback/ring transfers are retained. Nonzero prior surround,
+@@ -80,6 +83,26 @@ NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
+     NativeDSPMemoryEndpoint memory, std::uint32_t list_address, std::size_t bytes,
+     const NativeAXCommandHistory& history,
+     const NativeAXCoefficientView& coefficients);
++// Device-owner form. With verify_source_stability=false the prepare job does not re-read every command,
++// contributor, PB and output span to re-assert that nothing changed while it ran, and the commit does not
++// validate again: the device owner runs prepare and commit back to back and no other code can change that
++// memory in between. Address geometry (aliasing of outputs, PBs and contributors) is still checked, and
++// every staged store is still bus-checked before the first store. Output bytes are identical either way.
++NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
++    NativeDSPMemoryEndpoint memory, std::uint32_t list_address, std::size_t bytes,
++    const NativeAXCommandHistory& history,
++    const NativeAXCoefficientView& coefficients, bool verify_source_stability);
++// Prepares into a caller-retained frame (the device keeps one): its 96 voice slots are reused, so the roughly
++// 6 KB of per-voice working arrays are not zeroed and copied for every stopped voice of every frame. Only a
++// running voice's frame arrays (and only its mixed buses, see mixed_buses) are meaningful; the by-value entries
++// above prepare into a fresh frame. On an exception the frame content is unspecified.
++void PrepareNativeAXCommandFrameInto(NativeAXPreparedCommandFrame& frame,
++    NativeDSPMemoryEndpoint memory, std::uint32_t list_address, std::size_t bytes,
++    const NativeAXCommandHistory& history,
++    const NativeAXCoefficientView& coefficients, bool verify_source_stability);
++void CommitNativeAXCommandFrame(NativeDSPMemoryEndpoint memory,
++                               const NativeAXPreparedCommandFrame& frame,
++                               NativeAXCommandHistory& history, bool validate);
+ void ValidateNativeAXCommandCommit(NativeDSPMemoryEndpoint memory,
+                                   const NativeAXPreparedCommandFrame& frame,
+                                   const NativeAXCommandHistory& history);
+diff --git a/src/platform/ax_functional_device.cpp b/src/platform/ax_functional_device.cpp
+index 95cc3f5f..9c5b9d12 100644
+--- a/src/platform/ax_functional_device.cpp
++++ b/src/platform/ax_functional_device.cpp
+@@ -1,10 +1,16 @@
+ #include "platform/ax_functional_device.h"
++#include "platform/ax_perf.h"
+ #include "platform/os_audio_registers.h"
+ #include "platform/dsp_control_abi.h"
+ #include "platform/dsp_mailbox_abi.h"
+ #include <dolphin/ai.h>
+ #include "platform/ai.h"
+ #include "platform/interrupts.h"
++#ifdef MSCHARGED_AX_REFERENCE_CHECK
++#include "platform/ax_reference/ax_frame_commands.h"
++#endif
++#include <cstdio>
++#include <cstdlib>
+ #include <limits>
+ #include <stdexcept>
+ #include <thread>
+@@ -19,14 +25,104 @@ std::uint32_t Address(const NativeAXCommand& command,unsigned at=0) {
+ bool Contains(std::uint32_t base,std::size_t bytes,std::uint32_t at,std::size_t count) {
+     return at>=base&&std::uint64_t(at)+count<=std::uint64_t(base)+bytes;
+ }
++const bool g_ax_hash_on=[]{const char* a=std::getenv("MSCHARGED_AXHASH");const char* b=std::getenv("MSCHARGED_AXHASH_LOG");return (a&&*a&&*a!='0')||(b&&*b);}();
++// Diagnostic only (MSCHARGED_AXHASH / MSCHARGED_AXHASH_LOG): FNV-1a chain over everything a frame will store (voice PBs, output spans,
++// history). Optional per-frame log in MSCHARGED_AXHASH_LOG, one "<frame index> <chain hash>" line per frame.
++void AXPerfFrameHash(const NativeAXPreparedCommandFrame& frame) {
++    static std::uint64_t chain=1469598103934665603ull,index=0;
++    static std::FILE* log=[]{const char* p=std::getenv("MSCHARGED_AXHASH_LOG");return p&&*p?std::fopen(p,"w"):nullptr;}();
++    const auto mix=[&](const void* data,std::size_t bytes) {
++        const auto* p=static_cast<const unsigned char*>(data);
++        for(std::size_t i=0;i<bytes;++i){chain^=p[i];chain*=1099511628211ull;}
++    };
++    for(const auto& v:frame.voices){mix(v.parameters_after.data(),v.parameters_after.size());}
++    for(const auto& w:frame.writes){mix(&w.address,sizeof(w.address));mix(w.after.data(),w.after.size());}
++    {const auto& a=frame.after;mix(&a.master,2);mix(&a.aux_a,2);mix(&a.aux_b,2);mix(&a.aux_c,2);mix(&a.compressor_counter,2);mix(&a.compressor_counter_known,1);}
++    g_ax_perf.frame_hash.store(chain,std::memory_order_relaxed);
++    if(log){std::fprintf(log,"%llu %016llx\n",(unsigned long long)index,(unsigned long long)chain);std::fflush(log);}
++    ++index;
++}
++}
++
++#ifdef MSCHARGED_AX_REFERENCE_CHECK
++namespace {
++const bool g_ax_ref_on=[]{const char* v=std::getenv("MSCHARGED_AXREF");return v&&*v&&*v!='0';}();
++std::uint64_t g_ax_ref_frames=0;
++[[noreturn]] void RefMismatch(const char* what,std::uint64_t frame,long index=-1) {
++    std::fprintf(stderr,"[axref] MISMATCH at frame %llu: %s (index %ld)\n",(unsigned long long)frame,what,index);
++    std::fflush(stderr);std::abort();
++}
++// Runs the original (unoptimized) prepare on the same memory and compares every field of the result with
++// the optimized prepare's. Prepare only reads, so both see exactly the same inputs.
++void CompareWithReference(NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes,
++                          const NativeAXCommandHistory& history,const NativeAXCoefficientView& view,
++                          const NativeAXPreparedCommandFrame& f) {
++    namespace R=mscharged::platform::axref;
++    const std::uint64_t n=g_ax_ref_frames;
++    const R::NativeAXCommandHistory h{history.master,history.aux_a,history.aux_b,history.aux_c,
++        history.compressor_counter,history.compressor_counter_known};
++    const R::NativeAXCoefficientView rv(static_cast<R::NativeAXCoefficientPolicy>(view.Policy()),&view,
++        [](const void* c,std::uint16_t bank,std::uint16_t fraction) {
++            return static_cast<const NativeAXCoefficientView*>(c)->Row(bank,fraction);
++        });
++    R::NativeAXPreparedCommandFrame r;
++    try {r=R::PrepareNativeAXCommandFrame(memory,address,bytes,h,rv);}
++    catch(const std::exception& e) {std::fprintf(stderr,"[axref] reference threw: %s\n",e.what());RefMismatch("reference prepare threw",n);}
++    if(f.consumed_words!=r.consumed_words)RefMismatch("consumed_words",n);
++    if(f.voice_count!=r.voice_count)RefMismatch("voice_count",n);
++    if(f.active_voices!=r.active_voices)RefMismatch("active_voices",n);
++    if(f.aux_commands!=r.aux_commands)RefMismatch("aux_commands",n);
++    if(f.written_bytes!=r.written_bytes)RefMismatch("written_bytes",n);
++    const auto same=[](const NativeAXCommandHistory& a,const R::NativeAXCommandHistory& b) {
++        return a.master==b.master&&a.aux_a==b.aux_a&&a.aux_b==b.aux_b&&a.aux_c==b.aux_c&&
++               a.compressor_counter==b.compressor_counter&&a.compressor_counter_known==b.compressor_counter_known;
++    };
++    if(!same(f.before,r.before)||!same(f.after,r.after))RefMismatch("history",n);
++    if(f.reads.size()!=r.reads.size())RefMismatch("reads.size",n);
++    for(std::size_t i=0;i<f.reads.size();++i)
++        if(f.reads[i].address!=r.reads[i].address||f.reads[i].before!=r.reads[i].before)RefMismatch("reads",n,long(i));
++    if(f.writes.size()!=r.writes.size())RefMismatch("writes.size",n);
++    for(std::size_t i=0;i<f.writes.size();++i)
++        if(f.writes[i].address!=r.writes[i].address||f.writes[i].after!=r.writes[i].after)RefMismatch("writes",n,long(i));
++    if(f.voices.size()!=r.voices.size())RefMismatch("voices.size",n);
++    for(std::size_t i=0;i<f.voices.size();++i) {
++        const auto& a=f.voices[i];const auto& b=r.voices[i];
++        if(a.parameter_address!=b.parameter_address)RefMismatch("voice address",n,long(i));
++        if(a.parameters_before!=b.parameters_before)RefMismatch("voice parameters_before",n,long(i));
++        if(a.parameters_after!=b.parameters_after)RefMismatch("voice parameters_after",n,long(i));
++        if(a.was_running!=b.was_running||a.end_reached!=b.end_reached||a.loops!=b.loops||
++           a.decoded_samples!=b.decoded_samples||a.remote_enabled!=b.remote_enabled)RefMismatch("voice flags",n,long(i));
++        // A reused voice slot keeps stale working arrays: only a running voice's frame data is meaningful, and of
++        // its buses only the mixed ones (every other bus of the reference voice must be all zero).
++        if(!a.was_running)continue;
++        for(std::size_t bus=0;bus<a.buses.size();++bus) {
++            if(a.mixed_buses&(1u<<bus)) {
++                if(a.buses[bus]!=b.buses[bus])RefMismatch("voice bus",n,long(i*100+bus));
++            } else {
++                for(const auto sample:b.buses[bus])if(sample!=0)RefMismatch("voice bus outside mixed_buses is not zero",n,long(i*100+bus));
++            }
++        }
++        if(a.resampled!=b.resampled||a.enveloped!=b.enveloped||a.filtered!=b.filtered)RefMismatch("voice samples",n,long(i));
++        if(a.remote_enabled&&(a.remote.channels!=b.remote.channels||a.remote.resampled!=b.remote.resampled||
++                              a.remote.mixed!=b.remote.mixed))
++            RefMismatch("voice remote",n,long(i));
++    }
++    ++g_ax_ref_frames;
++    g_ax_perf.ref_frames.fetch_add(1,std::memory_order_relaxed);
++}
+ }
++#endif
+ struct NativeAXFunctionalDevice::State {
+     NativeDSPMemoryEndpoint memory;
+     NativeAXFunctionalBindings bindings;
+     NativeAXNativeFilter filter;
+     NativeAXCommandHistory history{};
+     std::thread::id owner=std::this_thread::get_id();
+-    std::uint64_t initializations{},processed{};
++    std::uint64_t initializations{},processed{},validated_epoch{};
++    bool bindings_validated{};
++    NativeAXPreparedCommandFrame frame; // retained: its 96 voice slots are reused every frame
++    // MSCHARGED_AXCHECK=1 restores the paranoid per-frame re-validation (see ax_frame_commands.h).
++    const bool paranoid=[]{const char* v=std::getenv("MSCHARGED_AXCHECK");return v&&*v&&*v!='0';}();
+     std::uint16_t active{},aux{};
+     bool initialized{},retired{};
+     void RequireOwner() const {
+@@ -96,24 +192,46 @@ struct NativeAXFunctionalDevice::State {
+     }
+     static void Reset(void* context) {
+         auto& s=*static_cast<State*>(context);s.RequireOwner();
+-        s.history={};s.initialized=false;s.processed=0;s.active=s.aux=0;
++        s.history={};s.initialized=false;s.processed=0;s.active=s.aux=0;s.bindings_validated=false;
+     }
+     static NativeAXDeviceFrameResult Process(void* context,NativeDSPMemoryEndpoint memory,
+                                              std::uint32_t address,std::size_t bytes) {
+         auto& s=*static_cast<State*>(context);s.RequireOwner();
+         if(!s.initialized||memory.generation!=s.memory.generation)
+             throw std::logic_error("functional AX processing precedes its actual native initialization");
+-        s.ValidateBindings();
++        const auto t0=g_ax_perf_on?AXPerfNowNs():0;
++        // The static spans stay pinned and live until a pin changes; re-prove them then (and every 256th frame).
++        const auto epoch=DSPBackendMemoryEpoch();
++        if(s.paranoid||!s.bindings_validated||epoch!=s.validated_epoch||(s.processed&255)==0) {
++            s.ValidateBindings();s.validated_epoch=epoch;s.bindings_validated=true;
++        } else s.RequireOwner();
++        const auto t1=g_ax_perf_on?AXPerfNowNs():0;
+         if(bytes!=128||(address!=s.bindings.addresses[0]&&address!=s.bindings.addresses[0]+128))
+             throw std::invalid_argument("functional AX request is not an actual source command slot");
+         s.ValidateList(ReadNativeAXCommandList(memory,address,bytes));
+-        auto frame=PrepareNativeAXCommandFrame(memory,address,bytes,s.history,s.filter.View());
++        const auto t2=g_ax_perf_on?AXPerfNowNs():0;
++        auto& frame=s.frame;
++        PrepareNativeAXCommandFrameInto(frame,memory,address,bytes,s.history,s.filter.View(),s.paranoid);
++#ifdef MSCHARGED_AX_REFERENCE_CHECK
++        if(g_ax_ref_on)CompareWithReference(memory,address,bytes,s.history,s.filter.View(),frame);
++#endif
++        const auto t3=g_ax_perf_on?AXPerfNowNs():0;
+         for(const auto& voice:frame.voices) {
+             s.Role(1,voice.parameter_address,320);
+             if((voice.parameter_address-s.bindings.addresses[1])%320)
+                 throw std::invalid_argument("functional AX PB has a non-original record boundary");
+         }
+-        CommitNativeAXCommandFrame(memory,frame,s.history);
++        if(g_ax_perf_on) {
++            AXPerfAdd(g_ax_perf.voices,frame.voices.size());AXPerfAdd(g_ax_perf.active_voices,frame.active_voices);
++            for(const auto& v:frame.voices)AXPerfAdd(g_ax_perf.decoded_samples,v.decoded_samples);
++        }
++        if(g_ax_hash_on)AXPerfFrameHash(frame);
++        CommitNativeAXCommandFrame(memory,frame,s.history,s.paranoid);
++        if(g_ax_perf_on) {
++            const auto t4=AXPerfNowNs();
++            AXPerfAdd(g_ax_perf.bind_ns,t1-t0);AXPerfAdd(g_ax_perf.list_ns,t2-t1);
++            AXPerfAdd(g_ax_perf.prepare_ns,t3-t2);AXPerfAdd(g_ax_perf.commit_ns,t4-t3);
++        }
+         ++s.processed;s.active=frame.active_voices;s.aux=frame.aux_commands;
+         return {frame.consumed_words,std::uint16_t(frame.voice_count-frame.active_voices),96,18,frame.written_bytes};
+     }
+diff --git a/src/platform/ax_perf.h b/src/platform/ax_perf.h
+new file mode 100644
+index 00000000..cc5b4066
+--- /dev/null
++++ b/src/platform/ax_perf.h
+@@ -0,0 +1,27 @@
++#pragma once
++// Env-gated (MSCHARGED_AXSTATS=1) counters for the native AX/DSP emulation. One line per second on stderr.
++// Off by default: a single predictable branch per counted event.
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++
++namespace mscharged::platform {
++struct AXPerfCounters {
++    std::atomic<std::uint64_t> frames{}, frame_ns{}, voices{}, active_voices{}, decoded_samples{};
++    std::atomic<std::uint64_t> read_calls{}, read_bytes{}, sample_calls{}, sample_bytes{}, write_calls{}, write_bytes{},
++        validate_calls{};
++    std::atomic<std::uint64_t> poll_calls{}, frame_hash{};
++    std::atomic<std::uint64_t> ref_frames{}, bind_ns{}, list_ns{}, prepare_ns{}, commit_ns{};
++};
++inline AXPerfCounters g_ax_perf;
++inline const bool g_ax_perf_on = [] {
++    const char* v = std::getenv("MSCHARGED_AXSTATS");
++    return v && *v && *v != '0';
++}();
++inline void AXPerfAdd(std::atomic<std::uint64_t>& c, std::uint64_t n = 1) {
++    if (g_ax_perf_on) c.fetch_add(n, std::memory_order_relaxed);
++}
++// Prints and resets the per-second line when a second has elapsed. Called after each AX frame.
++void AXPerfTick();
++std::uint64_t AXPerfNowNs();
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_active_voice.cpp b/src/platform/ax_reference/ax_active_voice.cpp
+new file mode 100644
+index 00000000..21ff52df
+--- /dev/null
++++ b/src/platform/ax_reference/ax_active_voice.cpp
+@@ -0,0 +1,303 @@
++// REFERENCE COPY of the original (unoptimized) ax_active_voice.cpp from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#include "platform/ax_reference/ax_active_voice.h"
++#include <algorithm>
++#include <cstring>
++#include <string>
++
++namespace mscharged::platform::axref {
++namespace {
++std::uint16_t Half(const unsigned char* p) { return (std::uint16_t(p[0]) << 8) | p[1]; }
++std::uint32_t Word(const unsigned char* p) { return (std::uint32_t(Half(p)) << 16) | Half(p + 2); }
++std::int16_t Signed(std::uint16_t bits) {
++    std::int16_t value; std::memcpy(&value, &bits, sizeof(value)); return value;
++}
++void PutHalf(unsigned char* p, std::uint16_t value) {
++    p[0] = static_cast<unsigned char>(value >> 8); p[1] = static_cast<unsigned char>(value);
++}
++void PutWord(unsigned char* p, std::uint32_t value) {
++    PutHalf(p, static_cast<std::uint16_t>(value >> 16)); PutHalf(p + 2, static_cast<std::uint16_t>(value));
++}
++std::int64_t Floor(std::int64_t value, std::int64_t divisor) {
++    return value >= 0 ? value / divisor : -((-value + divisor - 1) / divisor);
++}
++std::int16_t Saturate(std::int64_t value) {
++    return static_cast<std::int16_t>(std::max<std::int64_t>(-32768, std::min<std::int64_t>(32767, value)));
++}
++[[noreturn]] void Fail(NativeAXVoiceFailure reason, const char* message) {
++    throw NativeAXVoiceError(reason, message);
++}
++// Owned06AB..06C2 one-pole LPF. Both callers run it with SET15/M2/SET40 live
++// (set at0356/034C/0364), so the AX1.L coefficient operands of MULX/MADDX are
++// unsigned16 while PCM/history in AX0.H stay signed. The two products are
++// added before dropping15 fractional bits; the saturated accumulator middle
++// is both output and feedback. There is no added rounding.
++std::int16_t LowPass06AB(const std::array<std::int16_t, 96>& input, std::array<std::int16_t, 96>& output,
++                         std::int16_t history, std::uint16_t a0, std::uint16_t b0) {
++    for (std::size_t i = 0; i < 96; ++i) {
++        history = Saturate(Floor(std::int64_t(input[i]) * a0 + std::int64_t(history) * b0, 32768));
++        output[i] = history;
++    }
++    return history;
++}
++struct Bus { unsigned enabled, ramp, depop; };
++constexpr std::array<Bus, 12> MixBuses{{
++    {0,2,0},{1,2,4},{16,18,1},{17,18,5},{21,23,2},{22,23,6},
++    {26,28,3},{27,28,7},{3,4,8},{19,20,9},{24,25,10},{29,30,11}
++}};
++}
++void NativeAXSuppliedCoefficientROM::Load(NativeDSPMemoryEndpoint endpoint,
++                                         std::uint32_t address) {
++    if (address & 1) throw std::invalid_argument("AX coefficient DROM must be BE16 aligned");
++    std::array<unsigned char, 4096> wire{};
++    DSPBackendReadMemory(endpoint, address, wire.data(), wire.size());
++    std::array<std::int16_t, 2048> next{};
++    for (std::size_t i = 0; i < next.size(); ++i) next[i] = Signed(Half(wire.data() + i * 2));
++    words_ = next; loaded_ = true;
++}
++std::array<std::int16_t, 4> NativeAXSuppliedCoefficientROM::Row(
++    std::uint16_t bank, std::uint16_t fraction) const {
++    if (!loaded_) Fail(NativeAXVoiceFailure::MissingCoefficientBank,
++                       "AX four-tap source selection requires supplied authentic coefficient DROM");
++    if (bank > 2) Fail(NativeAXVoiceFailure::UnknownCoefficientBank, "AX coefficient selection is outside the three original banks");
++    // Owned axDspSlave DB A: 1000/1200/1400; 0739..073D: fraction >>9,
++    // <<18 then AC1.M -> AR3, giving128 phases and four consecutive words.
++    const auto at = std::size_t(bank) * 512 + std::size_t(fraction >> 9) * 4;
++    return {words_[at], words_[at + 1], words_[at + 2], words_[at + 3]};
++}
++NativeAXCoefficientView NativeAXSuppliedCoefficientROM::View() const noexcept {
++    return {NativeAXCoefficientPolicy::SuppliedBank,this,
++        [](const void* context,std::uint16_t bank,std::uint16_t fraction) {
++            return static_cast<const NativeAXSuppliedCoefficientROM*>(context)->Row(bank,fraction);
++        }};
++}
++NativeAXRemoteBank NativeAXRemoteCoefficientBank(const NativeAXCoefficientView& coefficients) {
++    NativeAXRemoteBank bank{};
++    for (std::uint16_t phase = 0; phase < 128; ++phase) {
++        const auto row = coefficients.Row(0, static_cast<std::uint16_t>(phase << 9));
++        std::copy(row.begin(), row.end(), bank.begin() + phase * 4);
++    }
++    return bank;
++}
++NativeAXRemoteVoice NativeAXProcessRemoteVoice(const std::array<std::int16_t, 96>& filtered,
++                                               unsigned char* pb, const NativeAXRemoteBank& bank0) {
++    NativeAXRemoteVoice result;
++    // 03A7..03CB: rmtIIR selector2 is the06C3 biquad, any other nonzero
++    // value the shared06AB LPF (SET15 still live). Its output, or a plain
++    // copy, lands at0D0C behind the four rmtSrc history samples at0D08.
++    std::array<std::int16_t, 100> window{};
++    for (std::size_t t = 0; t < 4; ++t) window[t] = Signed(Half(pb + 0x10c + t * 2));
++    std::array<std::int16_t, 96> input = filtered;
++    if (const auto iir = Half(pb + 0x114)) {
++        if (iir == 2)
++            Fail(NativeAXVoiceFailure::UnsupportedRemote, "AX active remote biquad processing is unqualified");
++        const auto history = LowPass06AB(filtered, input, Signed(Half(pb + 0x116)),
++                                         Half(pb + 0x118), Half(pb + 0x11a));
++        PutHalf(pb + 0x116, static_cast<std::uint16_t>(history));
++    }
++    std::copy(input.begin(), input.end(), window.begin() + 4);
++    // 03CC..03FD (CLR15, M2, SET40): the position starts at rmtSrc's stored
++    // fraction and ADDAX advances it by0x00055555 before each of18 outputs.
++    // Integer part indexes the window; fraction>>9 selects a bank-0 row. Four
++    // signed doubled products are summed by MULAC/ADDP and stored as the
++    // saturated AC1.M. The final window position and fraction are the next
++    // history (03F3..03FD).
++    std::uint32_t position = Half(pb + 0x10a);
++    for (std::size_t n = 0; n < 18; ++n) {
++        position += 0x55555;
++        const auto index = position >> 16;
++        const auto* taps = bank0.data() + ((position & 0xffff) >> 9) * 4;
++        std::int64_t product = 0;
++        for (std::size_t t = 0; t < 4; ++t) product += std::int64_t(window[index + t]) * taps[t] * 2;
++        result.resampled[n] = Saturate(Floor(product, 65536));
++    }
++    const auto last = position >> 16;
++    PutHalf(pb + 0x10a, static_cast<std::uint16_t>(position));
++    for (std::size_t t = 0; t < 4; ++t)
++        PutHalf(pb + 0x10c + t * 2, static_cast<std::uint16_t>(window[last + t]));
++    // 02CD..0310 select IRAM[0DB3 + ((rmtMixerCtrl >> 2*channel) & 3)]: 0CB0
++    // none, 0CB3 constant, 0CD0 ramp (twice) for main0, aux0, main1, aux1, ...
++    // 03FE..0446 call them with SET15 (unsigned volume, signed sample) and M2.
++    // A ramp volume advances by delta modulo2^16 per sample and is stored back
++    // after18 samples. The last product's saturated AC0.M is the channel's
++    // rmtDpop; the none handler stores zero.
++    const auto control = Half(pb + 0xd8);
++    for (std::size_t ch = 0; ch < 8; ++ch) {
++        const auto handler = (control >> (ch * 2)) & 3;
++        const std::size_t depop = (ch % 2 ? 0x102 : 0xfa) + (ch / 2) * 2;
++        if (!handler) {
++            PutHalf(pb + depop, 0);
++            continue;
++        }
++        auto volume = Half(pb + 0xda + ch * 4);
++        const auto delta = Half(pb + 0xdc + ch * 4);
++        for (std::size_t i = 0; i < 18; ++i) {
++            result.channels[ch][i] =
++                static_cast<std::int32_t>(Floor(std::int64_t(result.resampled[i]) * volume, 32768));
++            if (handler >= 2) volume = static_cast<std::uint16_t>(volume + delta);
++        }
++        if (handler >= 2) PutHalf(pb + 0xda + ch * 4, volume);
++        PutHalf(pb + depop, static_cast<std::uint16_t>(Saturate(result.channels[ch].back())));
++        result.mixed |= static_cast<std::uint8_t>(1u << ch);
++    }
++    return result;
++}
++NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
++    NativeDSPMemoryEndpoint endpoint, std::uint32_t address,
++    const NativeAXCoefficientView& coefficients) {
++    NativeAXPreparedVoiceFrame result; result.parameter_address = address;
++    DSPBackendReadMemory(endpoint, address, result.parameters_before.data(), result.parameters_before.size());
++    if (Word(result.parameters_before.data() + 4) != address)
++        Fail(NativeAXVoiceFailure::InvalidSelfAddress, "AX voice PB has no genuine self address");
++    auto state = ReadNativeAXADPCMState(endpoint, address);
++    // There is no whole-job lease in per-transfer DSP memory calls. Detect a
++    // source mutation even during these two reads; the original device fence
++    // must still exclude all CPU changes for this whole prepare/commit job.
++    std::array<unsigned char, 320> verified{};
++    DSPBackendReadMemory(endpoint, address, verified.data(), verified.size());
++    if (verified != result.parameters_before)
++        Fail(NativeAXVoiceFailure::SourceChanged, "AX source PB changed while preparing its device frame");
++    result.parameters_after = result.parameters_before;
++    result.was_running = state.running;
++    if (!state.running) return result;
++    if (state.src_select > 1)
++        Fail(NativeAXVoiceFailure::UnsupportedSRC,
++             ("AX active SRC selector=" + std::to_string(state.src_select) +
++              " ratio16.16=" + std::to_string(state.ratio) +
++              " fraction=" + std::to_string(state.fraction) +
++              "; direct/unknown processing is unqualified").c_str());
++    if (state.src_select == 0)
++        coefficients.Row(state.coefficient_select, state.fraction); // Fail before any sample reads/stores.
++    if (state.ratio > 0x40000)
++        Fail(NativeAXVoiceFailure::UnsupportedRate, "AX active slice qualifies ratios0..4 only, never clamps a source ratio");
++    if (state.gain != 0)
++        Fail(NativeAXVoiceFailure::UnsupportedGain, "AX ADPCM nonzero accelerator gain is outside the owned sample proof");
++    const auto* before = result.parameters_before.data();
++    if (Half(before + 0x44)) Fail(NativeAXVoiceFailure::UnsupportedITD, "AX active ITD/history processing is unqualified");
++    if (Half(before + 0xc2))
++        Fail(NativeAXVoiceFailure::UnsupportedFilter, "AX active biquad processing is unqualified");
++    const bool remote = Half(before + 0xd6) != 0;
++    if (remote) {
++        // Fail before any store: rmtIIR biquad and a missing bank-0 row.
++        if (Half(before + 0x114) == 2)
++            Fail(NativeAXVoiceFailure::UnsupportedRemote, "AX active remote biquad processing is unqualified");
++        coefficients.Row(0, Half(before + 0x10a));
++    }
++    const auto mixer = Word(before + 0x0c);
++    if (mixer & ~std::uint32_t(0x7fff001f))
++        Fail(NativeAXVoiceFailure::UnsupportedMixer, "AX DPL2/reserved mixer selection is outside this voice slice");
++
++    auto history = state.src_history;
++    std::uint32_t fraction = state.fraction;
++    auto* after = result.parameters_after.data();
++    // Original active voice processing clears12 main and8 remote depop cells
++    // at firmware038E..0395. Stopped voices skip these stores entirely.
++    std::fill(after + 0x52, after + 0x6a, 0);
++    std::fill(after + 0xfa, after + 0x10a, 0);
++    for (std::size_t i = 0; i < 96; ++i) {
++        const auto position = fraction + state.ratio;
++        const auto count = position >> 16;
++        fraction = position & 0xffff;
++        for (std::uint32_t n = 0; n < count; ++n) {
++            std::int16_t sample = 0;
++            if (state.running) {
++                const auto decoded = DecodeNativeAXRawADPCM(endpoint, state, 1);
++                state = decoded.next;
++                sample = decoded.samples[0];
++                result.decoded_samples += decoded.samples_decoded;
++                result.loops += decoded.loops;
++                result.end_reached |= decoded.end_reached;
++            }
++            // Original end IRQ F61..F71 switches AR2 to the initialized zero
++            // cell0CE9 for a nonloop voice; the rest of its96-sample FIR/VE
++            // frame still executes. Its accelerator histories stay terminal.
++            std::rotate(history.begin(), history.begin() + 1, history.end());
++            history.back() = sample;
++        }
++        if (state.src_select == 0) {
++            const auto taps = coefficients.Row(state.coefficient_select, static_cast<std::uint16_t>(fraction));
++            std::int64_t product = 0;
++            for (std::size_t t = 0; t < 4; ++t) product += std::int64_t(history[t]) * taps[t] * 2;
++            // Firmware0744..074A: four signed products, ADDP, saturated AC1.M
++            // store in40-bit mode. No added rounding or float interpolation.
++            result.resampled[i] = Saturate(Floor(product, 65536));
++        } else {
++            // Original076D..07AE selects unsigned low multiply operands and
++            // no product shift. The circular history pointer names its first
++            // two chronological cells after the carry reads. At zero phase
++            // 0795 copies the first cell; 0799..079D adds signedPCM * unsigned
++            // (65536-phase) and signedPCM * unsigned phase before AC1.M drops
++            // the low16 bits. This path neither reads nor substitutes DROM.
++            result.resampled[i] = fraction == 0 ? history[0] :
++                Saturate(Floor(std::int64_t(history[0]) * (65536 - fraction) +
++                               std::int64_t(history[1]) * fraction, 65536));
++        }
++    }
++    state.fraction = static_cast<std::uint16_t>(fraction);
++    state.src_history = history;
++    PutHalf(after + 0x10, state.running ? 1 : 0);
++    PutWord(after + 0x7a, state.current_nibble);
++    PutHalf(after + 0xa0, state.predictor_scale);
++    PutHalf(after + 0xa2, static_cast<std::uint16_t>(state.history1));
++    PutHalf(after + 0xa4, static_cast<std::uint16_t>(state.history2));
++    PutHalf(after + 0xaa, state.fraction);
++    for (std::size_t i = 0; i < 4; ++i) PutHalf(after + 0xac + i * 2, static_cast<std::uint16_t>(history[i]));
++
++    auto envelope = Half(before + 0x6a);
++    const auto delta = Signed(Half(before + 0x6c));
++    for (std::size_t i = 0; i < 96; ++i) {
++        // Original034D..0374 makes96 unsigned16 VE values in16-bit mode,
++        // then signedPCM * unsignedVE in40-bit mode, with middle saturation.
++        result.enveloped[i] = Saturate(Floor(std::int64_t(result.resampled[i]) * envelope, 32768));
++        envelope = static_cast<std::uint16_t>(envelope + delta);
++    }
++    PutHalf(after + 0x6a, envelope);
++    result.filtered = result.enveloped;
++    if (Half(before + 0xba)) {
++        // The LPF follows VE and precedes mixing (firmware0375..0381).
++        const auto history = LowPass06AB(result.enveloped, result.filtered, Signed(Half(before + 0xbc)),
++                                         Half(before + 0xbe), Half(before + 0xc0));
++        PutHalf(after + 0xbc, static_cast<std::uint16_t>(history));
++    }
++    for (std::size_t bus = 0; bus < MixBuses.size(); ++bus) {
++        const auto& selected = MixBuses[bus];
++        if (!(mixer & (std::uint32_t(1) << selected.enabled))) continue;
++        auto volume = Half(before + 0x14 + bus * 4);
++        const auto volume_delta = Signed(Half(before + 0x16 + bus * 4));
++        const bool ramp = (mixer & (std::uint32_t(1) << selected.ramp)) != 0;
++        for (std::size_t i = 0; i < 96; ++i) {
++            result.buses[bus][i] = static_cast<std::int32_t>(Floor(std::int64_t(result.filtered[i]) * volume, 32768));
++            if (ramp) volume = static_cast<std::uint16_t>(volume + volume_delta);
++        }
++        if (ramp) PutHalf(after + 0x14 + bus * 4, volume);
++        // The actual mixer returns last signed contribution via AX0.L,
++        // saturated AC0.M in40-bit mode, for the original depop field.
++        PutHalf(after + 0x52 + selected.depop * 2,
++                static_cast<std::uint16_t>(Saturate(result.buses[bus].back())));
++    }
++    if (remote) {
++        result.remote = NativeAXProcessRemoteVoice(result.filtered, after, NativeAXRemoteCoefficientBank(coefficients));
++        result.remote_enabled = true;
++    }
++    return result;
++}
++NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
++    NativeDSPMemoryEndpoint endpoint,std::uint32_t address,
++    const NativeAXSuppliedCoefficientROM& coefficients) {
++    return PrepareNativeAXADPCMVoiceFrame(endpoint,address,coefficients.View());
++}
++void ValidateNativeAXVoiceCommit(NativeDSPMemoryEndpoint endpoint,
++                                const NativeAXPreparedVoiceFrame& frame) {
++    DSPBackendValidateMemory(endpoint, frame.parameter_address, frame.parameters_after.size(), true);
++    std::array<unsigned char, 320> current{};
++    DSPBackendReadMemory(endpoint, frame.parameter_address, current.data(), current.size());
++    if (current != frame.parameters_before)
++        Fail(NativeAXVoiceFailure::SourceChanged, "AX source PB changed before its original device completion boundary");
++}
++void CommitNativeAXVoiceFrame(NativeDSPMemoryEndpoint endpoint,
++                             const NativeAXPreparedVoiceFrame& frame) {
++    ValidateNativeAXVoiceCommit(endpoint, frame);
++    DSPBackendWriteMemory(endpoint, frame.parameter_address, frame.parameters_after.data(), frame.parameters_after.size());
++}
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_active_voice.h b/src/platform/ax_reference/ax_active_voice.h
+new file mode 100644
+index 00000000..9a84cad4
+--- /dev/null
++++ b/src/platform/ax_reference/ax_active_voice.h
+@@ -0,0 +1,113 @@
++// REFERENCE COPY of the original (unoptimized) ax_active_voice.h from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#pragma once
++#include "platform/ax_reference/ax_adpcm_samples.h"
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++
++namespace mscharged::platform::axref {
++enum class NativeAXVoiceFailure {
++    MissingCoefficientBank, UnknownCoefficientBank, UnsupportedSRC,
++    UnsupportedRate, UnsupportedITD, UnsupportedFilter, UnsupportedRemote,
++    UnsupportedMixer, UnsupportedGain, InvalidSelfAddress, SourceChanged
++};
++class NativeAXVoiceError : public std::runtime_error {
++public:
++    NativeAXVoiceError(NativeAXVoiceFailure reason, const char* message)
++        : std::runtime_error(message), reason_(reason) {}
++    NativeAXVoiceFailure reason() const noexcept { return reason_; }
++private:
++    NativeAXVoiceFailure reason_;
++};
++
++enum class NativeAXCoefficientPolicy { SuppliedBank, NativeWindowedSinc4TapV1 };
++class NativeAXNativeFilter;
++class NativeAXSuppliedCoefficientROM;
++// Borrowed immutable processing input, never device/bootstrap readiness. The
++// provider and its actual bytes/rows must outlive every prepared hardware job.
++class NativeAXCoefficientView {
++public:
++    NativeAXCoefficientPolicy Policy() const noexcept { return policy_; }
++    std::array<std::int16_t,4> Row(std::uint16_t bank,std::uint16_t fraction) const {
++        return row_(context_,bank,fraction);
++    }
++    // Reference copy only: public so the checker can wrap the optimized build's coefficient rows.
++    using Reader=std::array<std::int16_t,4>(*)(const void*,std::uint16_t,std::uint16_t);
++    NativeAXCoefficientView(NativeAXCoefficientPolicy policy,const void* context,Reader row)
++        : policy_(policy),context_(context),row_(row) {}
++private:
++    NativeAXCoefficientPolicy policy_;
++    const void* context_;
++    Reader row_;
++    friend class NativeAXNativeFilter;
++    friend class NativeAXSuppliedCoefficientROM;
++};
++
++// Caller-supplied complete coefficient DROM, read through the genuine bus.
++// No built-in coefficients, guessed phase-zero row or ratio-one bypass.
++// Loading bytes does not establish their authenticity or kernel readiness;
++// owner provenance belongs to the device attachment, not sample selection.
++class NativeAXSuppliedCoefficientROM {
++public:
++    void Load(NativeDSPMemoryEndpoint endpoint, std::uint32_t physical_address);
++    bool loaded() const noexcept { return loaded_; }
++    NativeAXCoefficientView View() const noexcept;
++    std::array<std::int16_t, 4> Row(std::uint16_t bank, std::uint16_t fraction) const;
++private:
++    std::array<std::int16_t, 2048> words_{};
++    bool loaded_{};
++};
++
++// Literal owned03A2..0446 remote speaker branch for one running voice, after
++// its main mixing and on the same filtered96 samples: rmtIIR off or the shared
++// 06AB LPF (the biquad selector fails explicitly), the fixed0x55555 four-tap
++// bank-0 resampler to18 samples, then the eight2-bit rmtMixerCtrl handlers
++// (0CB0 none, 0CB3 constant, 0CD0 ramp) for main0, aux0, ..., main3, aux3.
++// It updates only the PB remote fields0xD8..0x127 in `parameters`; callers add
++// `channels` to the frame's remote accumulators (NativeAXMixAccumulate).
++struct NativeAXRemoteVoice {
++    std::array<std::array<std::int32_t, 18>, 8> channels{};
++    std::array<std::int16_t, 18> resampled{};
++    std::uint8_t mixed{}; // bit per channel with a nonzero handler
++};
++// Coefficient DROM0x1000..0x11FF as the remote resampler reads it: 128 phase
++// rows of four words selected by fraction>>9 (03E7..03EB), the same row
++// selection both coefficient policies implement.
++using NativeAXRemoteBank = std::array<std::int16_t, 512>;
++NativeAXRemoteBank NativeAXRemoteCoefficientBank(const NativeAXCoefficientView& coefficients);
++NativeAXRemoteVoice NativeAXProcessRemoteVoice(const std::array<std::int16_t, 96>& filtered,
++                                               unsigned char* parameters, const NativeAXRemoteBank& bank0);
++
++// A staged source-PB transaction, not a command-list/output device. Process
++// every contributing voice and actual command prerequisites before committing
++// any PB/output; unsupported work cannot produce a SYNC/completion interrupt.
++// The source CPU exclusion and real pin/job lifetime must span prepare/commit.
++struct NativeAXPreparedVoiceFrame {
++    std::uint32_t parameter_address{};
++    std::array<unsigned char, 320> parameters_before{}, parameters_after{};
++    // Original mix field order: L/R, AuxA L/R, AuxB L/R, AuxC L/R,
++    // S/AuxAS/AuxBS/AuxCS. Signed contributions remain wider than PCM16.
++    std::array<std::array<std::int32_t, 96>, 12> buses{};
++    std::array<std::int16_t, 96> resampled{}, enveloped{}, filtered{};
++    NativeAXRemoteVoice remote{};
++    bool remote_enabled{};
++    std::uint32_t decoded_samples{};
++    std::uint16_t loops{};
++    bool was_running{}, end_reached{};
++};
++NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
++    NativeDSPMemoryEndpoint endpoint, std::uint32_t parameter_address,
++    const NativeAXSuppliedCoefficientROM& coefficients);
++// Explicit platform-policy entry. Exact source position/history/PB arithmetic
++// is shared with the supplied-bank entry; native rows never imply Wii parity.
++NativeAXPreparedVoiceFrame PrepareNativeAXADPCMVoiceFrame(
++    NativeDSPMemoryEndpoint endpoint, std::uint32_t parameter_address,
++    const NativeAXCoefficientView& coefficients);
++void ValidateNativeAXVoiceCommit(NativeDSPMemoryEndpoint endpoint,
++                                const NativeAXPreparedVoiceFrame& frame);
++void CommitNativeAXVoiceFrame(NativeDSPMemoryEndpoint endpoint,
++                             const NativeAXPreparedVoiceFrame& frame);
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_adpcm_samples.cpp b/src/platform/ax_reference/ax_adpcm_samples.cpp
+new file mode 100644
+index 00000000..ad76a7b5
+--- /dev/null
++++ b/src/platform/ax_reference/ax_adpcm_samples.cpp
+@@ -0,0 +1,150 @@
++// REFERENCE COPY of the original (unoptimized) ax_adpcm_samples.cpp from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#include "platform/ax_reference/ax_adpcm_samples.h"
++#include <revolution/thp/THPAdpcmStep.h>
++#include <cstdio>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++
++namespace mscharged::platform::axref {
++namespace {
++std::uint16_t Half(const unsigned char* p) {return (std::uint16_t(p[0])<<8)|p[1];}
++std::uint32_t Word(const unsigned char* p) {return (std::uint32_t(Half(p))<<16)|Half(p+2);}
++std::int16_t SignedHalf(const unsigned char* p) {
++    const auto bits=Half(p);std::int16_t value;std::memcpy(&value,&bits,sizeof(value));return value;
++}
++// Accelerator sample bytes for one decode block, fetched in windows under one
++// DSP memory lock each. Every byte equals DSPBackendReadSampleByte's; a byte
++// outside the window is read afresh, so unavailable bytes fail as before.
++class SampleBytes {
++public:
++    explicit SampleBytes(NativeDSPMemoryEndpoint endpoint) : endpoint_(endpoint) {}
++    unsigned char operator()(std::uint32_t address) {
++        if (address-start_>=count_) {
++            count_=DSPBackendReadSampleBytes(endpoint_,address,window_.data(),window_.size());
++            start_=address;
++        }
++        return window_[address-start_];
++    }
++private:
++    NativeDSPMemoryEndpoint endpoint_;
++    std::array<unsigned char,64> window_{};
++    std::uint32_t start_=0;
++    std::size_t count_=0;
++};
++std::int16_t DecodeSample(unsigned char nibble,const NativeAXADPCMState& state) {
++    const auto predictor=(state.predictor_scale>>4)&7;
++    const auto scale=state.predictor_scale&15;
++    const auto sample=nibble<8?std::int32_t(nibble):std::int32_t(nibble)-16;
++    const auto& coefficient=state.coefficients[predictor];
++    // The verified original THP integer DSP ADPCM equation is the same codec:
++    // two owned signed coefficients/histories, signed4-bit residual, Q11 round
++    // and signed16 saturation. Container parsing and accelerator addresses are
++    // separate here; an SP sample is never treated as a THP container.
++    const auto accumulator=THPAdpcmAccumulator(sample,scale,coefficient[0],coefficient[1],
++                                               state.history1,state.history2);
++    // Defined floor division is equivalent to the original arithmetic >>16,
++    // including negative rounded values, without a signed-shift assumption.
++    const auto pcm=accumulator>=0?accumulator/65536:-((-accumulator+65535)/65536);
++    return static_cast<std::int16_t>(pcm);
++}
++std::string Hex(std::uint32_t value) {
++    char text[11];std::snprintf(text,sizeof(text),"0x%08x",value);return text;
++}
++void Geometry(const NativeAXADPCMState& state) {
++    if(state.current_nibble&0x40000000u || state.end_nibble&0xc0000000u || state.loop_nibble&0xc0000000u)
++        throw std::invalid_argument("AX ADPCM nibble address uses an unqualified hardware address domain");
++    if((state.end_nibble&15)<2)
++        throw std::logic_error("AX ADPCM special header-nibble end-address behavior is not implemented");
++    // Firmware0F61..0F71: the end exception of a voice whose loopFlag is not1
++    // stops it and points AR2 at the zero cell. Its loop address (often a
++    // silence buffer at a frame header) is never decoded; the accelerator's
++    // wrapped address is only written back as the final current address.
++    if((state.current_nibble&15)<2 || state.current_nibble>state.end_nibble ||
++       (state.loop_flag && ((state.loop_nibble&15)<2 || state.loop_nibble>state.end_nibble)))
++        throw std::logic_error("AX ADPCM raw decoding requires the original ordinary payload/end domain (current=" +
++                               Hex(state.current_nibble) + " loop=" + Hex(state.loop_nibble) + " end=" +
++                               Hex(state.end_nibble) + " loopFlag=" + std::to_string(state.loop_flag) + ")");
++    if(state.loop_flag>1 || state.voice_type>1)
++        throw std::logic_error("AX ADPCM loop/type descriptor is outside the qualified source domain");
++}
++}
++NativeAXADPCMState ReadNativeAXADPCMState(NativeDSPMemoryEndpoint endpoint,std::uint32_t address) {
++    std::array<unsigned char,320> wire{};DSPBackendReadMemory(endpoint,address,wire.data(),wire.size());
++    if(Half(wire.data()+0x70)!=0)
++        throw std::logic_error("AX sample format is not DSP ADPCM");
++    const auto status=Half(wire.data()+0x10);
++    if(status>1)throw std::logic_error("AX voice state is outside the qualified stop/run domain");
++    NativeAXADPCMState result;
++    result.src_select=Half(wire.data()+8);result.coefficient_select=Half(wire.data()+10);
++    result.running=status!=0;result.voice_type=Half(wire.data()+0x12);
++    result.loop_flag=Half(wire.data()+0x6e);result.loop_nibble=Word(wire.data()+0x72);
++    result.end_nibble=Word(wire.data()+0x76);result.current_nibble=Word(wire.data()+0x7a);
++    for(unsigned i=0;i<8;++i)for(unsigned j=0;j<2;++j)
++        result.coefficients[i][j]=SignedHalf(wire.data() + 0x7e + (i*2+j)*2);
++    result.gain=Half(wire.data()+0x9e);result.predictor_scale=Half(wire.data()+0xa0)&0x7f;
++    result.history1=SignedHalf(wire.data()+0xa2);result.history2=SignedHalf(wire.data()+0xa4);
++    result.ratio=Word(wire.data()+0xa6);result.fraction=Half(wire.data()+0xaa);
++    for(unsigned i=0;i<4;++i)result.src_history[i]=SignedHalf(wire.data()+0xac+i*2);
++    result.loop_predictor_scale=Half(wire.data()+0xb4)&0x7f;
++    result.loop_history1=SignedHalf(wire.data()+0xb6);result.loop_history2=SignedHalf(wire.data()+0xb8);
++    return result;
++}
++NativeAXRawADPCMBlock DecodeNativeAXRawADPCM(NativeDSPMemoryEndpoint endpoint,
++                                           const NativeAXADPCMState& input,std::size_t limit) {
++    if(!limit || limit>96)throw std::invalid_argument("AX raw ADPCM block must request 1..96 samples");
++    NativeAXRawADPCMBlock result;result.next=input;
++    auto& state=result.next;
++    if(!state.running)return result;
++    Geometry(state);state.predictor_scale&=0x7f;state.loop_predictor_scale&=0x7f;
++    const auto initial=state;
++    SampleBytes Byte(endpoint);
++    try {
++    while(result.samples_decoded<limit && state.running) {
++        const auto at=state.current_nibble;
++        const auto packed=Byte(at/2);
++        const auto nibble=static_cast<unsigned char>(at&1?packed&15:packed>>4);
++        const auto decoded=DecodeSample(nibble,state);
++        state.history2=state.history1;state.history1=decoded;
++        result.samples[result.samples_decoded++]=decoded;
++        const bool ended=at==state.end_nibble;
++        ++state.current_nibble;
++        // Header prefetch is a real accelerator boundary, including a payload
++        // end at nibble15: the next frame's header is read before the end
++        // check, past the allocation if the sample ends there. A looping voice
++        // then takes its loop pred/scale; a one-shot voice writes it back.
++        if((state.current_nibble&15)==0) {
++            state.predictor_scale=Byte(state.current_nibble/2)&0x7f;
++            state.current_nibble+=2;
++        }
++        if(ended) {
++            result.end_reached=true;state.current_nibble=state.loop_nibble;
++            if(state.loop_flag) {
++                state.predictor_scale=state.loop_predictor_scale;
++                if(state.voice_type!=1) {
++                    state.history1=state.loop_history1;state.history2=state.loop_history2;
++                }
++                ++result.loops;
++            } else state.running=false;
++        }
++    }
++    } catch(const std::out_of_range& error) {
++        throw std::out_of_range(std::string(error.what())+" during ADPCM decode at nibble "+Hex(state.current_nibble)+
++                                " (voice current="+Hex(initial.current_nibble)+" loop="+Hex(initial.loop_nibble)+
++                                " end="+Hex(initial.end_nibble)+" loopFlag="+std::to_string(initial.loop_flag)+
++                                " type="+std::to_string(initial.voice_type)+")");
++    }
++    return result;
++}
++void RequireNativeAXADPCMFrameProcessing(const NativeAXADPCMState& state) {
++    if(state.src_select==0)
++        throw std::logic_error("AX source-selected four-tap SRC needs a qualified original DSP coefficient bank; ratio 1 is not direct mode");
++    if(state.src_select==1)
++        throw std::logic_error("AX source-selected linear SRC/frame history is not implemented");
++    if(state.src_select==2)
++        throw std::logic_error("AX direct sample frame still needs original voice/envelope/filter/mix/remote processing");
++    throw std::logic_error("AX source sample-rate mode is unknown");
++}
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_adpcm_samples.h b/src/platform/ax_reference/ax_adpcm_samples.h
+new file mode 100644
+index 00000000..5f0f4681
+--- /dev/null
++++ b/src/platform/ax_reference/ax_adpcm_samples.h
+@@ -0,0 +1,42 @@
++// REFERENCE COPY of the original (unoptimized) ax_adpcm_samples.h from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#pragma once
++#include "platform/dsp_memory.h"
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace mscharged::platform::axref {
++// Snapshot of the actual typed physical AXPB sample fields. This is device
++// arithmetic state, not a game voice owner or a replacement sample selector.
++struct NativeAXADPCMState {
++    std::array<std::array<std::int16_t,2>,8> coefficients{};
++    std::uint32_t current_nibble{}, end_nibble{}, loop_nibble{}, ratio{};
++    std::uint16_t predictor_scale{}, gain{}, loop_predictor_scale{};
++    std::int16_t history1{}, history2{}, loop_history1{}, loop_history2{};
++    std::uint16_t src_select{}, coefficient_select{}, fraction{}, voice_type{}, loop_flag{};
++    std::array<std::int16_t,4> src_history{};
++    bool running{};
++};
++NativeAXADPCMState ReadNativeAXADPCMState(NativeDSPMemoryEndpoint endpoint,
++                                       std::uint32_t parameter_block_address);
++struct NativeAXRawADPCMBlock {
++    std::array<std::int16_t,96> samples{};
++    NativeAXADPCMState next{};
++    std::uint16_t samples_decoded{}, loops{};
++    bool end_reached{};
++};
++// Raw accelerator/codec samples only: no SRC, gain/envelope/filter/mix/output,
++// source PB writeback, callback, DMA, ready/boot mail. A source-selected four-tap
++// voice MUST NOT substitute these raw samples for its resampled frame.
++// Input pins/fields stay live and unmodified across this read-only device job.
++// Supported end geometry is an inclusive payload nibble (offset2..15); the
++// hardware's special header-nibble end addresses remain explicit unsupported.
++NativeAXRawADPCMBlock DecodeNativeAXRawADPCM(NativeDSPMemoryEndpoint endpoint,
++                                           const NativeAXADPCMState& state,
++                                           std::size_t raw_sample_limit=96);
++// Explicit admission boundary for future 96-frame voice processing. In
++// particular ratio 1 does not authorize changing default srcSelect 0 to direct.
++void RequireNativeAXADPCMFrameProcessing(const NativeAXADPCMState& state);
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_command_service.cpp b/src/platform/ax_reference/ax_command_service.cpp
+new file mode 100644
+index 00000000..c6c4fb0d
+--- /dev/null
++++ b/src/platform/ax_reference/ax_command_service.cpp
+@@ -0,0 +1,148 @@
++// REFERENCE COPY of the original (unoptimized) ax_command_service.cpp from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#include "platform/ax_reference/ax_command_service.h"
++#include <algorithm>
++#include <array>
++#include <limits>
++
++namespace mscharged::platform::axref {
++NativeAXCommandError::NativeAXCommandError(NativeAXFailure failure,std::size_t word,
++                                         const char* message)
++    : std::runtime_error(message),failure_(failure),word_(word) {}
++namespace {
++constexpr std::size_t FrameSamples=96, RemoteSamples=18, PBBytes=320, MaxVoices=96;
++constexpr std::array<std::uint16_t,15> CommandWords{3,3,3,3,3,6,6,6,14,14,5,6,6,9,1};
++std::uint16_t BE16(const unsigned char* p) {
++    return (std::uint16_t(p[0])<<8)|std::uint16_t(p[1]);
++}
++std::uint32_t BE32(const unsigned char* p) {
++    return (std::uint32_t(BE16(p))<<16)|BE16(p+2);
++}
++std::uint32_t Address(const NativeAXCommand& cmd,std::size_t argument=0) {
++    return (std::uint32_t(cmd.arguments[argument])<<16)|cmd.arguments[argument+1];
++}
++[[noreturn]] void Fail(NativeAXFailure failure,const NativeAXCommand& cmd,
++                      const char* message) {
++    throw NativeAXCommandError(failure,cmd.word_offset,message);
++}
++void RequireZero(NativeDSPMemoryEndpoint endpoint,std::uint32_t address,
++                 std::size_t bytes,NativeAXFailure failure,const NativeAXCommand& cmd,
++                 const char* message) {
++    std::array<unsigned char,768> wire{};
++    if (bytes>wire.size()) throw std::logic_error("AX zero contributor extent is invalid");
++    DSPBackendReadMemory(endpoint,address,wire.data(),bytes);
++    if (std::any_of(wire.begin(),wire.begin()+bytes,[](unsigned char x){return x!=0;}))
++        Fail(failure,cmd,message);
++}
++std::uint16_t CheckStoppedVoices(NativeDSPMemoryEndpoint endpoint,std::uint32_t address,
++                                const NativeAXCommand& cmd) {
++    std::array<std::uint32_t,MaxVoices> visited{};
++    std::uint16_t voices=0;
++    while(address) {
++        if(voices==MaxVoices || std::find(visited.begin(),visited.begin()+voices,address)!=visited.begin()+voices)
++            Fail(NativeAXFailure::InvalidVoiceChain,cmd,"AX parameter-block chain is cyclic or exceeds original96 voices");
++        std::array<unsigned char,PBBytes> wire{};
++        DSPBackendReadMemory(endpoint,address,wire.data(),wire.size());
++        if(BE32(wire.data()+4)!=address)
++            Fail(NativeAXFailure::InvalidVoiceChain,cmd,"AX parameter-block self address differs from its checked physical backing");
++        if(BE16(wire.data()+16)!=0)
++            Fail(NativeAXFailure::ActiveVoice,cmd,"AX active voice/sample/filter/SRC processing is not implemented");
++        visited[voices++]=address;
++        address=BE32(wire.data());
++    }
++    if(voices!=MaxVoices)
++        Fail(NativeAXFailure::InvalidVoiceChain,cmd,"AX zero slice requires all96 original initialized parameter blocks");
++    return voices;
++}
++struct WriteSpan {std::uint32_t address{};std::size_t bytes{};};
++}
++NativeAXCommandList ReadNativeAXCommandList(NativeDSPMemoryEndpoint endpoint,
++                                          std::uint32_t address,std::size_t bytes) {
++    if(!bytes || bytes>128 || bytes%2 || address%2 ||
++       bytes>std::numeric_limits<std::uint32_t>::max()-std::uint64_t(address)+1)
++        throw NativeAXCommandError(NativeAXFailure::InvalidListExtent,0,"AX command list must be an aligned bounded original128-byte slot");
++    std::array<unsigned char,128> wire{};
++    DSPBackendReadMemory(endpoint,address,wire.data(),bytes);
++    NativeAXCommandList result;
++    const auto available=bytes/2;
++    for(std::size_t at=0;at<available;) {
++        const auto opcode=BE16(wire.data()+at*2);
++        if(opcode>=CommandWords.size())
++            throw NativeAXCommandError(NativeAXFailure::UnknownCommand,at,"AX command is unknown; no firmware layout fallback");
++        const auto words=CommandWords[opcode];
++        if(words>available-at)
++            throw NativeAXCommandError(NativeAXFailure::TruncatedCommand,at,"AX command exceeds its published list extent");
++        auto& command=result.commands[result.command_count++];
++        command.opcode=static_cast<NativeAXOpcode>(opcode);
++        command.word_offset=static_cast<std::uint16_t>(at);command.argument_count=words-1;
++        for(unsigned i=1;i<words;++i)command.arguments[i-1]=BE16(wire.data()+(at+i)*2);
++        at+=words;result.consumed_words=static_cast<std::uint16_t>(at);
++        if(command.opcode==NativeAXOpcode::End)return result;
++    }
++    throw NativeAXCommandError(NativeAXFailure::MissingEnd,available,"AX bounded command list has no END");
++}
++NativeAXZeroFrameResult ExecuteNativeAXZeroInputFrame(NativeDSPMemoryEndpoint endpoint,
++                                                     std::uint32_t address,std::size_t bytes) {
++    const auto list=ReadNativeAXCommandList(endpoint,address,bytes);
++    // Validate the actual AXCL source sequence and every contributing input
++    // before any output store. Parsing never executes arbitrary device commands.
++    std::size_t next=0;
++    auto Take=[&](NativeAXOpcode opcode)->const NativeAXCommand& {
++        const auto& cmd=list.commands[next<list.command_count?next:list.command_count-1];
++        if(next>=list.command_count || cmd.opcode!=opcode)
++            Fail(NativeAXFailure::UnsupportedSequence,cmd,"AX zero slice requires the original frame command order");
++        ++next;return cmd;
++    };
++    const auto& setup=Take(NativeAXOpcode::Setup);
++    RequireZero(endpoint,Address(setup),120,NativeAXFailure::NonzeroStudio,setup,
++                "AX depop Studio contributor is nonzero; source ramp processing is unsupported");
++    const auto& surround=list.commands[next<list.command_count?next:list.command_count-1];
++    if(next>=list.command_count || (surround.opcode!=NativeAXOpcode::AddToLR &&
++       surround.opcode!=NativeAXOpcode::SubToLR && surround.opcode!=NativeAXOpcode::AddSubToLR))
++        Fail(NativeAXFailure::UnsupportedSequence,surround,"AX original surround routing command is absent");
++    ++next;
++    const bool dpl2=surround.opcode==NativeAXOpcode::AddSubToLR;
++    const auto surround_bytes=FrameSamples*sizeof(std::uint32_t)*(dpl2?2:1);
++    RequireZero(endpoint,Address(surround),surround_bytes,NativeAXFailure::NonzeroSurround,surround,
++                "AX prior surround contributor is nonzero; routing arithmetic is unsupported");
++    const auto& process=Take(NativeAXOpcode::Process);
++    const auto voices=CheckStoppedVoices(endpoint,Address(process),process);
++    bool compressor=false;
++    if(next<list.command_count && list.commands[next].opcode>=NativeAXOpcode::MixAuxA &&
++       list.commands[next].opcode<=NativeAXOpcode::UploadAuxBMixLRSC)
++        Fail(NativeAXFailure::AuxiliaryProcessing,list.commands[next],"AX auxiliary effect bus upload/mix processing is unsupported");
++    if(next<list.command_count && list.commands[next].opcode==NativeAXOpcode::Compressor) {
++        const auto& cmd=Take(NativeAXOpcode::Compressor);
++        if(cmd.arguments[0]!=32768 || cmd.arguments[1]!=10)
++            Fail(NativeAXFailure::UnsupportedCompressor,cmd,"AX zero slice requires the original compressor threshold32768/release10");
++        // No attack is triggered by exactly zero samples. A fresh attenuation
++        // history stays zero; no coefficient is guessed or substituted. Validate
++        // that the source supplied a genuinely readable coefficient owner.
++        DSPBackendValidateMemory(endpoint,Address(cmd,2),2,false);
++        compressor=true;
++    }
++    const auto& remote=Take(NativeAXOpcode::RemoteOutput);
++    const auto& output=Take(dpl2?NativeAXOpcode::OutputDPL2:NativeAXOpcode::Output);
++    if(Address(output,1)!=Address(surround))
++        Fail(NativeAXFailure::UnsupportedSequence,output,"AX zero slice output surround owner differs from original input owner");
++    Take(NativeAXOpcode::End);
++    if(next!=list.command_count)
++        Fail(NativeAXFailure::UnsupportedSequence,list.commands[next],"AX commands follow END");
++    const std::array<WriteSpan,6> writes{{
++        {Address(remote,0),RemoteSamples*sizeof(std::uint16_t)},
++        {Address(remote,2),RemoteSamples*sizeof(std::uint16_t)},
++        {Address(remote,4),RemoteSamples*sizeof(std::uint16_t)},
++        {Address(remote,6),RemoteSamples*sizeof(std::uint16_t)},
++        {Address(output,1),surround_bytes},
++        {Address(output,3),FrameSamples*2*sizeof(std::uint16_t)}}};
++    for(const auto& write:writes)DSPBackendValidateMemory(endpoint,write.address,write.bytes,true);
++    const std::array<unsigned char,768> zero{};
++    std::uint32_t written=0;
++    for(const auto& write:writes) {
++        DSPBackendWriteMemory(endpoint,write.address,zero.data(),write.bytes);
++        written+=static_cast<std::uint32_t>(write.bytes);
++    }
++    return {list.consumed_words,voices,FrameSamples,RemoteSamples,written,compressor,dpl2};
++}
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_command_service.h b/src/platform/ax_reference/ax_command_service.h
+new file mode 100644
+index 00000000..4abbe40a
+--- /dev/null
++++ b/src/platform/ax_reference/ax_command_service.h
+@@ -0,0 +1,64 @@
++// REFERENCE COPY of the original (unoptimized) ax_command_service.h from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#pragma once
++#include "platform/dsp_memory.h"
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <stdexcept>
++
++namespace mscharged::platform::axref {
++// The command numbers and lengths are the single Wii list written by the
++// original AXCL.c. No old firmware layout detection or unknown-command fallback.
++enum class NativeAXOpcode : std::uint16_t {
++    Setup=0, AddToLR=1, SubToLR=2, AddSubToLR=3, Process=4,
++    MixAuxA=5, MixAuxB=6, MixAuxC=7, UploadAuxAMixLRSC=8,
++    UploadAuxBMixLRSC=9, Compressor=10, Output=11, OutputDPL2=12,
++    RemoteOutput=13, End=14
++};
++enum class NativeAXFailure {
++    InvalidListExtent, UnknownCommand, TruncatedCommand, MissingEnd,
++    UnsupportedSequence, NonzeroStudio, NonzeroSurround,
++    ActiveVoice, InvalidVoiceChain, AuxiliaryProcessing,
++    UnsupportedCompressor
++};
++class NativeAXCommandError : public std::runtime_error {
++public:
++    NativeAXCommandError(NativeAXFailure failure, std::size_t word,
++                         const char* message);
++    NativeAXFailure failure() const noexcept { return failure_; }
++    std::size_t word() const noexcept { return word_; }
++private:
++    NativeAXFailure failure_;
++    std::size_t word_;
++};
++struct NativeAXCommand {
++    NativeAXOpcode opcode{};
++    std::uint16_t word_offset{}, argument_count{};
++    std::array<std::uint16_t,13> arguments{};
++};
++struct NativeAXCommandList {
++    std::array<NativeAXCommand,64> commands{};
++    std::uint16_t command_count{}, consumed_words{};
++};
++NativeAXCommandList ReadNativeAXCommandList(NativeDSPMemoryEndpoint endpoint,
++                                          std::uint32_t address, std::size_t bytes);
++struct NativeAXZeroFrameResult {
++    std::uint16_t consumed_words{}, stopped_voices{};
++    std::uint16_t stereo_frames{}, remote_samples_per_channel{};
++    std::uint32_t written_bytes{};
++    bool compressor_present{}, dpl2{};
++};
++// This is an explicitly bounded device conformance slice, not a complete AX
++// kernel or a boot endpoint. It accepts only verified zero contributors and
++// stopped PBs; unsupported nonzero/voice/aux work is an error, never silence.
++// The caller retains all pins and excludes source CPU mutation throughout this
++// operation using the original request/completion boundary. No raw pointers
++// escape the checked bus, no source callbacks/flags/mails are changed, and no
++// kernel-ready operation is exposed. A zero input leaves fresh compressor
++// attenuation history at zero; arbitrary prior compressor history is unsupported.
++NativeAXZeroFrameResult ExecuteNativeAXZeroInputFrame(NativeDSPMemoryEndpoint endpoint,
++                                                     std::uint32_t address,
++                                                     std::size_t bytes);
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_frame_commands.cpp b/src/platform/ax_reference/ax_frame_commands.cpp
+new file mode 100644
+index 00000000..04a3b270
+--- /dev/null
++++ b/src/platform/ax_reference/ax_frame_commands.cpp
+@@ -0,0 +1,312 @@
++// REFERENCE COPY of the original (unoptimized) ax_frame_commands.cpp from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#include "platform/ax_reference/ax_frame_commands.h"
++#include "platform/ax_studio_depop.h"
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <limits>
++
++namespace mscharged::platform::axref {
++namespace {
++std::uint16_t Half(const unsigned char* p) {return (std::uint16_t(p[0])<<8)|p[1];}
++std::uint32_t Word(const unsigned char* p) {return (std::uint32_t(Half(p))<<16)|Half(p+2);}
++std::uint32_t Address(const NativeAXCommand& c,unsigned i=0) {
++    return (std::uint32_t(c.arguments[i])<<16)|c.arguments[i+1];
++}
++void PutHalf(unsigned char* p,std::uint16_t x) {p[0]=x>>8;p[1]=x;}
++void PutWord(unsigned char* p,std::uint32_t x) {PutHalf(p,x>>16);PutHalf(p+2,x);}
++std::int16_t SignedHalf(std::uint16_t x) {std::int16_t s;std::memcpy(&s,&x,2);return s;}
++std::int32_t SignedWord(std::uint32_t x) {std::int32_t s;std::memcpy(&s,&x,4);return s;}
++std::int64_t SignedWidth(std::int64_t x,unsigned width) {
++    const auto mask=(std::uint64_t(1)<<width)-1;
++    const auto bits=std::uint64_t(x)&mask;
++    return bits&(std::uint64_t(1)<<(width-1)) ? std::int64_t(bits)-std::int64_t(mask+1) : std::int64_t(bits);
++}
++std::int64_t Floor(std::int64_t x,std::int64_t d) {return x>=0?x/d:-((-x+d-1)/d);}
++std::int16_t Saturate(std::int64_t x) {return std::int16_t(std::max<std::int64_t>(-32768,std::min<std::int64_t>(32767,x)));}
++std::int32_t StoreBus(std::int64_t x) {
++    // Literal40-bit mode stores saturated AC.M and the unchanged AC.L, not a
++    // generic s32 clamp. Preserve this source hardware overflow behavior.
++    const auto value=SignedWidth(x,40);
++    const auto high=std::uint16_t(Saturate(Floor(value,65536)));
++    return SignedWord((std::uint32_t(high)<<16)|(std::uint64_t(value)&65535));
++}
++[[noreturn]] void Fail(NativeAXFailure why,const NativeAXCommand& c,const char* message) {
++    throw NativeAXCommandError(why,c.word_offset,message);
++}
++std::vector<unsigned char> Read(NativeDSPMemoryEndpoint e,std::uint32_t a,std::size_t bytes) {
++    std::vector<unsigned char> data(bytes);DSPBackendReadMemory(e,a,data.data(),bytes);return data;
++}
++bool Overlap(std::uint32_t a,std::size_t an,std::uint32_t b,std::size_t bn) {
++    return std::uint64_t(a)<std::uint64_t(b)+bn && std::uint64_t(b)<std::uint64_t(a)+an;
++}
++std::vector<unsigned char> Capture(NativeAXPreparedCommandFrame& f,NativeDSPMemoryEndpoint e,
++                                  std::uint32_t a,std::size_t bytes) {
++    auto wire=Read(e,a,bytes);f.reads.push_back({a,wire,{}});return wire;
++}
++void Stage(NativeAXPreparedCommandFrame& f,NativeDSPMemoryEndpoint e,std::uint32_t a,
++           std::vector<unsigned char> after) {
++    DSPBackendValidateMemory(e,a,after.size(),true);
++    const auto end=std::uint64_t(a)+after.size();
++    for(const auto& w:f.writes)
++        if(std::uint64_t(a)<std::uint64_t(w.address)+w.after.size() && w.address<end)
++            throw std::runtime_error("AX original output/AUX writable spans overlap");
++    f.written_bytes+=after.size();f.writes.push_back({a,Read(e,a,after.size()),std::move(after)});
++}
++bool IsZero(const std::vector<unsigned char>& bytes) {
++    return std::all_of(bytes.begin(),bytes.end(),[](unsigned char x){return x==0;});
++}
++}
++bool operator==(const NativeAXCommandHistory& a,const NativeAXCommandHistory& b) noexcept {
++    return a.master==b.master && a.aux_a==b.aux_a && a.aux_b==b.aux_b && a.aux_c==b.aux_c &&
++           a.compressor_counter==b.compressor_counter && a.compressor_counter_known==b.compressor_counter_known;
++}
++std::array<std::uint16_t,96> NativeAXCommandGainRamp(std::uint16_t before,std::uint16_t requested) {
++    const auto delta=SignedHalf(std::uint16_t(requested-before));
++    std::int64_t accumulator=std::int64_t(before)*65536;
++    std::array<std::uint16_t,96> result{};
++    constexpr int weight[3]={683,683,682};
++    for(unsigned i=0;i<95;++i) {
++        accumulator+=std::int64_t(delta)*weight[i%3];
++        result[i]=std::uint16_t(Floor(accumulator,65536));
++    }
++    result.back()=requested;return result;
++}
++NativeAXChannel96 NativeAXMixAuxReturn(const NativeAXChannel96& main,
++                                      const NativeAXChannel96& returned,
++                                      const std::array<std::uint16_t,96>& gain) {
++    NativeAXChannel96 result{};
++    for(unsigned i=0;i<96;++i)
++        result[i]=StoreBus(std::int64_t(main[i])+Floor(std::int64_t(returned[i])*gain[i],32768));
++    return result;
++}
++NativeAXStereo96 NativeAXPackStereo(const NativeAXChannel96& left,const NativeAXChannel96& right,
++                                    const std::array<std::uint16_t,96>& gain) {
++    NativeAXStereo96 result{};
++    for(unsigned i=0;i<96;++i) {
++        // Actual0631..0655 interleaves right,left. LSL16 wraps the40-bit
++        // accumulator before its saturated middle store, including wide edges.
++        result[i*2]=Saturate(SignedWidth(Floor(std::int64_t(right[i])*gain[i],32768),24));
++        result[i*2+1]=Saturate(SignedWidth(Floor(std::int64_t(left[i])*gain[i],32768),24));
++    }
++    return result;
++}
++std::int32_t NativeAXMixAccumulate(std::int32_t bus,std::int32_t contribution) {
++    return static_cast<std::int32_t>(SignedWidth(std::int64_t(bus)+contribution,24));
++}
++std::array<std::int16_t,18> NativeAXRemoteOutput(const std::array<std::int32_t,18>& accumulator) {
++    std::array<std::int16_t,18> result{};
++    for(unsigned i=0;i<18;++i)
++        result[i]=Saturate(Floor(SignedWidth(std::int64_t(accumulator[i])*65536,40),65536));
++    return result;
++}
++NativeAXCompressorDecision NativeAXCompressorStep(std::uint16_t counter,std::uint16_t threshold,
++                                                  std::uint16_t release_frames,
++                                                  const NativeAXChannel96& left,
++                                                  const NativeAXChannel96& right) {
++    // Owned0586..0593 loads each sign-extended bus word, takes ABS and compares
++    // it with the unsigned threshold in AC1.L; carry marks an overflow.
++    bool overflow=false;
++    for(const auto* channel:{&left,&right})for(const auto sample:*channel)
++        if(std::abs(std::int64_t(sample))>=threshold)overflow=true;
++    if(overflow)return {true,std::uint32_t(counter)*192,release_frames};
++    if(!counter)return {};
++    const std::uint16_t next=std::uint16_t(counter-1);
++    return {true,0x840+std::uint32_t(next)*192,next};
++}
++std::int32_t NativeAXCompressSample(std::int32_t sample,std::uint16_t gain) {
++    const auto bits=std::uint32_t(sample);
++    const std::int64_t high=SignedHalf(std::uint16_t(bits>>16)),low=bits&65535;
++    // MULXMV/LSL16 shift the doubled high product inside the 40-bit AC, MULXAC
++    // adds the doubled low product, ASR16 floors and SL/S store the halves.
++    auto accumulator=SignedWidth(2*high*gain*65536,40);
++    accumulator=SignedWidth(accumulator+2*low*std::int64_t(gain),40);
++    return StoreBus(Floor(accumulator,65536));
++}
++NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
++    NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes,
++    const NativeAXCommandHistory& history,const NativeAXCoefficientView& coefficients) {
++    if(!bytes || bytes>128 || bytes%2 || address%2)
++        throw NativeAXCommandError(NativeAXFailure::InvalidListExtent,0,"AX staged list must be an aligned original128-byte slot");
++    NativeAXPreparedCommandFrame f;f.before=f.after=history;
++    const auto list_before=Capture(f,memory,address,bytes);
++    const auto list=ReadNativeAXCommandList(memory,address,bytes);
++    if(Read(memory,address,bytes)!=list_before)
++        throw std::runtime_error("AX source command list changed while parsing");
++    f.consumed_words=list.consumed_words;
++    std::size_t next=0;
++    auto Take=[&](NativeAXOpcode op)->const NativeAXCommand& {
++        const auto& c=list.commands[next<list.command_count?next:list.command_count-1];
++        if(next>=list.command_count || c.opcode!=op)
++            Fail(NativeAXFailure::UnsupportedSequence,c,"AX staged frame requires original normal-output command order");
++        ++next;return c;
++    };
++    const auto& setup=Take(NativeAXOpcode::Setup);
++    const auto studio=Capture(f,memory,Address(setup),120);
++    // Owned Setup initializes twelve96-frame accumulators before voices/AUX,
++    // then (0184..0222) eight18-frame remote ones in the order main0, aux0,
++    // main1, aux1, ... from the last eight Studio value/delta entries.
++    std::array<NativeAXChannel96,12> buses{};
++    constexpr unsigned studio_bus[12]={0,1,8,2,3,9,4,5,10,6,7,11};
++    for(unsigned i=0;i<12;++i)
++        buses[studio_bus[i]]=NativeAXStudioDepop96(SignedWord(Word(studio.data()+i*6)),
++                                                SignedHalf(Half(studio.data()+i*6+4)));
++    std::array<std::array<std::int32_t,18>,8> remote_buses{};
++    for(unsigned i=0;i<8;++i)
++        remote_buses[i]=NativeAXStudioDepop18(SignedWord(Word(studio.data()+72+i*6)),
++                                              SignedHalf(Half(studio.data()+72+i*6+4)));
++    const auto& surround=list.commands[next<list.command_count?next:list.command_count-1];
++    if(next>=list.command_count || (surround.opcode!=NativeAXOpcode::AddToLR && surround.opcode!=NativeAXOpcode::SubToLR))
++        Fail(NativeAXFailure::UnsupportedSequence,surround,"AX DPL2 routing/output is not yet qualified");
++    ++next;
++    if(!IsZero(Capture(f,memory,Address(surround),384)))
++        Fail(NativeAXFailure::NonzeroSurround,surround,"AX prior surround routing is not yet qualified");
++    const auto& process=Take(NativeAXOpcode::Process);
++    std::array<std::uint32_t,96> seen{};auto voice_address=Address(process);
++    while(voice_address) {
++        if(f.voice_count==96 || std::find(seen.begin(),seen.begin()+f.voice_count,voice_address)!=seen.begin()+f.voice_count)
++            Fail(NativeAXFailure::InvalidVoiceChain,process,"AX source PB chain is cyclic or exceeds96 voices");
++        for(unsigned i=0;i<f.voice_count;++i)
++            if(Overlap(seen[i],320,voice_address,320))
++                Fail(NativeAXFailure::InvalidVoiceChain,process,"AX distinct source PB records partially overlap");
++        const auto voice=PrepareNativeAXADPCMVoiceFrame(memory,voice_address,coefficients);
++        seen[f.voice_count++]=voice_address;
++        if(voice.was_running) {
++            ++f.active_voices;
++            for(unsigned c=0;c<12;++c)for(unsigned i=0;i<96;++i)
++                buses[c][i]=StoreBus(std::int64_t(buses[c][i])+voice.buses[c][i]);
++            // 0CB3/0CD0 accumulate a voice's selected remote channels in place.
++            if(voice.remote_enabled)for(unsigned c=0;c<8;++c)if(voice.remote.mixed&(1u<<c))
++                for(unsigned i=0;i<18;++i)
++                    remote_buses[c][i]=NativeAXMixAccumulate(remote_buses[c][i],voice.remote.channels[c][i]);
++            f.written_bytes+=voice.parameters_after.size();
++        }
++        voice_address=Word(voice.parameters_before.data());f.voices.push_back(voice);
++    }
++    if(f.voice_count!=96)
++        Fail(NativeAXFailure::InvalidVoiceChain,process,"AX staged frame requires the complete original96-PB owner");
++    constexpr unsigned aux_bus[3][3]={{2,3,9},{4,5,10},{6,7,11}};
++    std::array<std::uint16_t*,3> previous{{&f.after.aux_a,&f.after.aux_b,&f.after.aux_c}};
++    for(unsigned aux=0;aux<3;++aux) {
++        const auto opcode=static_cast<NativeAXOpcode>(unsigned(NativeAXOpcode::MixAuxA)+aux);
++        if(next>=list.command_count || list.commands[next].opcode!=opcode)continue;
++        const auto& c=Take(opcode);const auto gain=NativeAXCommandGainRamp(*previous[aux],c.arguments[0]);
++        *previous[aux]=c.arguments[0];++f.aux_commands;
++        const auto returned=Capture(f,memory,Address(c,3),1152);
++        std::vector<unsigned char> upload(1152);
++        for(unsigned channel=0;channel<3;++channel) {
++            NativeAXChannel96 incoming{};
++            for(unsigned i=0;i<96;++i) {
++                PutWord(upload.data()+(channel*96+i)*4,std::uint32_t(buses[aux_bus[aux][channel]][i]));
++                incoming[i]=SignedWord(Word(returned.data()+(channel*96+i)*4));
++            }
++            const unsigned main=channel<2?channel:8;
++            buses[main]=NativeAXMixAuxReturn(buses[main],incoming,gain);
++        }
++        Stage(f,memory,Address(c,1),std::move(upload));
++    }
++    if(next<list.command_count && list.commands[next].opcode==NativeAXOpcode::Compressor) {
++        const auto& c=Take(NativeAXOpcode::Compressor);
++        if(!history.compressor_counter_known)
++            Fail(NativeAXFailure::UnsupportedCompressor,c,"AX compressor release counter history is unknown");
++        // Owned057B..0609: threshold, release frames and the source table come
++        // from the command list; the counter is the firmware's 0CE4 cell. The
++        // selected 96-halfword ramp scales the left and right main buses only.
++        const auto decision=NativeAXCompressorStep(history.compressor_counter,c.arguments[0],c.arguments[1],
++                                                   buses[0],buses[1]);
++        f.after.compressor_counter=decision.counter;
++        if(decision.apply) {
++            const auto ramp=Capture(f,memory,Address(c,2)+decision.offset,192);
++            for(unsigned channel=0;channel<2;++channel)for(unsigned i=0;i<96;++i)
++                buses[channel][i]=NativeAXCompressSample(buses[channel][i],Half(ramp.data()+i*2));
++        } else {
++            DSPBackendValidateMemory(memory,Address(c,2),2,false);
++        }
++    }
++    const auto& remote=Take(NativeAXOpcode::RemoteOutput);
++    const auto& output=Take(NativeAXOpcode::Output);
++    if(Address(output,1)!=Address(surround))
++        Fail(NativeAXFailure::UnsupportedSequence,output,"AX surround output owner differs from source routing input");
++    Take(NativeAXOpcode::End);
++    if(next!=list.command_count)
++        Fail(NativeAXFailure::UnsupportedSequence,list.commands[next],"AX staged frame has commands after END");
++    // Owned067C..06A9 writes each speaker's main accumulator as 18 PCM16
++    // samples; the aux remote accumulators are mixed but never output.
++    for(unsigned channel=0;channel<4;++channel) {
++        const auto samples=NativeAXRemoteOutput(remote_buses[channel*2]);
++        std::vector<unsigned char> wire(36);
++        for(unsigned i=0;i<18;++i)PutHalf(wire.data()+i*2,std::uint16_t(samples[i]));
++        Stage(f,memory,Address(remote,channel*2),std::move(wire));
++    }
++    std::vector<unsigned char> surround_wire(384);
++    for(unsigned i=0;i<96;++i)PutWord(surround_wire.data()+i*4,std::uint32_t(buses[8][i]));
++    Stage(f,memory,Address(output,1),std::move(surround_wire));
++    const auto gain=NativeAXCommandGainRamp(history.master,output.arguments[0]);f.after.master=output.arguments[0];
++    const auto packed=NativeAXPackStereo(buses[0],buses[1],gain);
++    std::vector<unsigned char> pcm(384);
++    for(unsigned i=0;i<192;++i)PutHalf(pcm.data()+i*2,std::uint16_t(packed[i]));
++    Stage(f,memory,Address(output,3),std::move(pcm));
++    ValidateNativeAXCommandCommit(memory,f,history);return f;
++}
++NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
++    NativeDSPMemoryEndpoint memory,std::uint32_t address,std::size_t bytes,
++    const NativeAXCommandHistory& history,const NativeAXSuppliedCoefficientROM& coefficients) {
++    return PrepareNativeAXCommandFrame(memory,address,bytes,history,coefficients.View());
++}
++void ValidateNativeAXCommandCommit(NativeDSPMemoryEndpoint memory,const NativeAXPreparedCommandFrame& f,
++                                  const NativeAXCommandHistory& history) {
++    if(!(history==f.before))throw std::runtime_error("AX device history changed before whole-frame commit");
++    // Typed memory transport permits interior byte transfers. It does not
++    // certify320-byte PB starts, so prove all participants disjoint explicitly
++    // before validation/commit of any individual PB or output span.
++    for(std::size_t i=0;i<f.voices.size();++i) {
++        const auto& voice=f.voices[i];
++        for(std::size_t j=0;j<i;++j)
++            if(Overlap(voice.parameter_address,320,f.voices[j].parameter_address,320))
++                throw std::runtime_error("AX source PB records overlap before whole-frame commit");
++        for(const auto& r:f.reads)
++            if(Overlap(voice.parameter_address,320,r.address,r.before.size()))
++                throw std::runtime_error("AX source PB aliases a command/contributor before whole-frame commit");
++    }
++    for(const auto& r:f.reads)
++        if(Read(memory,r.address,r.before.size())!=r.before)
++            throw std::runtime_error("AX source command/contributor changed before whole-frame commit");
++    for(const auto& voice:f.voices) {
++        if(voice.was_running)ValidateNativeAXVoiceCommit(memory,voice);
++        else {
++            std::array<unsigned char,320> current{};
++            DSPBackendReadMemory(memory,voice.parameter_address,current.data(),current.size());
++            if(current!=voice.parameters_before)
++                throw std::runtime_error("AX stopped source PB changed before whole-frame commit");
++        }
++    }
++    for(const auto& w:f.writes) {
++        DSPBackendValidateMemory(memory,w.address,w.after.size(),true);
++        if(Read(memory,w.address,w.before.size())!=w.before)
++            throw std::runtime_error("AX source output/AUX owner changed before whole-frame commit");
++        for(std::size_t i=0;i<f.reads.size();++i) {
++            const auto& r=f.reads[i];const auto end=std::uint64_t(w.address)+w.after.size();
++            if(std::uint64_t(w.address)<std::uint64_t(r.address)+r.before.size() && r.address<end) {
++                // The original prior-surround operand is the same source
++                // in/out span. Original CL/Studio/AUX-return owners are not.
++                if(i!=2 || w.address!=r.address || w.after.size()!=r.before.size())
++                    throw std::runtime_error("AX output aliases an original readonly command contributor");
++            }
++        }
++        for(const auto& voice:f.voices) {
++            const auto end=std::uint64_t(w.address)+w.after.size();
++            if(std::uint64_t(w.address)<std::uint64_t(voice.parameter_address)+320 && voice.parameter_address<end)
++                throw std::runtime_error("AX output aliases its original parameter-block owner");
++        }
++    }
++}
++void CommitNativeAXCommandFrame(NativeDSPMemoryEndpoint memory,const NativeAXPreparedCommandFrame& f,
++                               NativeAXCommandHistory& history) {
++    ValidateNativeAXCommandCommit(memory,f,history);
++    for(const auto& voice:f.voices)if(voice.was_running)CommitNativeAXVoiceFrame(memory,voice);
++    for(const auto& w:f.writes)DSPBackendWriteMemory(memory,w.address,w.after.data(),w.after.size());
++    history=f.after;
++}
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_reference/ax_frame_commands.h b/src/platform/ax_reference/ax_frame_commands.h
+new file mode 100644
+index 00000000..d7cb5920
+--- /dev/null
++++ b/src/platform/ax_reference/ax_frame_commands.h
+@@ -0,0 +1,92 @@
++// REFERENCE COPY of the original (unoptimized) ax_frame_commands.h from the pinned port commit, renamed into
++// mscharged::platform::axref. Only built with -DMSCHARGED_AX_REFERENCE_CHECK=ON and run in lock step with the
++// optimized code (MSCHARGED_AXREF=1) to prove the optimized frames are bit identical. Do not edit.
++#pragma once
++#include "platform/ax_reference/ax_active_voice.h"
++#include "platform/ax_reference/ax_command_service.h"
++#include <array>
++#include <vector>
++
++namespace mscharged::platform::axref {
++using NativeAXChannel96 = std::array<std::int32_t, 96>;
++using NativeAXStereo96 = std::array<std::int16_t, 192>;
++// Device history, never source AXCL globals. The caller must supply the actual
++// initialized DSP context and retain it across frames. This leaf does not
++// establish cold reset validity, a complete kernel, or an authentic FIR bank.
++struct NativeAXCommandHistory {
++    std::uint16_t master{}, aux_a{}, aux_b{}, aux_c{}, compressor_counter{};
++    bool compressor_counter_known{};
++};
++bool operator==(const NativeAXCommandHistory&, const NativeAXCommandHistory&) noexcept;
++
++// Literal owned04E6/0618 instruction arithmetic. Stored ramp positions follow
++// the multiply pipeline:683/683/682, final requested halfword exactly.
++std::array<std::uint16_t,96> NativeAXCommandGainRamp(std::uint16_t before,
++                                                  std::uint16_t requested);
++NativeAXChannel96 NativeAXMixAuxReturn(const NativeAXChannel96& main,
++                                      const NativeAXChannel96& returned,
++                                      const std::array<std::uint16_t,96>& gain);
++NativeAXStereo96 NativeAXPackStereo(const NativeAXChannel96& left,
++                                    const NativeAXChannel96& right,
++                                    const std::array<std::uint16_t,96>& gain);
++// Literal owned057B..0609 compressor. Any main left/right |sample| >= threshold
++// selects attack ramp <counter> (byte offset counter*192) and restarts the
++// release counter; otherwise a nonzero counter counts down and selects the
++// ramp at 0x840+(counter-1)*192. Without either the firmware skips its table
++// DMA and leaves both buses untouched (apply is false).
++struct NativeAXCompressorDecision {
++    bool apply{};
++    std::uint32_t offset{};
++    std::uint16_t counter{};
++};
++NativeAXCompressorDecision NativeAXCompressorStep(std::uint16_t counter, std::uint16_t threshold,
++                                                  std::uint16_t release_frames,
++                                                  const NativeAXChannel96& left,
++                                                  const NativeAXChannel96& right);
++// Literal owned LSL16/MULXAC/ASR16 accumulation (0CB3/0CD0): the stored bus
++// word is shifted left16 inside a40-bit accumulator, so only its low24 bits
++// survive; the doubled product is added and ASR16 yields a24-bit result that
++// is stored sign-extended. `contribution` is floor(product/65536).
++std::int32_t NativeAXMixAccumulate(std::int32_t bus,std::int32_t contribution);
++// Literal owned067C..06A9 remote output: each speaker's main accumulator is
++// shifted into AC.M (LSL16) and stored saturated in 40-bit mode.
++std::array<std::int16_t,18> NativeAXRemoteOutput(const std::array<std::int32_t,18>& accumulator);
++// One ramp sample (owned05E1..05EF under SET15/M2): mixed signed-high and
++// unsigned-low products, doubled, combined in the 40-bit accumulator, ASR16,
++// then the saturated-middle/raw-low bus store.
++std::int32_t NativeAXCompressSample(std::int32_t sample, std::uint16_t gain);
++struct NativeAXCommandSpan {
++    std::uint32_t address{};
++    std::vector<unsigned char> before, after;
++};
++struct NativeAXPreparedCommandFrame {
++    NativeAXCommandHistory before{}, after{};
++    std::vector<NativeAXCommandSpan> reads, writes;
++    std::vector<NativeAXPreparedVoiceFrame> voices;
++    std::uint16_t consumed_words{}, voice_count{}, active_voices{}, aux_commands{};
++    std::uint32_t written_bytes{};
++};
++// A staged normal-output hardware conformance slice. Genuine source order and
++// source-owned AUX callback/ring transfers are retained. Nonzero prior surround,
++// DPL2, unknown compressor history and unsupported voice features fail before
++// stores. It never calls effects, selects a cue, changes source flags,
++// replies to a DSP mailbox, or marks the device ready.
++// Caller holds the actual source/job fence and every pin through prepare/commit;
++// per-transfer memory locks do not provide that whole-job lifetime.
++NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
++    NativeDSPMemoryEndpoint memory, std::uint32_t list_address, std::size_t bytes,
++    const NativeAXCommandHistory& history,
++    const NativeAXSuppliedCoefficientROM& coefficients);
++// Explicit native coefficient-policy entry; source list/PB/output transactions
++// are identical. This overload performs no boot/init/callback or IRQ operation.
++NativeAXPreparedCommandFrame PrepareNativeAXCommandFrame(
++    NativeDSPMemoryEndpoint memory, std::uint32_t list_address, std::size_t bytes,
++    const NativeAXCommandHistory& history,
++    const NativeAXCoefficientView& coefficients);
++void ValidateNativeAXCommandCommit(NativeDSPMemoryEndpoint memory,
++                                  const NativeAXPreparedCommandFrame& frame,
++                                  const NativeAXCommandHistory& history);
++void CommitNativeAXCommandFrame(NativeDSPMemoryEndpoint memory,
++                               const NativeAXPreparedCommandFrame& frame,
++                               NativeAXCommandHistory& history);
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_studio_depop.cpp b/src/platform/ax_studio_depop.cpp
+index 765540b4..42a51977 100644
+--- a/src/platform/ax_studio_depop.cpp
++++ b/src/platform/ax_studio_depop.cpp
+@@ -3,7 +3,9 @@
+ namespace mscharged::platform {
+ namespace {
+ std::int64_t Floor(std::int64_t value) {
+-    return value>=0?value/65536:-((-value+65535)/65536);
++    // Floor division by 65536 is the arithmetic right shift of a two's complement value.
++    static_assert((std::int64_t(-1)>>1)==-1 && (std::int64_t(-3)>>1)==-2,"arithmetic right shift is required");
++    return value>>16;
+ }
+ std::int32_t Store(std::int64_t accumulator) {
+     const auto raw=std::uint64_t(accumulator)&0xffffffffffULL;
+diff --git a/src/platform/dsp_memory.cpp b/src/platform/dsp_memory.cpp
+index bb60bdc6..c52f3a5c 100644
+--- a/src/platform/dsp_memory.cpp
++++ b/src/platform/dsp_memory.cpp
+@@ -1,9 +1,13 @@
+ #include "platform/dsp_memory.h"
+ #include "platform/dsp_memory_abi.h"
++#include "platform/ax_perf.h"
++#include <chrono>
++#include <ctime>
+ #include <dolphin/os.h>
+ #include <dolphin/os/OSNativeMemory.h>
+ #include <cstdio>
+ #include <algorithm>
++#include <atomic>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+@@ -27,6 +31,7 @@ struct AddressSpace {
+     std::uintptr_t start{};
+     std::uint32_t bytes{};
+     std::uint64_t generation{},next_identity{};
++    std::atomic<std::uint64_t> epoch{};
+     bool attached{};
+     std::map<std::uint32_t,Span> spans;
+ };
+@@ -137,6 +142,18 @@ std::size_t NativeByteOffset(NativeDSPMemoryEncoding encoding,std::size_t wire)
+     default: throw std::logic_error("Live DSP memory pin has an invalid encoding");
+     }
+ }
++// One 320-byte AX parameter block between native little-endian fields and the big-endian DSP wire layout.
++// The mapping is its own inverse, so the same routine serves reads and writes: bytes 0..11 and 16..295 swap within
++// each halfword, bytes 12..15 are one reversed word, the 24-byte tail is opaque. Same bytes as the per-byte form.
++inline std::uint64_t SwapPairs64(std::uint64_t v) {return ((v&0x00ff00ff00ff00ffull)<<8)|((v>>8)&0x00ff00ff00ff00ffull);}
++void SwapParameterBlock(unsigned char* dst,const unsigned char* src) {
++    std::uint64_t v;std::uint32_t w;
++    std::memcpy(&v,src,8);v=SwapPairs64(v);std::memcpy(dst,&v,8);
++    std::memcpy(&w,src+8,4);w=((w&0x00ff00ffu)<<8)|((w>>8)&0x00ff00ffu);std::memcpy(dst+8,&w,4);
++    std::memcpy(&w,src+12,4);w=__builtin_bswap32(w);std::memcpy(dst+12,&w,4);
++    for(std::size_t k=16;k<296;k+=8){std::memcpy(&v,src+k,8);v=SwapPairs64(v);std::memcpy(dst+k,&v,8);}
++    std::memcpy(dst+296,src+296,24);
++}
+ // Device byte i of a transfer at wire offset is native byte NativeByteOffset(wire+i)
+ // of the pin. Every field mapping is its own inverse, so the same index maps a
+ // write. These loops produce exactly the bytes of the per-byte form when the
+@@ -162,11 +179,8 @@ void ConvertFields(NativeDSPMemoryEncoding encoding,unsigned char* native,std::s
+         if (wire%320==0 && bytes%320==0) {
+             // Whole parameter blocks: u16 fields, the u32 at 12..15, opaque tail.
+             for (std::size_t record=0;record<bytes;record+=320) {
+-                const auto at=wire+record;
+-                for (std::size_t k=0;k<12;++k) move(record+k,(at+k)^std::size_t(1));
+-                for (std::size_t k=12;k<16;++k) move(record+k,(at+k)^std::size_t(3));
+-                for (std::size_t k=16;k<296;++k) move(record+k,(at+k)^std::size_t(1));
+-                for (std::size_t k=296;k<320;++k) move(record+k,at+k);
++                if constexpr (Write) SwapParameterBlock(native+wire+record,device+record);
++                else SwapParameterBlock(device+record,native+wire+record);
+             }
+             return;
+         }
+@@ -207,6 +221,7 @@ NativeDSPMemoryPin Pin(AddressSpace& state,const void* address,std::size_t bytes
+             if (static_cast<std::uint64_t>(previous->first)+previous->second.bytes>physical)
+                 throw std::invalid_argument("DSP source pin overlaps an existing live extent");
+         }
++        state.epoch.fetch_add(1,std::memory_order_release);
+         const auto identity=++state.next_identity;
+         state.spans.emplace(physical,Span{identity,static_cast<std::uint32_t>(bytes),writable,
+             reinterpret_cast<std::uintptr_t>(address),retained,encoding});
+@@ -218,6 +233,41 @@ NativeDSPMemoryPin Pin(AddressSpace& state,const void* address,std::size_t bytes
+ }
+ }
+ namespace mscharged::platform {
++// Thread CPU time, so the AX cost stays meaningful while other processes load the machine.
++std::uint64_t AXPerfNowNs() {
++    timespec t{};clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);
++    return std::uint64_t(t.tv_sec)*1000000000ull+std::uint64_t(t.tv_nsec);
++}
++static std::uint64_t AXPerfWallNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++void AXPerfTick() {
++    static std::uint64_t last = AXPerfWallNs();
++    static std::uint64_t last_p2c = 0, last_c2p = 0, total_frames = 0;
++    const auto now = AXPerfWallNs();
++    if (now - last < 1000000000ull) return;
++    auto& c = g_ax_perf;
++    std::uint64_t p2c = 0, c2p = 0;
++    OSNativeAddressCallCounts(&p2c, &c2p);
++    const auto f = c.frames.exchange(0);
++    total_frames += f;
++    const auto ns = c.frame_ns.exchange(0);
++    std::fprintf(stderr,
++        "[axstats] dt=%.2fs ax_frames=%llu ax_ms=%.2f us_per_frame=%.1f voices=%llu active=%llu decoded=%llu "
++        "read_calls=%llu read_bytes=%llu sample_calls=%llu sample_bytes=%llu write_calls=%llu write_bytes=%llu "
++        "bind_ms=%.2f list_ms=%.2f prepare_ms=%.2f commit_ms=%.2f validate_calls=%llu ref_frames_total=%llu p2c_calls=%llu c2p_calls=%llu poll_calls=%llu total_frames=%llu frame_hash=%016llx\n",
++        (now - last) / 1e9, (unsigned long long)f, ns / 1e6, f ? ns / 1e3 / f : 0.0,
++        (unsigned long long)c.voices.exchange(0), (unsigned long long)c.active_voices.exchange(0),
++        (unsigned long long)c.decoded_samples.exchange(0), (unsigned long long)c.read_calls.exchange(0),
++        (unsigned long long)c.read_bytes.exchange(0), (unsigned long long)c.sample_calls.exchange(0),
++        (unsigned long long)c.sample_bytes.exchange(0), (unsigned long long)c.write_calls.exchange(0),
++        (unsigned long long)c.write_bytes.exchange(0), c.bind_ns.exchange(0)/1e6, c.list_ns.exchange(0)/1e6,
++        c.prepare_ns.exchange(0)/1e6, c.commit_ns.exchange(0)/1e6, (unsigned long long)c.validate_calls.exchange(0), (unsigned long long)c.ref_frames.load(),
++        (unsigned long long)(p2c - last_p2c), (unsigned long long)(c2p - last_c2p),
++        (unsigned long long)c.poll_calls.exchange(0), (unsigned long long)total_frames,
++        (unsigned long long)c.frame_hash.load());
++    last_p2c = p2c; last_c2p = c2p; last = now;
++}
+ NativeDSPMemoryEndpoint AttachNativeDSPMEM1() {
+     auto& state=State();std::lock_guard lock(state.mutex);
+     if (state.attached) { RequireOwner(state);return {state.generation}; }
+@@ -228,7 +278,7 @@ NativeDSPMemoryEndpoint AttachNativeDSPMEM1() {
+     if (!start || !bytes || bytes>std::numeric_limits<std::uintptr_t>::max()-start)
+         throw std::logic_error("SDK MEM1 backing has an invalid native extent");
+     state.start=start;state.bytes=bytes;state.owner=std::this_thread::get_id();
+-    ++state.generation;state.attached=true;
++    ++state.generation;state.attached=true;state.epoch.fetch_add(1,std::memory_order_release);
+     return {state.generation};
+ }
+ void DetachNativeDSPMEM1() {
+@@ -238,6 +288,7 @@ void DetachNativeDSPMEM1() {
+         throw std::logic_error("DSP memory detach requires its owner thread");
+     for (const auto& [physical,span]:state.spans)
+         if (span.static_identity) OSNativeUnpinAddress(span.static_identity);
++    state.epoch.fetch_add(1,std::memory_order_release);
+     state.spans.clear();state.attached=false;state.owner={};state.start=0;state.bytes=0;
+ }
+ NativeDSPMemoryPin PinNativeDSPMEM1(const void* address,std::size_t bytes,bool writable) {
+@@ -261,12 +312,15 @@ void ReleaseNativeDSPMemory(NativeDSPMemoryPin pin) {
+     for (auto it=state.spans.begin();it!=state.spans.end();++it) {
+         if (it->second.identity==pin.identity) {
+             if (it->second.static_identity) OSNativeUnpinAddress(it->second.static_identity);
++            state.epoch.fetch_add(1,std::memory_order_release);
+             state.spans.erase(it);return;
+         }
+     }
+     throw std::invalid_argument("DSP source pin was already released or never existed");
+ }
++std::uint64_t DSPBackendMemoryEpoch() {return State().epoch.load(std::memory_order_acquire);}
+ void DSPBackendValidateMemory(NativeDSPMemoryEndpoint endpoint,std::uint32_t address,std::size_t bytes,bool writing) {
++    AXPerfAdd(g_ax_perf.validate_calls);
+     auto& state=State();std::lock_guard lock(state.mutex);RequireDevice(state,endpoint);
+     NativePointer(state,address,bytes,writing);
+ }
+@@ -290,10 +344,12 @@ void ReadLocked(const AddressSpace& state,std::uint32_t address,void* destinatio
+ }
+ }
+ void DSPBackendReadMemory(NativeDSPMemoryEndpoint endpoint,std::uint32_t address,void* destination,std::size_t bytes) {
++    AXPerfAdd(g_ax_perf.read_calls);AXPerfAdd(g_ax_perf.read_bytes,bytes);
+     auto& state=State();std::lock_guard lock(state.mutex);RequireDevice(state,endpoint);
+     ReadLocked(state,address,destination,bytes);
+ }
+ unsigned char DSPBackendReadSampleByte(NativeDSPMemoryEndpoint endpoint,std::uint32_t address) {
++    AXPerfAdd(g_ax_perf.sample_calls);AXPerfAdd(g_ax_perf.sample_bytes);
+     auto& state=State();std::lock_guard lock(state.mutex);RequireDevice(state,endpoint);
+     auto it=state.spans.upper_bound(address);
+     if (it!=state.spans.begin()) {
+@@ -316,6 +372,7 @@ unsigned char DSPBackendReadSampleByte(NativeDSPMemoryEndpoint endpoint,std::uin
+ std::size_t DSPBackendReadSampleBytes(NativeDSPMemoryEndpoint endpoint,std::uint32_t address,
+                                       unsigned char* destination,std::size_t capacity) {
+     if (!destination || !capacity) throw std::invalid_argument("DSP sample window is empty");
++    AXPerfAdd(g_ax_perf.sample_calls);
+     auto& state=State();std::lock_guard lock(state.mutex);RequireDevice(state,endpoint);
+     auto it=state.spans.upper_bound(address);
+     if (it!=state.spans.begin()) {
+@@ -324,6 +381,7 @@ std::size_t DSPBackendReadSampleBytes(NativeDSPMemoryEndpoint endpoint,std::uint
+         if (offset<it->second.bytes) {
+             const auto count=static_cast<std::size_t>(std::min<std::uint64_t>(capacity,it->second.bytes-offset));
+             ReadLocked(state,address,destination,count);
++            AXPerfAdd(g_ax_perf.sample_bytes,count);
+             return count;
+         }
+         if (it->second.encoding==NativeDSPMemoryEncoding::RawBytes &&
+@@ -337,6 +395,7 @@ std::size_t DSPBackendReadSampleBytes(NativeDSPMemoryEndpoint endpoint,std::uint
+     throw std::out_of_range(detail);
+ }
+ void DSPBackendWriteMemory(NativeDSPMemoryEndpoint endpoint,std::uint32_t address,const void* source,std::size_t bytes) {
++    AXPerfAdd(g_ax_perf.write_calls);AXPerfAdd(g_ax_perf.write_bytes,bytes);
+     auto& state=State();std::lock_guard lock(state.mutex);RequireDevice(state,endpoint);
+     if (!source && bytes) throw std::invalid_argument("DSP write source is null");
+     const auto it=FindSpan(state,address,bytes,true);
+diff --git a/src/platform/dsp_memory.h b/src/platform/dsp_memory.h
+index e6615551..d16cb1df 100644
+--- a/src/platform/dsp_memory.h
++++ b/src/platform/dsp_memory.h
+@@ -29,6 +29,9 @@ NativeDSPMemoryPin PinNativeDSPMemory(const void* address, std::size_t bytes, bo
+ NativeDSPMemoryPin PinNativeDSPMemory(const void* address, std::size_t bytes, bool writable,
+                                    NativeDSPMemoryEncoding encoding);
+ void ReleaseNativeDSPMemory(NativeDSPMemoryPin pin);
++// Changes whenever a pin is added or released or the endpoint attaches/detaches. A validation of
++// pinned extents (DSPBackendValidateMemory) stays true while this value is unchanged.
++std::uint64_t DSPBackendMemoryEpoch();
+ 
+ // Checked copy operations keep the ownership lock through each transfer. No
+ // raw pointer escapes to a device worker. A typed pin applies its declared DSP

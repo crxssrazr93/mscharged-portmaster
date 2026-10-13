@@ -21,7 +21,7 @@ apply() {  # apply a patch once
   elif git apply -R --check "$1" 2>/dev/null; then echo "already applied: $(basename "$1")"
   else echo "cannot apply $1" >&2; exit 1; fi
 }
-for p in "$W"/patches/port-gles/*.patch "$W"/patches/port-pm/*.patch; do apply "$p"; done
+for p in "$W"/patches/port-gles/*.patch "$W"/patches/port-pm/*.patch "$W"/patches/port-perf/*.patch; do apply "$p"; done
 # Decomp host adaptations (appended to the port's own decomp series).
 for p in "$W"/patches/decomp-pm/*.patch; do
   cp "$p" patches/mscharged-decomp/
