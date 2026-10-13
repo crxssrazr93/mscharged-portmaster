@@ -81,7 +81,7 @@ Unzip into the ports folder, copy the disc image into `ports/mscharged/`, and st
 
 ## Status
 
-Based on mscharged-port 1.0.8. Boots and plays on PC with GLES (also the handheld build, see `docs/handheld-strip-2026-10-13.md`). On the RG35XX H it boots and runs the intro; a GPU texture leak during movies and GPU throughput are being fixed, so it is not playable on a device yet.
+Based on mscharged-port 1.0.8. Boots and plays on PC with GLES (also the handheld build, see `docs/handheld-strip-2026-10-13.md`). On the RG35XX H it boots and runs the intro at 13 to 20 fps (static screens 30), not playable yet. Work is paused, see `docs/status-2026-10-13.md` for where it stands and what is next.
 
 ## Licenses
 
