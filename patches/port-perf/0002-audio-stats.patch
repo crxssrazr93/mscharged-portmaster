@@ -1,0 +1,263 @@
+diff --git a/src/platform/ai.cpp b/src/platform/ai.cpp
+index 2f8ff791..40739a72 100644
+--- a/src/platform/ai.cpp
++++ b/src/platform/ai.cpp
+@@ -1,5 +1,6 @@
+ #include "platform/ai.h"
+ #include "platform/interrupts.h"
++#include "platform/audio_stats.h"
+ 
+ #include <dolphin/ai.h>
+ #include <SDL3/SDL.h>
+@@ -69,6 +70,14 @@ struct AIState {
+     std::uint64_t hold_start_ns{};
+     mscharged::platform::NativeAIDeliveryStatus delivery{};
+     float output_gain{1.0f};
++    // MSCHARGED_AUDIOSTATS: counters of the current one second window (under mutex), printed by StatsTick.
++    struct Window {
++        std::uint64_t pulls{}, short_pulls{}, short_bytes{}, blocks{}, held{}, held_max_ns{}, skipped_cells{};
++        std::uint64_t dispatched{}, late_cb{}, lat_sum_ns{}, lat_max_ns{}, replayed{}, dup{}, nosrc{};
++        std::uint64_t queue_samples{}, queue_sum{}, queue_min{~std::uint64_t(0)}, queue_last{};
++    } win;
++    std::uint64_t prev_block_hash{};
++    std::uint64_t stats_window_start_ns{};
+     char error[256]{};
+ };
+ 
+@@ -156,6 +165,7 @@ void Edge(AIState& state) { Edge(state, ClockTime(state)); }
+ 
+ // Latch the next registers at a completed block and raise its hardware cause.
+ void LatchNext(AIState& state, std::uint64_t cause_ns) {
++    if (!state.next_programmed) ++state.win.replayed;
+     if (state.observing) {
+         ++state.delivery.latched_blocks;
+         if (!state.next_programmed) ++state.delivery.replayed_latches;
+@@ -262,6 +272,7 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+         // independent of the CPU mask. Source delivery remains masked below.
+         if (state.first_edge && due) { Edge(state); state.first_edge = false; }
+         if (!source_access) {
++            ++state.win.nosrc;
+             if (blocked) *blocked = true;
+             return 0;
+         }
+@@ -282,8 +293,10 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+                 if (due > state.epoch_cells + limit) {
+                     const auto skip = due - state.epoch_cells - limit;
+                     state.epoch_cells += skip;
++                    state.win.skipped_cells += skip;
+                     if (state.observing) state.delivery.skipped_cells += skip;
+                 }
++                state.win.held_max_ns = std::max(state.win.held_max_ns, now - state.hold_start_ns);
+                 if (state.observing)
+                     state.delivery.maximum_hold_ns = std::max(state.delivery.maximum_hold_ns, now - state.hold_start_ns);
+                 state.held = false;
+@@ -305,11 +318,20 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+                 try { packets.push_back(packet); }
+                 catch (...) { std::free(packet); throw; }
+                 state.last_hash = Hash(packet->Data(), state.fifo.size());
++                ++state.win.blocks;
++                // A block equal to the one before it (and not silence) is a replayed, stale source buffer.
++                if (state.last_hash == state.prev_block_hash) {
++                    bool silent = true;
++                    for (std::size_t n = 0; n < state.fifo.size(); ++n) if (packet->Data()[n]) { silent = false; break; }
++                    if (!silent) ++state.win.dup;
++                }
++                state.prev_block_hash = state.last_hash;
+                 ++state.retained;
+                 ++state.submitted;
+                 if (state.observing) ClassifyBlock(state, packet->Data(), state.fifo.size());
+                 if (state.pending && deliverable) {
+                     state.held = true;
++                    ++state.win.held;
+                     state.hold_start_ns = now;
+                     if (state.observing) ++state.delivery.held_boundaries;
+                     break;
+@@ -330,6 +352,49 @@ std::size_t Transfer(AIState& state, SDL_AudioStream* stream, bool* blocked = nu
+     return queued;
+ }
+ 
++// MSCHARGED_AUDIOSTATS=1: one line per second. Called from the SDL device thread (after every pull) and from the owner's
++// service, whichever comes first once the second is over.
++void StatsTick(AIState& state, SDL_AudioStream* stream) {
++    if (!mscharged::platform::g_audio_stats_on || !stream) return;
++    using mscharged::platform::g_audio_stats;
++    const auto now = SDL_GetTicksNS();
++    AIState::Window w;
++    std::uint64_t dt;
++    int rate;
++    bool running;
++    {
++        std::lock_guard lock(state.mutex);
++        if (!state.stats_window_start_ns) { state.stats_window_start_ns = now; return; }
++        dt = now - state.stats_window_start_ns;
++        if (dt < 1000000000ull) return;
++        state.stats_window_start_ns = now;
++        w = state.win;
++        state.win = {};
++        rate = Frequency(state.rate);
++        running = state.running;
++    }
++    const int queued_now = SDL_GetAudioStreamQueued(stream);
++    const double bytes_per_ms = double(rate) * 4.0 / 1000.0;
++    const double qmin = w.queue_samples ? double(w.queue_min) / bytes_per_ms : -1.0;
++    const double qavg = w.queue_samples ? double(w.queue_sum) / double(w.queue_samples) / bytes_per_ms : -1.0;
++    const auto ax_jobs = g_audio_stats.ax_jobs.exchange(0, std::memory_order_relaxed);
++    const auto ax_comp = g_audio_stats.ax_compute_max_ns.exchange(0, std::memory_order_relaxed);
++    const auto ax_dsum = g_audio_stats.ax_commit_delay_sum_ns.exchange(0, std::memory_order_relaxed);
++    const auto ax_dmax = g_audio_stats.ax_commit_delay_max_ns.exchange(0, std::memory_order_relaxed);
++    std::fprintf(stderr,
++        "[audiostats] dt=%.2fs run=%d queue_ms min=%.1f avg=%.1f now=%.1f pulls=%llu underruns=%llu silence_ms=%.1f "
++        "blocks=%llu held=%llu held_ms_max=%.1f late_blocks=%llu cb_lat_ms avg=%.1f max=%.1f skipped_blocks=%.1f "
++        "replayed=%llu dup=%llu nosrc=%llu ax_jobs=%llu ax_compute_ms_max=%.2f ax_commit_delay_ms avg=%.2f max=%.2f\n",
++        double(dt) / 1e9, running ? 1 : 0, qmin, qavg, double(queued_now) / bytes_per_ms,
++        (unsigned long long)w.pulls, (unsigned long long)w.short_pulls, double(w.short_bytes) / bytes_per_ms,
++        (unsigned long long)w.blocks, (unsigned long long)w.held, double(w.held_max_ns) / 1e6,
++        (unsigned long long)w.late_cb, w.dispatched ? double(w.lat_sum_ns) / double(w.dispatched) / 1e6 : 0.0,
++        double(w.lat_max_ns) / 1e6, double(w.skipped_cells) / 12.0, (unsigned long long)w.replayed,
++        (unsigned long long)w.dup, (unsigned long long)w.nosrc, (unsigned long long)ax_jobs, double(ax_comp) / 1e6,
++        ax_jobs ? double(ax_dsum) / double(ax_jobs) / 1e6 : 0.0, double(ax_dmax) / 1e6);
++    std::fflush(stderr);
++}
++
+ void SDLCALL Feed(void* userdata, SDL_AudioStream* stream, int additional, int total) noexcept {
+     auto& state = *static_cast<AIState*>(userdata);
+     if (state.observing.load(std::memory_order_relaxed)) {
+@@ -354,6 +419,23 @@ void SDLCALL Feed(void* userdata, SDL_AudioStream* stream, int additional, int t
+     // real elapsed DMA transfers enter SDL; demand never repeats a buffer.
+     bool blocked = false;
+     const auto queued = Transfer(state, stream, &blocked);
++    if (mscharged::platform::g_audio_stats_on) {
++        const int depth = SDL_GetAudioStreamQueued(stream);
++        std::lock_guard lock(state.mutex);
++        auto& w = state.win;
++        ++w.pulls;
++        const auto have = std::uint64_t(std::max(depth, 0));
++        const auto need = std::uint64_t(std::max(additional, 0));
++        if (have < need) {
++            ++w.short_pulls;
++            w.short_bytes += need - have;
++        }
++        w.queue_min = std::min(w.queue_min, have);
++        w.queue_sum += have;
++        w.queue_last = have;
++        ++w.queue_samples;
++    }
++    StatsTick(state, stream);
+     if (state.observing.load(std::memory_order_relaxed)) {
+         // SDL holds its recursive stream lock for this callback. Demand left
+         // unsatisfied here becomes device silence; it is observed, not filled.
+@@ -581,6 +663,7 @@ bool ServiceNativeAI() {
+         stream = state.stream;
+     }
+     Transfer(state, stream);
++    StatsTick(state, stream);
+     {
+         std::lock_guard lock(state.mutex);
+         if (!state.initialized) return false;
+@@ -604,6 +687,17 @@ bool ServiceNativeAI() {
+                 callback = call.state.callback;
+                 call.state.pending = false;
+                 call.state.callback_active = true;
++                {
++                    const auto at = SDL_GetTicksNS();
++                    const auto latency = at > call.state.cause_ns ? at - call.state.cause_ns : 0;
++                    const auto block_ns = std::uint64_t(call.state.active_length / 4) * 1000000000ull /
++                        std::uint64_t(Frequency(call.state.rate));
++                    auto& w = call.state.win;
++                    ++w.dispatched;
++                    w.lat_sum_ns += latency;
++                    w.lat_max_ns = std::max(w.lat_max_ns, latency);
++                    if (block_ns && latency >= block_ns) ++w.late_cb;
++                }
+                 if (call.state.observing) {
+                     auto& observed = call.state.observations;
+                     observation_start = SDL_GetTicksNS();
+diff --git a/src/platform/audio_stats.h b/src/platform/audio_stats.h
+new file mode 100644
+index 00000000..c7cd0afa
+--- /dev/null
++++ b/src/platform/audio_stats.h
+@@ -0,0 +1,23 @@
++#pragma once
++// Env-gated (MSCHARGED_AUDIOSTATS=1) audio delivery counters: one "[audiostats]" line per second on stderr, printed by
++// platform/ai.cpp. The AX part is filled by the functional AX device. Counting is cheap (relaxed atomics) and only
++// done when the switch is on.
++#include <atomic>
++#include <cstdint>
++#include <cstdlib>
++
++namespace mscharged::platform {
++struct AudioStatCounters {
++    // AX frame jobs: count, longest compute on the worker, total owner commit delay (job done until the owner commits).
++    std::atomic<std::uint64_t> ax_jobs{}, ax_compute_max_ns{}, ax_commit_delay_sum_ns{}, ax_commit_delay_max_ns{};
++};
++inline AudioStatCounters g_audio_stats;
++inline const bool g_audio_stats_on = [] {
++    const char* v = std::getenv("MSCHARGED_AUDIOSTATS");
++    return v && *v && *v != '0';
++}();
++inline void AudioStatMax(std::atomic<std::uint64_t>& slot, std::uint64_t value) {
++    auto old = slot.load(std::memory_order_relaxed);
++    while (value > old && !slot.compare_exchange_weak(old, value, std::memory_order_relaxed)) {}
++}
++} // namespace mscharged::platform
+diff --git a/src/platform/ax_functional_device.cpp b/src/platform/ax_functional_device.cpp
+index 5eb16170..4744a5e0 100644
+--- a/src/platform/ax_functional_device.cpp
++++ b/src/platform/ax_functional_device.cpp
+@@ -1,5 +1,6 @@
+ #include "platform/ax_functional_device.h"
+ #include "platform/ax_perf.h"
++#include "platform/audio_stats.h"
+ #include "platform/os_audio_registers.h"
+ #include "platform/dsp_control_abi.h"
+ #include "platform/dsp_mailbox_abi.h"
+@@ -10,6 +11,7 @@
+ #include "platform/ax_reference/ax_frame_commands.h"
+ #endif
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -141,6 +143,11 @@ struct NativeAXFunctionalDevice::State {
+     NativeDSPMemoryEndpoint job_memory{};
+     std::uint32_t job_address{};
+     std::exception_ptr job_error;
++    std::atomic<std::uint64_t> job_done_ns{}; // MSCHARGED_AUDIOSTATS: when the worker finished the job in flight
++    static std::uint64_t SteadyNs() {
++        return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count());
++    }
+     ~State() {
+         if(worker.joinable()) {
+             {std::lock_guard lock(worker_mutex);worker_stop=true;}
+@@ -278,8 +285,14 @@ struct NativeAXFunctionalDevice::State {
+             const auto mem=job_memory;const auto address=job_address;
+             lock.unlock();
+             std::exception_ptr error;
++            const auto started=g_audio_stats_on?SteadyNs():0;
+             try {Compute(mem,address,128);}
+             catch(...) {error=std::current_exception();}
++            if(g_audio_stats_on) {
++                const auto done=SteadyNs();
++                job_done_ns.store(done,std::memory_order_relaxed);
++                AudioStatMax(g_audio_stats.ax_compute_max_ns,done-started);
++            }
+             lock.lock();
+             job_error=error;
+             job_state.store(2,std::memory_order_release);
+@@ -312,6 +325,13 @@ struct NativeAXFunctionalDevice::State {
+         {std::lock_guard lock(s.worker_mutex);error=s.job_error;s.job_error=nullptr;}
+         s.job_state.store(0,std::memory_order_release);
+         if(error)std::rethrow_exception(error);
++        if(g_audio_stats_on) {
++            const auto done=s.job_done_ns.load(std::memory_order_relaxed),now=SteadyNs();
++            const auto delay=now>done?now-done:0;
++            g_audio_stats.ax_jobs.fetch_add(1,std::memory_order_relaxed);
++            g_audio_stats.ax_commit_delay_sum_ns.fetch_add(delay,std::memory_order_relaxed);
++            AudioStatMax(g_audio_stats.ax_commit_delay_max_ns,delay);
++        }
+         result=s.Commit(s.memory);
+         return true;
+     }
